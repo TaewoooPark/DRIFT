@@ -1,0 +1,15 @@
+# DRIFT config — see DRIFT-implementation-spec.md §5 and docs/03 canonical values.
+# Models are ungated; no huggingface-cli login needed.
+model_id: "Qwen/Qwen2.5-1.5B-Instruct"   # primary (28 layers → 0–14 / 14–28). Gemma: google/gemma-4-E2B-it (35 → 0–18/18–35)
+dtype: "float16"                          # boundary + compute dtype (fp16 CPU round-trip is bit-lossless)
+device: "mps"                             # parity baseline device on this Mac; both shards same device for M2/M3 exactness
+port: 52600
+
+shards:
+  - { name: "mac",     host: "127.0.0.1", port: 52600, start_layer: 0,  end_layer: 14, device: "mps" }
+  - { name: "windows", host: "127.0.0.1", port: 52601, start_layer: 14, end_layer: 28, device: "mps" }
+
+generation:
+  max_new_tokens: 50
+  # parity tests force greedy (do_sample=False); the demo can sample.
+  prompt: "Give me a short introduction to large language models."
