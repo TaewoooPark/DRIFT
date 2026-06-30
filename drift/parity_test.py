@@ -31,6 +31,8 @@ _SELFTEST_CASES = [
     ("Write a haiku about the sea.", 40),
     ("def fibonacci(n):", 60),
     ("한국어로 인공지능을 한 문장으로 설명해줘.", 50),
+    ("Hi.", 1),                                  # edge: single-token generation
+    ("Count from one to forty in words.", 180),  # edge: long decode sequence
 ]
 
 

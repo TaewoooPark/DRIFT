@@ -129,7 +129,16 @@ class Orchestrator:
         tok = self.head.tokenizer
         input_ids = build_input_ids(tok, prompt).to(self.device)
         S = input_ids.shape[1]
-        eos = set(tok.all_special_ids) if stop_on_eos else set()
+        # Narrow EOS set (not all special ids, which would stop on benign tokens).
+        eos: set[int] = set()
+        if stop_on_eos:
+            if tok.eos_token_id is not None:
+                eos.add(int(tok.eos_token_id))
+            gen_eos = getattr(getattr(self.head.lm, "generation_config", None), "eos_token_id", None)
+            if isinstance(gen_eos, int):
+                eos.add(gen_eos)
+            elif isinstance(gen_eos, (list, tuple)):
+                eos.update(int(x) for x in gen_eos)
 
         hidden = self.head.embed(input_ids)
         pos = list(range(S))

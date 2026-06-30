@@ -13,6 +13,9 @@ slot and parity would break after the first token.
 
 from __future__ import annotations
 
+import copy
+import inspect
+
 import torch
 from transformers import AutoModelForCausalLM
 from transformers.cache_utils import DynamicCache
@@ -86,12 +89,30 @@ class TorchShardEngine(ShardEngine):
         self.layer_types = [gtypes[i] for i in range(self.start_layer, self.end_layer)]
 
         # Re-index kept layers to local cache slots (see module docstring).
+        # NOTE: this mutates the (possibly shared) model's layer indices, so the
+        # parent model object must NOT be used for a full forward() afterward.
+        # In-process sharing is safe because shards own DISJOINT layer slices and
+        # the orchestrator only uses embed_tokens/norm/lm_head (not the layers).
         for local_i, layer in enumerate(self.layers):
             attn = getattr(layer, "self_attn", None)
             if attn is not None and hasattr(attn, "layer_idx"):
                 attn.layer_idx = local_i
             if hasattr(layer, "layer_idx"):
                 layer.layer_idx = local_i
+
+        # Introspect the loaded layer's forward params (spec §7.2 — never hardcode
+        # the arg list); we pass only kwargs this version's layer actually accepts.
+        self._layer_params = set(
+            inspect.signature(type(self.layers[0]).forward).parameters
+        )
+
+        # A cache config sized to THIS shard's layer count (not the full model),
+        # so DynamicCache slots match the re-indexed local layers exactly.
+        self._cache_config = copy.copy(self.config)
+        try:
+            self._cache_config.num_hidden_layers = len(self.layers)
+        except Exception:
+            self._cache_config = self.config
 
     # --------------------------------------------------------------- forward
     @torch.no_grad()
@@ -100,7 +121,7 @@ class TorchShardEngine(ShardEngine):
 
         cache = self.caches.get(session_id)
         if cache is None:
-            cache = DynamicCache(config=self.config)
+            cache = DynamicCache(config=self._cache_config)
             self.caches[session_id] = cache
 
         hidden = hidden.to(device=self.device, dtype=self.torch_dtype)
@@ -128,14 +149,16 @@ class TorchShardEngine(ShardEngine):
 
         for local_i, layer in enumerate(self.layers):
             mask = mask_mapping.get(self.layer_types[local_i], mask_mapping["full_attention"])
-            hidden = layer(
-                hidden,
-                attention_mask=mask,
-                position_embeddings=pos_emb,
-                position_ids=position_ids,
-                past_key_values=cache,
-                use_cache=True,
-            )
+            call_kwargs = {
+                "attention_mask": mask,
+                "position_embeddings": pos_emb,
+                "position_ids": position_ids,
+                "past_key_values": cache,
+                "use_cache": True,
+            }
+            # pass only what this transformers version's layer accepts (§7.2)
+            call_kwargs = {k: v for k, v in call_kwargs.items() if k in self._layer_params}
+            hidden = layer(hidden, **call_kwargs)
         return hidden
 
     # ----------------------------------------------------------------- reset
