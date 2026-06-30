@@ -29,13 +29,13 @@ three skills:
 
 ### 1. `drift-parity-debugger` — **scaffold eagerly (now)**
 - **Gaps:** layer-bisection debugging (a) + float max-abs-diff comparison (b).
-- **Scope:** fp32 `max_abs_diff`; the `k → diff` bisection sweep; the early-vs-late divergence decision rule; the §13 suspect checklist. Mirrors [`05`](05-parity-debugging-playbook.md).
+- **Scope:** fp32 `max_abs_diff`; the `k → diff` bisection sweep; the early-vs-late divergence decision rule; the §13 suspect checklist + the **model-specific suspects** (Gemma 4 PLE, dual-rope, hybrid mask). Mirrors [`05`](05-parity-debugging-playbook.md).
 - **Why eager:** it shapes how `reference.py` / `engine_torch.py` are written to be *bisectable* (e.g. exposing per-boundary hidden states), so it must exist before that code.
 
 ### 2. `drift-env-introspect` — **scaffold eagerly (M0-scoped)**
 - **Gaps:** HF layer-signature introspection (d) + requirements-lock version-parity validation (f).
-- **Scope:** introspect the installed `LlamaDecoderLayer.forward` signature so engine calls match the installed `transformers` (never hardcode — spec §7.2); diff `requirements.lock` vs `requirements.win.lock` and flag any `transformers`/`msgpack` mismatch between the two nodes.
-- **Why eager:** prevents the two most insidious silent-parity-breakers (API drift, version skew) from M0 onward.
+- **Scope:** introspect the **loaded model's** decoder-layer `forward` signature (`type(model.model.layers[0])` — `Qwen2DecoderLayer` / `Gemma4DecoderLayer`, never hardcode — spec §7.2) **and the model's architecture profile** (cache type Dynamic vs Hybrid; single vs dual RoPE theta + per-layer attention types; PLE `embed_tokens_per_layer`; embedding scaling; KV-sharing groups); diff `requirements.lock` vs `requirements.win.lock` and flag any `transformers`/`msgpack` mismatch (and that `transformers >= 5.5` for Gemma 4).
+- **Why eager:** prevents the most insidious silent-parity-breakers (API drift, version skew, unhandled model quirks) from M0 onward.
 
 ### 3. `drift-protocol-tester` — **stub now, flesh out before M3**
 - **Gaps:** protocol stress-testing (c) + cross-node message tracing (e).

@@ -67,7 +67,7 @@ const VERDICT_SCHEMA = {
 
 const RUBRIC = `7 dimensions (each PASS/FAIL). A dimension FAILs ONLY for a real blocker/major issue — do NOT fail a dimension for wording nitpicks (log those as minor findings).
 1. d1_completeness: all 4 requested docs present (impl plan=01, workflow=02, goal execution=03, skills/MCP=04); every milestone M0-M6 in 01 has tasks/files/acceptance/risks/effort; spec sections are covered.
-2. d2_technical: matches validated facts — model.model.layers[start:end]; embed_tokens/model.norm/lm_head/model.model.rotary_emb; LlamaDecoderLayer.forward accepts position_ids AND position_embeddings=(cos,sin); shards compute RoPE locally from position_ids via rotary_emb (layer-agnostic); per-session DynamicCache using cache_position (NOT deprecated _seen_tokens); split points match layer counts (Llama 16->8/8, Qwen 28->14/14).
+2. d2_technical: matches validated facts — model.model.layers[start:end]; embed_tokens/model.norm/lm_head/model.model.rotary_emb; the loaded model's decoder-layer forward (Qwen2DecoderLayer / Gemma4DecoderLayer) accepts position_ids AND position_embeddings=(cos,sin) (introspect, never hardcode the class); shards compute RoPE locally from position_ids via rotary_emb (layer-agnostic); per-session cache uses cache_position (NOT deprecated _seen_tokens) and the correct type per model (DynamicCache Qwen / HybridCache Gemma); split points match layer counts (Qwen 28->14/14, Gemma 4 E2B 35->18/17). Gemma 4 quirks correct: PLE per-layer embeddings (shard self-computes from input_ids carried on the wire), embedding sqrt(hidden) scaling in orchestrator, dual RoPE theta (sliding/global), hybrid per-layer attention, NO final-logit softcapping. Both default models (Qwen, gemma-4-E2B-it) are ungated; transformers>=5.5 for Gemma 4.
 3. d3_no_hardcoded_api: docs INSTRUCT introspection of the installed transformers (spec section 7.2); they must never present a fixed HF forward-arg list as authoritative truth.
 4. d4_actionability: commands copy-pasteable (uv venv --python 3.12, exact pip, huggingface-cli login); acceptance tests runnable; paths consistent.
 5. d5_consistency: split point, port 52600, model id, Python 3.12, transformers pin, filenames identical across ALL docs; cross-references valid. VERIFY by grepping shared values across files.
@@ -84,7 +84,7 @@ SOURCE OF TRUTH (read, do NOT edit, do NOT flag for editing): ${SPEC}
 DOCS TO REVIEW (read all): ${DOCS.join(', ')}
 ALSO IN SCOPE: ${OTHER.join(', ')}
 
-Read every file. Use Grep to VERIFY dimension 5 (consistency) — grep for "52600", "Llama-3.2-1B", "3.12", "14/14", "8/8" across the docs and confirm they agree. Use Grep for dimension 6 — confirm "torch.distributed"/"NCCL"/"gloo" appear ONLY as forbidden, and that "_seen_tokens" appears only as deprecated.
+Read every file. Use Grep to VERIFY dimension 5 (consistency) — grep for "52600", "Qwen/Qwen2.5-1.5B-Instruct", "gemma-4-E2B-it", "3.12", "14/14", "18/35" or "18 / 18-35" splits across the docs and confirm they agree (NO stray "Llama" as a default/primary model — Llama may appear only as spec §5's placeholder example or a gated fallback note). Use Grep for dimension 6 — confirm "torch.distributed"/"NCCL"/"gloo" appear ONLY as forbidden, and that "_seen_tokens" appears only as deprecated.
 
 RUBRIC:
 ${RUBRIC}

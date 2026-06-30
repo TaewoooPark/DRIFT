@@ -58,6 +58,18 @@ them that way from the start (this is why the skill is eager, per `docs/04`).
 3. **Attention mask length** — prefill causal-full; decode KV-length-aware.
 4. **Double-applied embed/norm/head** — a shard must run only decoder layers; if it also applies `embed_tokens`/`norm`/`lm_head`, the boundary diff explodes immediately.
 
+## Step 3b — model-specific suspects
+
+**Qwen2.5** — plain decoder; nothing beyond Step 3. (If Qwen is clean but Gemma isn't, the split logic is fine — it's a Gemma quirk below.)
+
+**Gemma 4 E2B** (introspect, never hardcode — use `drift-env-introspect`):
+1. **PLE per-layer embeddings** — shard looks up `embed_tokens_per_layer` for its layers from `input_ids` (on the wire); missing/misaligned → diff grows steadily through the shard.
+2. **Embedding sqrt(hidden) scaling** — orchestrator must scale `embed_tokens(ids)`; missing → large diff from token 0.
+3. **Dual RoPE theta** (sliding ≈10k / global 1M) — shard must use the correct base per layer type; bisect to the first global layer.
+4. **Hybrid attention mask** — pass full vs 512-sliding mask per layer by type.
+5. **HybridCache + KV-sharing groups** — don't use `DynamicCache` for Gemma; don't split inside a KV-sharing group.
+6. **No final-logit softcapping** for Gemma 4 (that was Gemma 2) — don't add it.
+
 ## Step 4 — serialization (M2 clean, M3 broken)
 
 The wire path is the only new variable: `_recvn` must loop (partial recv); 4-byte

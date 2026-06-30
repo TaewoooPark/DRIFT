@@ -55,6 +55,18 @@ The skill runs this sweep and prints a `k → max_abs_diff` table.
 3. **Attention mask length** — prefill = causal-full; decode = KV-length-aware. A wrong length silently attends to garbage.
 4. **Double-applied embed/norm/head** — a shard must run **only** decoder layers. If a shard also applies `embed_tokens`, `norm`, or `lm_head`, the boundary diff explodes immediately.
 
+## Step 3b — model-specific suspects
+
+**Qwen2.5** — plain decoder; nothing beyond Step 3. If Qwen parity is clean but Gemma isn't, the bug is one of the Gemma quirks below (good signal — the split logic itself is fine).
+
+**Gemma 4 E2B** (introspect every value; never hardcode):
+1. **PLE (per-layer embeddings)** — each shard must look up `embed_tokens_per_layer` for *its* layer range from `input_ids` (carried on the wire), scale, and add per layer. Missing/misaligned PLE → diff grows steadily through the shard, not at one boundary. **ORCHESTRATOR/SHARD.**
+2. **Embedding sqrt(hidden) scaling** — orchestrator must multiply `embed_tokens(ids)` by `sqrt(hidden_size)`. If missing, the diff is large from token 0. **ORCHESTRATOR.**
+3. **Dual RoPE theta** (≈10k sliding / 1M global) — a shard that uses one theta for all its layers breaks the global layers. Bisect to the first global layer in the shard. **SHARD.**
+4. **Hybrid attention mask** — per layer, the correct full vs 512-sliding mask must be passed (by layer type). Wrong mask → wrong long-range attention, usually late-ish divergence. **MASK.**
+5. **HybridCache + KV-sharing groups** — wrong cache type (using `DynamicCache` for Gemma) or splitting inside a KV-sharing group corrupts decode. **SHARD.**
+6. **final logit softcapping** — Gemma 4 dropped it (uses QK-norm in-layer); do **not** add softcapping at `lm_head` for Gemma 4 (that was Gemma 2). **ORCHESTRATOR.**
+
 ## Step 4 — serialization (M3-specific)
 
 If M2 is exact but M3 diverges, the bug is in the wire path (the *only* new variable):

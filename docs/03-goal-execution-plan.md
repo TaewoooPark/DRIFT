@@ -10,17 +10,20 @@ states the Definition of Done (§14).
 
 | Key | Value | Source / note |
 |---|---|---|
-| Primary model | `meta-llama/Llama-3.2-1B-Instruct` | spec §5; **gated** on HF |
-| Primary layers / split | 16 layers → `0–8` (Mac) / `8–16` (Windows) | verify via `AutoConfig` at M1 |
-| Fallback model | `Qwen/Qwen2.5-1.5B-Instruct` | non-gated |
-| Fallback layers / split | 28 layers → `0–14` / `14–28` | used if HF gating not cleared |
-| Boundary dtype | `float16` | spec §5/§6; CPU round-trip is lossless |
+| Primary model | `Qwen/Qwen2.5-1.5B-Instruct` | **ungated**; simple plain decoder — the first bring-up |
+| Primary layers / split | 28 layers → `0–14` (Mac) / `14–28` (Windows) | verify via `AutoConfig` at M1 |
+| Secondary model | `google/gemma-4-E2B-it` | **ungated** (Apache 2.0); advanced — second bring-up |
+| Secondary layers / split | 35 layers → `0–18` / `18–35` | verify layer count + KV-sharing groups via config at M1 |
+| Boundary dtype | `float16` | spec §6; CPU round-trip is lossless; **MPS-safe (avoid bf16 on MPS)** |
 | TCP port | `52600` | spec §5; localhost uses two ports (see `06`) |
 | Python | `3.12` (via `uv venv --python 3.12`) | **not 3.14** — no torch wheel |
-| `transformers` | pinned in `requirements.lock`, **identical on both nodes** | target ≥ 4.44; parity-critical |
+| `transformers` | pinned in `requirements.lock`, **identical on both nodes** | Qwen needs ≥ 4.44; **Gemma 4 needs ≥ 5.5**; parity-critical |
 | `torch` | per-machine (Mac MPS wheel / Windows CUDA wheel) | versions differ by device — that's expected |
+| Wire schema fields | `hidden_states` + `position_ids` + **`input_ids`** | `input_ids` (ints, small) added so **PLE models (Gemma 4) work** — shards self-compute per-layer embeddings; decide at M0 before freezing (spec §1.2) |
 | Code dir | `drift/` | spec §4 |
 | Repo root | `/Users/taewoopark/personal/DRIFT` | — |
+
+> **Both default models are ungated** → `huggingface-cli login` is **optional** (only for rate limits / private repos). Llama-3.2-1B (spec §5's placeholder example — §5 values are user-filled) and the gated `google/gemma-3-1b-it` are *not* used here; Gemma 3 is the simpler-but-gated fallback only if Gemma 4's PLE proves too fiddly (decision #1).
 
 ---
 
@@ -32,6 +35,7 @@ states the Definition of Done (§14).
 | Correctness-first / parity | **M1** (oracle), **M2** (sharding/RoPE/KV), **M3** (serialization) |
 | Heterogeneous cooperation — *the differentiator* | **M4** (MPS + CUDA on one model) |
 | Swappable engine behind an interface | **M2** (`ShardEngine` ABC in use); fully realized in v2 (§12) |
+| Model-family-agnostic engine | running **both** Qwen (plain decoder) and Gemma 4 (PLE + dual-rope + hybrid attention) through the same introspection-based engine — proves the boundary isn't tied to one architecture |
 | Demoable | **M5**; resilience polish **M6** |
 
 ---
@@ -68,8 +72,8 @@ whole project first; M4 then only adds the heterogeneous-hardware variable.
 
 | # | Decision | Resolution | Decide at |
 |---|---|---|---|
-| 1 | Model | **Llama-3.2-1B-Instruct first**; auto-fallback to Qwen2.5-1.5B-Instruct if HF gating isn't cleared in ~15 min | M0/M1 |
-| 2 | Split point | Match layer count (Llama 8/8, Qwen 14/14); verify via `AutoConfig`; memory-weighting deferred | M1 |
+| 1 | Model | **Qwen2.5-1.5B-Instruct first** (plain, ungated — proves the core), then **`google/gemma-4-E2B-it`** as the second-family bring-up (ungated, but PLE + dual-rope + hybrid attention). `gemma-3-1b-it` (gated, simpler) is the fallback only if Gemma 4's PLE is too fiddly | M1 / second pass |
+| 2 | Split point | Match layer count (Qwen 14/14, Gemma 4 E2B 18/17); verify via `AutoConfig` + check Gemma's KV-sharing groups (don't split inside one); memory-weighting deferred | M1 |
 | 3 | Loading path | v1 = full-model-load, keep slice (spec §7.1). Memory path (`init_empty_weights` + per-shard safetensors) deferred | M2 |
 | 4 | Mac engine | v1 = PyTorch-MPS. MLX (`engine_mlx.py`) is post-DoD (§12) | v2 |
 | 5 | Display | `rich` terminal first; local webpage only if a big screen demands it (this also decides whether `webapp-testing`/`playwright` are needed — see `04`) | M5 |

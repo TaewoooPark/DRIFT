@@ -34,7 +34,7 @@ not a logic bug. This is the single most important structural choice in the buil
 **Tasks**
 1. Env per [`06`](06-m0-setup-runbook.md): `uv venv --python 3.12`, install torch (MPS)/transformers/safetensors/msgpack/numpy, `huggingface-cli login`, `pip freeze > requirements.lock`.
 2. `config.yaml` (spec §5) — model id, dtype, port, shard table with `host/start_layer/end_layer/device`.
-3. `protocol.py` — `send_msg`/`recv_msg`/`_recvn` exactly per spec §6 (4-byte big-endian length prefix + msgpack dict). **This is the wire contract — freeze it.**
+3. `protocol.py` — `send_msg`/`recv_msg`/`_recvn` exactly per spec §6 (4-byte big-endian length prefix + msgpack dict). **This is the wire contract — freeze it.** Decide the schema fields *now* (spec §1.2): `hidden_states` + `position_ids` **+ `input_ids`**. The extra `input_ids` (small ints) lets PLE models (Gemma 4) self-compute per-layer embeddings on the downstream shard without a re-freeze; Qwen simply ignores it. The boundary stays neutral and small.
 4. `engine_base.py` — the `ShardEngine` ABC (spec §7): `load`, `forward`, `reset`.
 5. `engine_torch.py` — `load()` only for now (full-model load, keep `layers[start:end]`, capture `embed_tokens`/`norm`/`lm_head`/`rotary_emb` refs); plus a `ping`-info method.
 6. `shard_server.py` — TCP listen → `recv_msg` → handle `ping`/`reset` → `send_msg`. Sequential, single-session. Reads its identity from `config.yaml`, but accepts CLI overrides (`--name/--start/--end/--device`) and a `DRIFT_PORT` env var for localhost multi-port runs (see [`06`](06-m0-setup-runbook.md)).
@@ -42,7 +42,7 @@ not a logic bug. This is the single most important structural choice in the buil
 
 **Acceptance (§9 M0):** orchestrator receives a valid `ping` reply `{ok, name, start_layer, end_layer, device}` from both shards.
 
-**Risks:** Python 3.14 has no torch wheel → pin 3.12 (`06`). Llama gating → `huggingface-cli login` or fall back to Qwen (`03` decision #1). Localhost port reuse → run the two shards on `52600` and `52601`.
+**Risks:** Python 3.14 has no torch wheel → pin 3.12 (`06`). Gemma 4 needs `transformers >= 5.5` (Qwen ≥ 4.44) → pin the newer and match both nodes. Default models are ungated, so no login needed. Localhost port reuse → run the two shards on `52600` and `52601`.
 
 **Effort:** 0.5–1 day.
 
@@ -56,7 +56,7 @@ not a logic bug. This is the single most important structural choice in the buil
 **Tasks**
 1. `reference.py` — load the full model normally; **greedy** (`do_sample=False`) generate **50 tokens** from a fixed prompt.
 2. Save the **token-id sequence** + **first-step logits** to `reference_out.npz`.
-3. `AutoConfig`-verify `num_hidden_layers` (Llama 16 / Qwen 28) → this fixes the split point (`03` decision #2).
+3. `AutoConfig`-verify `num_hidden_layers` (Qwen 28 / Gemma 4 E2B 35) → this fixes the split point (`03` decision #2). For Gemma 4 also inspect the config for KV-sharing layer groups — don't split inside one.
 4. Compare logits in **fp32** when diffing later.
 
 **Acceptance (§9 M1):** deterministic output saved; re-running yields identical token ids.
@@ -72,21 +72,30 @@ not a logic bug. This is the single most important structural choice in the buil
 **Goal:** prove sharding/RoPE/KV logic, isolated from the network.
 **Executable on Mac now:** ✅ (highest-risk milestone)
 
+Do M2 on **Qwen first** (plain decoder — isolates the split logic from model quirks), then repeat for Gemma 4 (callout below).
+
 **Tasks**
 1. Finish `engine_torch.forward()`:
    - Run `model.model.layers[start:end]` over the incoming hidden state.
-   - Compute RoPE **locally** from `position_ids` via `model.model.rotary_emb` (layer-agnostic — a shard holding `[k,N)` still computes correct cos/sin). Pass `position_embeddings=(cos,sin)` to layers. **Introspect** the installed `LlamaDecoderLayer.forward` signature (spec §7.2) — never hardcode arg lists.
-   - Keep a per-`session_id` `DynamicCache`; use `cache_position` (not deprecated `_seen_tokens`). `prefill` fills KV for the whole prompt; `decode` appends one position.
-   - `attention_mask`: causal-full for prefill, KV-length-aware for decode (use HF utilities).
+   - Compute RoPE **locally** from `position_ids` via `model.model.rotary_emb` (layer-agnostic — a shard holding `[k,N)` still computes correct cos/sin). Pass `position_embeddings=(cos,sin)` to layers. **Introspect** the *loaded model's* decoder-layer `forward` signature (`type(model.model.layers[0])`, spec §7.2) — never hardcode arg lists (it's `Qwen2DecoderLayer` for Qwen, `Gemma4DecoderLayer` for Gemma 4).
+   - Per-`session_id` cache, **type chosen by model**: `DynamicCache` (Qwen) vs `HybridCache` (Gemma — sliding-window layers). Use `cache_position` (not deprecated `_seen_tokens`). `prefill` fills KV; `decode` appends one position.
+   - `attention_mask`: causal-full for prefill, KV-length-aware for decode (use HF utilities). For Gemma's hybrid attention, build **both** a full and a sliding-window mask and pass the right one per layer by its type.
 2. Finalize `engine_base.py`.
-3. `orchestrator.py` core decode loop (spec §8) with the **in-process transport**: `embed_tokens` → route through both shards → `final_norm` → `lm_head` → argmax.
+3. `orchestrator.py` core decode loop (spec §8) with the **in-process transport**: `embed_tokens` → route through both shards → `final_norm` → `lm_head` → argmax. (Gemma: also apply embedding scaling — callout.)
 4. `parity_test.py` — run the split path greedy 50 tokens, assert token-id sequence equals `reference_out.npz`.
 
-**Acceptance (§9 M2, strict):** split token-id sequence is **exactly** equal to M1.
+**Acceptance (§9 M2, strict):** split token-id sequence is **exactly** equal to M1 (per model).
 
 **Risks (spec §13 suspect list):** (a) RoPE/`position_ids` wiring, (b) KV position accumulation across prefill→decode, (c) attention-mask length, (d) `embed_tokens`/`norm`/`lm_head` applied inside a shard by mistake. Use [`05`](05-parity-debugging-playbook.md) continuously here.
 
-**Effort:** 1.5–2 days.
+> **Gemma 4 second-model bring-up (after Qwen parity).** Same engine, extra model-aware handling — all introspected, never hardcoded (see [`05`](05-parity-debugging-playbook.md) model-specific suspects):
+> - **PLE (per-layer embeddings)** — each shard holds `embed_tokens_per_layer` for *its* layers and computes them from `input_ids` (carried on the wire) — like RoPE, self-computed locally so the boundary stays small. **ORCHESTRATOR/SHARD.**
+> - **Embedding sqrt(hidden) scaling** at the embed step. **ORCHESTRATOR.**
+> - **Dual RoPE theta** (≈10k sliding / 1M global) — shard uses the correct base per layer type. **SHARD.**
+> - **Hybrid per-layer attention** (512 sliding vs global) + **HybridCache** + possible **KV-sharing layer groups**. **SHARD/MASK.**
+> - Tied `lm_head ↔ embed_tokens` (orchestrator holds both — already so).
+
+**Effort:** 1.5–2 days (Qwen) + ~1–1.5 days (Gemma 4 quirks).
 
 ---
 
