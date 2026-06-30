@@ -67,3 +67,26 @@ Models changed from Llama/Qwen to **Qwen2.5-1.5B (primary) + gemma-4-E2B-it (sec
 > The two minor findings from the OK rounds were non-blocking (minors don't gate `OK`) but
 > were applied afterward for completeness — see the round-1-patched `01` and the post-loop
 > edits to `01`/`06`.
+
+---
+
+## Implementation review — M0–M3 code (Exo + references)
+
+After implementing M0–M3, the `drift/` code was reviewed against **Exo** and other
+split-inference references (Petals, llama.cpp RPC, vLLM pipeline parallelism), patching
+until **2 consecutive all-OK**. Fresh independent reviewers each round (direct agent calls
+— the Workflow path had stalled on the docs run).
+
+| Round | Reviewers | Verdict | Blocker/Major | Notes |
+|---|---|---|---|---|
+| 1 | correctness + Exo/design | both OK | 0 | clean |
+| 2 | adversarial-break + spec/reference | both OK | 0 | 6 minors logged (introspected kwargs, EOS breadth, cache sizing, reindex doc, edge-case coverage); Exo's MLX/`mx.distributed` Apple-only coupling re-verified from source |
+| 3 | patch-correctness + minors/doc-consistency | both OK | 0 | all round-2 minors **resolved**; ZERO findings |
+
+**Result:** 2 consecutive all-OK (rounds 2 & 3); round 3 fully clean on the hardened code.
+Empirically verified: `parity_test --selftest` = 6/6 bitwise-equal to a clean reference
+(English/code/Korean; n = 1, 40, 50, 60, 80, 180). Releases: **v0.1.0** (pre-patch reviewed
+state) and **v0.1.1** (hardened, round-3-clean).
+
+**Scope:** M0–M3 done on the Mac (100% of the correctness risk). M4 (Windows MPS+CUDA),
+M5 (booth display), M6 (kill-node resilience) need the second node.
