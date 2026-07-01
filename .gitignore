@@ -8,8 +8,12 @@ __pycache__/
 reference_out.npz
 bench_results.json
 
-# Claude Code local state (keep skills/ and workflows/ tracked)
-.claude/settings.local.json
+# Internal / making-of material — kept on disk, no longer published.
+# NOTE: this only stops FUTURE tracking; these files still exist in prior
+# git history. Purging them from the past needs a history rewrite + force-push.
+docs/
+DRIFT-implementation-spec.md
+.claude/
 
 # OS
 .DS_Store
