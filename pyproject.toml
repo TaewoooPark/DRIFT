@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "drift"
-version = "0.5.0"
+version = "0.6.0"
 description = "Decentralized Routed Inference For Tokens — one model, split across your machines, no datacenter."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -20,11 +20,8 @@ dependencies = [
   "huggingface_hub",
   "accelerate",
   "pyyaml",
+  "zeroconf>=0.131",
 ]
-
-[project.optional-dependencies]
-# LAN auto-discovery for `drift node` / `drift run` (falls back to --nodes without it)
-discovery = ["zeroconf>=0.131"]
 
 [project.scripts]
 drift = "drift.cli:main"

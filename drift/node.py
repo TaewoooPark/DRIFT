@@ -11,6 +11,7 @@ import argparse
 import os
 import sys
 
+from . import discovery
 from .common import free_port, lan_ip, load_config, pick_device
 from .shard_server import Node, serve
 
@@ -25,6 +26,7 @@ def main(argv=None) -> int:
     ap.add_argument("--port", type=int,
                     help="listen port (default: $DRIFT_PORT or an OS-assigned free port)")
     ap.add_argument("--quiet", action="store_true", help="one-line banner (used by `drift up`)")
+    ap.add_argument("--no-advertise", action="store_true", help="do not announce over mDNS")
     args = ap.parse_args(argv)
 
     cfg = {}
@@ -39,21 +41,30 @@ def main(argv=None) -> int:
                 dtype=cfg.get("dtype", "float16"), device=device)
     ip = lan_ip()
 
+    advertised = not args.no_advertise and discovery.HAVE_ZEROCONF
+    disc_line = ("this node auto-announces on the LAN — the head can just run `drift run`"
+                 if advertised else
+                 "zeroconf not active — the head must use `drift run --nodes …`")
     if args.quiet:
-        banner = f"[node] {ip}:{port} device={device} — ready, waiting for the head"
+        banner = f"[node] {ip}:{port} device={device} advertise={advertised} — ready"
     else:
         banner = (
             "\n  DRIFT node ready\n"
             f"    address : {ip}:{port}\n"
             f"    device  : {device}\n"
+            f"    discover: {disc_line}\n"
             "    status  : waiting for the head to assign layers…\n\n"
-            f"  on the head machine, run:  drift run --nodes {ip}:{port},<other-nodes…>\n"
-            "  (or just `drift run` if zeroconf discovery is installed on the LAN)\n"
+            f"  head:  drift run          (auto-discovers this node)\n"
+            f"  head:  drift run --nodes {ip}:{port},<others…>   (explicit)\n"
         )
+
+    handle = None if args.no_advertise else discovery.advertise(port, device, name=node.name)
     try:
         serve(node, args.host, port, banner=banner)
     except KeyboardInterrupt:
         print("\n[node] shutting down", flush=True)
+    finally:
+        discovery.unadvertise(handle)
     return 0
 
 

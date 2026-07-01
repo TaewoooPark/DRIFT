@@ -106,6 +106,29 @@ def _parse_nodes(spec: str) -> list[dict]:
     return out
 
 
+def _select_endpoints(args, cfg: dict) -> list[dict]:
+    """Pick worker endpoints: explicit --nodes → LAN discovery → config shards."""
+    if args.nodes:
+        return _parse_nodes(args.nodes)
+    if not args.no_discover:
+        from . import discovery
+        if discovery.HAVE_ZEROCONF:
+            print(f"[run] discovering nodes on the LAN ({args.discover_timeout:.0f}s) …", flush=True)
+            found = discovery.discover(timeout=args.discover_timeout)
+            if found:
+                eps = [{"name": f"n{i}", "host": f["host"], "port": f["port"],
+                        "device": f.get("device")} for i, f in enumerate(found)]
+                print("[run] found " + ", ".join(
+                    f"{e['host']}:{e['port']}({e.get('device')})" for e in eps), flush=True)
+                return eps
+            print("[run] none found via discovery — falling back to config.yaml", flush=True)
+    shards = cfg.get("shards") or []
+    if not shards:
+        raise SystemExit("no nodes — start `drift node` on each machine, "
+                         "or pass --nodes host:port,…")
+    return [{"name": s["name"], "host": s["host"], "port": s["port"]} for s in shards]
+
+
 def up_main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         prog="drift up",
@@ -152,6 +175,8 @@ def main(argv=None) -> int:
         description="head: assign layers to running nodes and chat/generate")
     ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--nodes", help="comma-separated host:port of running `drift node`s")
+    ap.add_argument("--no-discover", action="store_true", help="skip LAN auto-discovery")
+    ap.add_argument("--discover-timeout", type=float, default=3.0)
     ap.add_argument("--model", help="override model_id")
     ap.add_argument("--prompt", help="one-shot; omit for an interactive chat")
     ap.add_argument("--max-new-tokens", type=int)
@@ -163,13 +188,7 @@ def main(argv=None) -> int:
     head_device = pick_device(cfg.get("device"))
     n_new = args.max_new_tokens or cfg["generation"]["max_new_tokens"]
 
-    if args.nodes:
-        endpoints = _parse_nodes(args.nodes)
-    else:
-        shards = cfg.get("shards") or []
-        if not shards:
-            raise SystemExit("no nodes — pass --nodes host:port,… or define shards in config.yaml")
-        endpoints = [{"name": s["name"], "host": s["host"], "port": s["port"]} for s in shards]
+    endpoints = _select_endpoints(args, cfg)
 
     print(f"[run] {len(endpoints)} node(s); splitting {model_id} …", flush=True)
     orch, plan = build_over_nodes(model_id, dtype, head_device, endpoints)
