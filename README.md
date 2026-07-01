@@ -253,7 +253,7 @@ flowchart LR
     M1["M1 · reference oracle<br/>full model · greedy"] -->|token ids| GATE{"exactly equal?"}
     SPLIT["split path<br/>2 shards"] -->|token ids| GATE
     GATE -->|yes| PASS["✅ parity — advance"]
-    GATE -->|no| BISECT["🔎 fp32 max-abs-diff<br/>+ layer bisection<br/>(docs/05)"]
+    GATE -->|no| BISECT["🔎 fp32 max-abs-diff<br/>+ layer bisection"]
     BISECT -.->|localize broken boundary| SPLIT
     classDef n fill:#111,stroke:#555,color:#eee;
     class M1,SPLIT,GATE,PASS,BISECT n;
@@ -270,15 +270,13 @@ flowchart LR
 
 The `--selftest` is the strongest evidence: it re-derives a fresh reference and compares, across prompt *kinds* (prose, source code, Korean) and *lengths* (a single-token generation up to a 180-token decode). Every token id matches — first divergence index `None` in all six.
 
-**MPS ↔ CUDA (M4).** Only at the true cross-machine step do the two GPU vendors' kernels round fp16 differently, so greedy decoding may diverge in *later* tokens — this is expected, and handled by a **relaxed gate** (early tokens match + coherent output). Divergence at token 1–2 is a **bug**, not float noise → bisect. The playbook for exactly this is **[docs/05-parity-debugging-playbook.md](docs/05-parity-debugging-playbook.md)**.
-
-This implementation was reviewed to **two consecutive all-OK rounds** — correctness plus a design comparison against Exo/Petals/llama.cpp — verifying the Exo coupling claim from Exo's own source. Ledger: **[docs/07-review-log.md](docs/07-review-log.md)**.
+**MPS ↔ CUDA (M4).** Only at the true cross-machine step do the two GPU vendors' kernels round fp16 differently, so greedy decoding may diverge in *later* tokens — this is expected, and handled by a **relaxed gate** (early tokens match + coherent output). Divergence at token 1–2 is a **bug**, not float noise → bisect.
 
 ---
 
 ## Benchmarks
 
-*Methodology, controls, and the fair competitor protocol: **[docs/08-benchmark-plan.md](docs/08-benchmark-plan.md)**. Reproduce every number with `python -m drift.bench`.*
+*Methodology, controls, and the fair competitor protocol: **[docs/benchmarks.md](docs/benchmarks.md)**. Reproduce every number with `python -m drift.bench`.*
 
 `tokens/sec` is the wrong axis to lead with: on an Apple-only cluster Exo's native MLX path wins raw throughput, and on the axis DRIFT owns — Mac(MPS)↔Windows(CUDA) — no competitor even runs ([see the table](#why-this-is-different)). So the numbers live where a *correct* split genuinely leads, all on **one** Mac — Qwen2.5-1.5B-Instruct · fp16 · Apple MPS.
 
@@ -315,7 +313,7 @@ The heaviest single node carries **42.4 %** of the model — one 2× too big for
 
 The **same decode loop** runs over both transports, so the M3 − M2 delta is the *pure* cost of the framework-neutral protocol — the thing that lets MPS and CUDA cooperate. At localhost it is indistinguishable from zero: the 3 KB round-trip is dwarfed by compute. (A real LAN adds RTT on top, unchanged by DRIFT.)
 
-> Absolute, reproducible numbers — not a cherry-picked win. A head-to-head `tok/s` against Exo / llama.cpp RPC needs them installed on the same box; the honest protocol for that is in **[docs/08](docs/08-benchmark-plan.md)**. Today's comparative claim is the capability matrix above **plus** a distributed output that is *provably* identical to one machine.
+> Absolute, reproducible numbers — not a cherry-picked win. A head-to-head `tok/s` against Exo / llama.cpp RPC needs them installed on the same box; the honest protocol for that is in **[docs/benchmarks.md](docs/benchmarks.md)**. Today's comparative claim is the capability matrix above **plus** a distributed output that is *provably* identical to one machine.
 
 ---
 
@@ -347,7 +345,7 @@ Each Gemma 4 quirk maps cleanly onto a plane — **orchestrator** (embed scaling
 
 ## Design rationale (why-not)
 
-The interesting decisions are the ones DRIFT declined. Each is a hard constraint in the spec.
+The interesting decisions are the ones DRIFT declined. Each is a deliberate, hard constraint.
 
 - **Why not `torch.distributed` / NCCL / gloo across nodes?** NCCL cannot place an Apple Metal device and an NVIDIA CUDA device in one process group — full stop. And any of these couples the *data plane* to a specific backend, which is exactly what DRIFT refuses. The wire is neutral bytes so the runtimes need agree on nothing but framing.
 - **Why not ship the KV cache between nodes?** KV is megabytes per token and grows with sequence length; sending it would dwarf the ~3 KB residual and destroy the economics. Each shard keeps its own KV locally; only the residual stream travels.
@@ -426,10 +424,10 @@ drift/
   parity_test.py    # M2/M3 gate + multi-prompt --selftest
   common.py         # config + identical tokenization (shared by oracle and split path)
 config.yaml         # model, dtype, port, shard table
-docs/               # 01 impl plan · 02 workflow · 03 goals · 04 skills/MCP · 05 parity playbook · 06 setup · 07 review log
+docs/               # public benchmark methodology + measured results (benchmarks.md)
 ```
 
-**Reviewer's shortlist:** `engine_torch.py` (the KV re-index + introspection), `protocol.py` (the frozen wire), `orchestrator.py` (the injectable transport + decode loop), and `docs/05` (how parity is debugged).
+**Reviewer's shortlist:** `engine_torch.py` (the KV re-index + introspection), `protocol.py` (the frozen wire), `orchestrator.py` (the injectable transport + decode loop).
 
 ---
 

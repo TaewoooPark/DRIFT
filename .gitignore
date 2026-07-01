@@ -11,7 +11,9 @@ bench_results.json
 # Internal / making-of material — kept on disk, no longer published.
 # NOTE: this only stops FUTURE tracking; these files still exist in prior
 # git history. Purging them from the past needs a history rewrite + force-push.
-docs/
+# Exception: docs/benchmarks.md is the one public doc kept in the repo.
+docs/*
+!docs/benchmarks.md
 DRIFT-implementation-spec.md
 .claude/
 
