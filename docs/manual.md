@@ -46,21 +46,26 @@ elsewhere.
 
 ## 2 · The 60-second run
 
-Two shards on **one** machine (localhost), then a real generation over TCP:
+Install once — `bash scripts/install.sh` (macOS/Linux) or `powershell -File scripts\install.ps1`
+(Windows) — then `drift doctor` to sanity-check. To run:
+
+**On one machine:**
 
 ```bash
-# terminal A — front half, layers [0,14)
-DRIFT_PORT=52600 python -m drift.shard_server --name mac     --start 0  --end 14 --device mps --preload
-# terminal B — back half, layers [14,28)
-DRIFT_PORT=52601 python -m drift.shard_server --name windows --start 14 --end 28 --device mps --preload
-# terminal C — health check, then generate
-python -m drift.orchestrator --ping   --ports 52600,52601
-python -m drift.orchestrator --prompt "Explain pipeline parallelism in two sentences." --ports 52600,52601
+drift up 2      # spawn 2 local nodes, auto-split the model, and chat
+                # add --prompt "…" for a one-shot answer
 ```
 
-The last command **is** the product: the orchestrator embeds the prompt, routes the hidden
-state through shard A then shard B, and prints the decoded answer — each shard running only
-its own layers. Everything below is how to change what that run does.
+**Across machines:**
+
+```bash
+drift node      # on each worker — auto device, announced on the LAN
+drift run       # on the head — auto-discovers the workers, splits, streams
+```
+
+**No layer ranges, no IPs, no device flags.** `drift run` reads the model's layer count,
+splits it across the nodes it finds, and each node computes only its slice. Everything below
+is how to change what a run does — and §5–§6 also cover driving the shards by hand.
 
 ---
 
@@ -127,6 +132,13 @@ model: 28 decoder layers (Qwen2.5-1.5B)
 
 ## 5 · Running across two machines (Mac + Windows)
 
+**The easy way.** On each worker run `drift node` (it auto-detects the device and announces
+itself); on the head run `drift run` (it auto-discovers the workers over the LAN, splits the
+model, and streams). No IPs, no ranges. If the LAN blocks mDNS, list the workers explicitly:
+`drift run --nodes 192.168.0.22:PORT,192.168.0.11:PORT`. The rest of this section is the
+**by-hand** method — useful for pinning exact ports/ranges or wanting full manual control.
+
+
 The localhost run in §2 becomes a real cluster with three changes.
 
 **1) Point the config at each machine.** On the orchestrator node, set each shard's `host` to
@@ -171,6 +183,20 @@ Notes:
 ## 6 · CLI reference
 
 Every entry point takes `--config` (default `config.yaml`).
+
+### `drift` — the high-level commands
+
+| Command | What it does |
+|---|---|
+| `drift doctor` | preflight: Python/torch/device, deps, `config.yaml` tiling, port reachability, firewall hints |
+| `drift up N` | localhost: spawn N nodes, auto-split, chat (or `--prompt` for one-shot) |
+| `drift node` | run THIS machine as a worker: auto device, LAN-announced, waits for the head |
+| `drift run` | the head: discover nodes (or `--nodes host:port,…`), auto-split, configure, stream/chat |
+
+`drift up`, `node`, and `run` take `--max-new-tokens`; `run` also takes `--model` and
+`--nodes`. These wrap the lower-level modules below — use the modules directly for the
+parity gate and benchmarks.
+
 
 ### `drift.shard_server` — run one shard
 

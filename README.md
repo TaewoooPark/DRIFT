@@ -374,42 +374,33 @@ The Mac-only track (M0–M3) is ~80 % of the engineering and **100 % of the corr
 
 ## Quickstart
 
-Requires Python **3.12** (PyTorch has no 3.14 wheel yet) and [`uv`](https://github.com/astral-sh/uv). Both default models are **ungated** — no Hugging Face login needed.
+Requires Python **3.12** and [`uv`](https://github.com/astral-sh/uv). Both default models are **ungated** — no Hugging Face login. The commands below are the real `drift` CLI (`scripts/install.sh` provides it).
+
+**Install** — on each machine:
 
 ```bash
 git clone https://github.com/TaewoooPark/DRIFT && cd DRIFT
-
-# 1 · isolated env + deps (torch's macOS arm64 wheel already includes MPS)
-uv venv --python 3.12 .venv && source .venv/bin/activate
-uv pip install "torch" "transformers>=5.5" safetensors msgpack numpy huggingface_hub accelerate pyyaml
-export PYTORCH_ENABLE_MPS_FALLBACK=1
-
-# 2 · M1 — build the reference oracle           (downloads Qwen2.5-1.5B once)
-python -m drift.reference                        # → reference_out.npz, 28 layers, coherent text
-
-# 3 · M2 — in-process 2-shard parity            (MUST be bitwise-equal to M1)
-python -m drift.parity_test --mode inprocess     # → PASS 50/50
-
-# 4 · robustness — 6 prompts, English/code/Korean, n = 1…180
-python -m drift.parity_test --selftest           # → ALL PASS
+bash scripts/install.sh          # macOS / Linux   ·   Windows: powershell -File scripts\install.ps1
+drift doctor                     # checks Python, torch, device, config, ports
 ```
 
-**M3 — real TCP across two processes** (two shard servers + the orchestrator):
+**One machine** — the 30-second try:
 
 ```bash
-# terminal A — Mac shard, layers [0,14)
-DRIFT_PORT=52600 python -m drift.shard_server --name mac     --start 0  --end 14 --device mps --preload
-# terminal B — second shard, layers [14,28)
-DRIFT_PORT=52601 python -m drift.shard_server --name windows --start 14 --end 28 --device mps --preload
-# terminal C — health check, then parity over the wire, then generate
-python -m drift.orchestrator --ping    --ports 52600,52601      # → M0 ping: PASS
-python -m drift.parity_test  --mode socket --ports 52600,52601  # → PASS 50/50 over TCP
-python -m drift.orchestrator --prompt "Explain pipeline parallelism." --ports 52600,52601
+drift up 2                       # spawn 2 local nodes, auto-split the model, open a chat
+                                 # (add --prompt "…" for a one-shot answer)
 ```
 
-Everything is configured in **`config.yaml`** — model id, dtype, port, and the per-shard layer ranges + device. To try Gemma 4, set `model_id: google/gemma-4-E2B-it` and the split to `0–18 / 18–35`.
+**Across your machines** — one model, no datacenter:
 
-**Actually using it.** The `--prompt` call above *is* the real thing: the orchestrator tokenizes, routes the hidden state through every shard in turn, and streams the answer back — each machine computing only its own layer range. To put the shards on **different machines** (Mac + Windows), set each shard's `host`/`device` in `config.yaml`, start `drift.shard_server --host 0.0.0.0 …` on each box, and run the orchestrator from the node that holds the head. **Everything you can tune — models, split points, devices, ports, cross-machine setup, sampling, troubleshooting — is in the operations manual: [docs/manual.md](docs/manual.md).**
+```bash
+drift node                       # on each worker: auto-detects the GPU, announces on the LAN
+drift run                        # on the head: auto-discovers the workers, splits, streams
+```
+
+That is the whole thing — **no layer ranges, no IPs, no device flags.** `drift run` reads the model's layer count, splits it across the nodes it finds, and streams the answer; each machine computes only its slice. (No zeroconf on the LAN? `drift run --nodes host:port,…`.) To try Gemma 4, set `model_id: google/gemma-4-E2B-it` in `config.yaml` — the split is recomputed automatically.
+
+Changing models and split points, driving it by hand, the bitwise-parity gate, and benchmarks are all in the **operations manual → [docs/manual.md](docs/manual.md)** ([한국어](docs/manual.ko.md) · [中文](docs/manual.zh.md) · [日本語](docs/manual.ja.md)).
 
 ---
 

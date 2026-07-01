@@ -374,42 +374,33 @@ Mac のみで完結するトラック（M0–M3）は、エンジニアリング
 
 ## クイックスタート
 
-Python **3.12**（PyTorch にはまだ 3.14 の wheel がありません）と [`uv`](https://github.com/astral-sh/uv) が必要です。デフォルトの 2 つのモデルはどちらも **ゲートなし** です — Hugging Face のログインは不要です。
+Python **3.12** と [`uv`](https://github.com/astral-sh/uv) が必要です。デフォルトの 2 つのモデルはどちらも **ゲートなし** です — Hugging Face のログインは不要です。以下のコマンドは本物の `drift` CLI です（`scripts/install.sh` がそれを提供します）。
+
+**インストール** — 各マシンで:
 
 ```bash
 git clone https://github.com/TaewoooPark/DRIFT && cd DRIFT
-
-# 1 · 隔離された環境 + 依存関係（torch の macOS arm64 wheel にはすでに MPS が含まれる）
-uv venv --python 3.12 .venv && source .venv/bin/activate
-uv pip install "torch" "transformers>=5.5" safetensors msgpack numpy huggingface_hub accelerate pyyaml
-export PYTORCH_ENABLE_MPS_FALLBACK=1
-
-# 2 · M1 — リファレンスオラクルを構築           （Qwen2.5-1.5B を一度だけダウンロード）
-python -m drift.reference                        # → reference_out.npz、28 レイヤー、一貫したテキスト
-
-# 3 · M2 — プロセス内 2 シャードのパリティ            （M1 とビット単位で等しくなければならない）
-python -m drift.parity_test --mode inprocess     # → PASS 50/50
-
-# 4 · 頑健性 — 6 プロンプト、英語/コード/韓国語、n = 1…180
-python -m drift.parity_test --selftest           # → ALL PASS
+bash scripts/install.sh          # macOS / Linux   ·   Windows: powershell -File scripts\install.ps1
+drift doctor                     # checks Python, torch, device, config, ports
 ```
 
-**M3 — 2 つのプロセスにまたがる本物の TCP**（2 つのシャードサーバー + オーケストレーター）:
+**1 台のマシン** — 30 秒で試す:
 
 ```bash
-# ターミナル A — Mac シャード、レイヤー [0,14)
-DRIFT_PORT=52600 python -m drift.shard_server --name mac     --start 0  --end 14 --device mps --preload
-# ターミナル B — 2 つ目のシャード、レイヤー [14,28)
-DRIFT_PORT=52601 python -m drift.shard_server --name windows --start 14 --end 28 --device mps --preload
-# ターミナル C — ヘルスチェック、次にワイヤ越しのパリティ、そして生成
-python -m drift.orchestrator --ping    --ports 52600,52601      # → M0 ping: PASS
-python -m drift.parity_test  --mode socket --ports 52600,52601  # → PASS 50/50 over TCP
-python -m drift.orchestrator --prompt "Explain pipeline parallelism." --ports 52600,52601
+drift up 2                       # spawn 2 local nodes, auto-split the model, open a chat
+                                 # (add --prompt "…" for a one-shot answer)
 ```
 
-すべては **`config.yaml`** で設定します — モデル id、dtype、ポート、そしてシャードごとのレイヤー範囲 + デバイス。Gemma 4 を試すには、`model_id: google/gemma-4-E2B-it` を設定し、分割を `0–18 / 18–35` にします。
+**複数のマシンにまたがって** — 1 つのモデル、データセンターなし:
 
-**実際に使う。** 上の `--prompt` 呼び出しこそが本番です。オーケストレーターがプロンプトをトークナイズし、hidden state を各シャードへ順にルーティングして答えをストリーミングで返します — 各マシンは自分のレイヤー範囲だけを計算します。シャードを**別々のマシン**（Mac + Windows）に置くには、`config.yaml` で各シャードの `host`/`device` を設定し、各マシンで `drift.shard_server --host 0.0.0.0 …` を起動し、head を持つノードからオーケストレーターを実行します。**モデル・分割点・デバイス・ポート・クロスマシン構成・サンプリング・トラブルシューティングなど、調整できるものはすべて運用マニュアルにあります: [docs/manual.ja.md](docs/manual.ja.md)。**
+```bash
+drift node                       # on each worker: auto-detects the GPU, announces on the LAN
+drift run                        # on the head: auto-discovers the workers, splits, streams
+```
+
+これで全部です — **レイヤー範囲も、IP も、デバイスフラグもありません。** `drift run` はモデルのレイヤー数を読み取り、見つけたノード群にまたがって分割し、答えをストリーミングします。各マシンは自分のスライスだけを計算します。（LAN 上に zeroconf がない？ `drift run --nodes host:port,…`。）Gemma 4 を試すには、`config.yaml` で `model_id: google/gemma-4-E2B-it` を設定します — 分割は自動で再計算されます。
+
+モデルと分割点の変更、手動での操作、ビット単位パリティゲート、そしてベンチマークは、すべて **運用マニュアル → [docs/manual.ja.md](docs/manual.ja.md)** にあります ([English](docs/manual.md) · [한국어](docs/manual.ko.md) · [中文](docs/manual.zh.md))。
 
 ---
 
