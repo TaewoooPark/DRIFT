@@ -109,6 +109,18 @@ class SocketTransport:
         protocol.send_msg(sk, {"type": "reset", "session_id": session_id})
         protocol.recv_msg(sk)
 
+    def configure(self, name, start_layer, end_layer, model_id, dtype, device=None):
+        """Push a layer range to an unassigned (fungible) node."""
+        sk = self._sock(name)
+        protocol.send_msg(sk, {
+            "type": "configure", "model_id": model_id, "dtype": dtype,
+            "start_layer": start_layer, "end_layer": end_layer, "device": device,
+        })
+        reply = protocol.recv_msg(sk)
+        if not reply.get("ok"):
+            raise RuntimeError(f"configure {name} failed: {reply.get('error')}")
+        return reply
+
     def ping(self, name):
         sk = self._sock(name)
         protocol.send_msg(sk, {"type": "ping"})

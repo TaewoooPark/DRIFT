@@ -6,7 +6,7 @@ this framing can join.
 
 Request schema:
     {
-      "type":        "prefill" | "decode" | "reset" | "ping",
+      "type":        "prefill" | "decode" | "reset" | "ping" | "configure",
       "session_id":  str,
       "seq_id":      int,                 # monotonic, for ordering/debug
       "shape":       [B, S, D],           # hidden_states shape (decode: S=1)
@@ -18,7 +18,13 @@ Request schema:
     }
 Response schema:
     { "ok": bool, "shape": [B,S,D], "dtype": "float16", "tensor": <bytes>, "error": str|null }
-ping response: { "ok": true, "name", "start_layer", "end_layer", "device" }
+ping response: { "ok": true, "assigned": bool, "name", "start_layer", "end_layer", "device" }
+
+`configure` lets the orchestrator assign a layer range to an *unassigned* node
+(so users never hand-write ranges): a new message TYPE — the 4B+msgpack framing
+is unchanged — carrying { "type":"configure", "model_id", "dtype",
+"start_layer", "end_layer", "device"? }. The node builds/loads its engine and
+replies with its ping info. Pre-assigned nodes (fixed range at launch) ignore it.
 
 The boundary carries only hidden_states (floats) + position_ids + input_ids (ints).
 No KV, no framework objects. fp16 CPU round-trip is bit-lossless, so serialization

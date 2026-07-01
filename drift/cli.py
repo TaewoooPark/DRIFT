@@ -13,6 +13,8 @@ import sys
 # command -> (module, function, args prepended before the user's)
 _COMMANDS: dict[str, tuple[str, str, list[str]]] = {
     "doctor":    ("drift.doctor", "main", []),
+    "up":        ("drift.run", "up_main", []),
+    "node":      ("drift.node", "main", []),
     "reference": ("drift.reference", "main", []),
     "parity":    ("drift.parity_test", "main", []),
     "bench":     ("drift.bench", "main", []),
@@ -23,8 +25,12 @@ _HELP = """drift — run one model split across your machines, no datacenter.
 
 usage: drift <command> [options]
 
-commands:
+getting started:
   doctor        preflight environment & config check (run this first)
+  up [N]        localhost: spawn N nodes, auto-split the model, and generate
+  node          run THIS machine as a worker (auto device/port, LAN-reachable)
+
+commands:
   reference     single-machine reference generation (the oracle)
   parity        bitwise parity gate   (--mode inprocess|socket, --selftest)
   bench         benchmarks            (fidelity / footprint / wire / overhead)
