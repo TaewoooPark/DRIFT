@@ -14,6 +14,7 @@ import sys
 _COMMANDS: dict[str, tuple[str, str, list[str]]] = {
     "doctor":    ("drift.doctor", "main", []),
     "up":        ("drift.run", "up_main", []),
+    "run":       ("drift.run", "main", []),
     "node":      ("drift.node", "main", []),
     "reference": ("drift.reference", "main", []),
     "parity":    ("drift.parity_test", "main", []),
@@ -27,8 +28,10 @@ usage: drift <command> [options]
 
 getting started:
   doctor        preflight environment & config check (run this first)
-  up [N]        localhost: spawn N nodes, auto-split the model, and generate
+  up [N]        localhost: spawn N nodes, auto-split the model, and chat/generate
   node          run THIS machine as a worker (auto device/port, LAN-reachable)
+  run           head: assign layers to running nodes and chat/generate
+                  (--nodes host:port,… ; omit --prompt for an interactive chat)
 
 commands:
   reference     single-machine reference generation (the oracle)

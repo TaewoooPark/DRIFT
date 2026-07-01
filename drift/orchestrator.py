@@ -181,6 +181,59 @@ class Orchestrator:
             self.transport.reset(name, session_id)
         return {"token_ids": generated, "first_logits": first_logits, "text": tok.decode(generated)}
 
+    @torch.no_grad()
+    def generate_stream(self, prompt: str, max_new_tokens: int, stop_on_eos: bool = True,
+                        session_id: str = "s0"):
+        """Same decode loop as generate(), but *yields* decoded text as it lands.
+
+        Yields incremental UTF-8-safe text deltas (decode the full id list each
+        step and emit the new suffix, so multibyte tokens never break). EOS is
+        not emitted. The result is identical to generate() — this only changes
+        when the tokens reach the caller.
+        """
+        tok = self.head.tokenizer
+        input_ids = build_input_ids(tok, prompt).to(self.device)
+        S = input_ids.shape[1]
+        eos: set[int] = set()
+        if stop_on_eos:
+            if tok.eos_token_id is not None:
+                eos.add(int(tok.eos_token_id))
+            gen_eos = getattr(getattr(self.head.lm, "generation_config", None), "eos_token_id", None)
+            if isinstance(gen_eos, int):
+                eos.add(gen_eos)
+            elif isinstance(gen_eos, (list, tuple)):
+                eos.update(int(x) for x in gen_eos)
+
+        hidden = self.head.embed(input_ids)
+        pos = list(range(S))
+        ids_list = input_ids[0].tolist()
+        for name in self.order:
+            hidden = self.transport.forward(name, session_id, hidden, pos, ids_list, "prefill").to(self.device)
+        logits = self.head.head(self.head.norm(hidden[:, -1:, :]))[:, -1, :]
+        next_id = int(torch.argmax(logits, dim=-1))
+
+        generated: list[int] = []
+        prev = ""
+        p = S
+        for _ in range(max_new_tokens):
+            if stop_on_eos and next_id in eos:
+                break
+            generated.append(next_id)
+            text = tok.decode(generated)
+            if len(text) > len(prev):
+                yield text[len(prev):]
+                prev = text
+            cur = torch.tensor([[next_id]], device=self.device)
+            hidden = self.head.embed(cur)
+            for name in self.order:
+                hidden = self.transport.forward(name, session_id, hidden, [p], [next_id], "decode").to(self.device)
+            logits = self.head.head(self.head.norm(hidden[:, -1:, :]))[:, -1, :]
+            next_id = int(torch.argmax(logits, dim=-1))
+            p += 1
+
+        for name in self.order:
+            self.transport.reset(name, session_id)
+
 
 # ----------------------------------------------------------- builders / CLI
 def build_inprocess(cfg: dict) -> Orchestrator:
