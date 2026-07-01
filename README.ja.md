@@ -409,6 +409,8 @@ python -m drift.orchestrator --prompt "Explain pipeline parallelism." --ports 52
 
 すべては **`config.yaml`** で設定します — モデル id、dtype、ポート、そしてシャードごとのレイヤー範囲 + デバイス。Gemma 4 を試すには、`model_id: google/gemma-4-E2B-it` を設定し、分割を `0–18 / 18–35` にします。
 
+**実際に使う。** 上の `--prompt` 呼び出しこそが本番です。オーケストレーターがプロンプトをトークナイズし、hidden state を各シャードへ順にルーティングして答えをストリーミングで返します — 各マシンは自分のレイヤー範囲だけを計算します。シャードを**別々のマシン**（Mac + Windows）に置くには、`config.yaml` で各シャードの `host`/`device` を設定し、各マシンで `drift.shard_server --host 0.0.0.0 …` を起動し、head を持つノードからオーケストレーターを実行します。**モデル・分割点・デバイス・ポート・クロスマシン構成・サンプリング・トラブルシューティングなど、調整できるものはすべて運用マニュアルにあります: [docs/manual.ja.md](docs/manual.ja.md)。**
+
 ---
 
 ## リポジトリマップ — どこを見るか
@@ -424,7 +426,7 @@ drift/
   parity_test.py    # M2/M3 ゲート + マルチプロンプト --selftest
   common.py         # config + 同一のトークン化（オラクルと分割経路で共有）
 config.yaml         # モデル、dtype、ポート、シャードテーブル
-docs/               # 公開ベンチマーク方法論 + 実測結果 (benchmarks.md)
+docs/               # 公開ドキュメント — benchmarks.md（方法論 + 結果）· manual.ja.md（実行方法）
 ```
 
 **レビュアー向けの要点リスト:** `engine_torch.py`（KV 再インデックス + イントロスペクション）、`protocol.py`（凍結されたワイヤ）、`orchestrator.py`（差し替え可能なトランスポート + デコードループ）。

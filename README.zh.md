@@ -409,6 +409,8 @@ python -m drift.orchestrator --prompt "Explain pipeline parallelism." --ports 52
 
 一切都在 **`config.yaml`** 里配置——模型 id、dtype、端口，以及每个分片的层范围 + device。要试 Gemma 4，把 `model_id: google/gemma-4-E2B-it` 设好，并把切分改为 `0–18 / 18–35`。
 
+**真正上手使用。** 上面的 `--prompt` 调用*就是*真实用法：编排器把 prompt 分词，将 hidden state 依次路由穿过每个分片，再把答案流式返回——每台机器只计算自己那段层范围。要把分片放到**不同机器**上（Mac + Windows），在 `config.yaml` 里为每个分片设好 `host`/`device`，在每台机器上启动 `drift.shard_server --host 0.0.0.0 …`，再从持有 head 的节点运行编排器。**所有可调项——模型、切分点、device、端口、跨机配置、采样、排障——都在操作手册里：[docs/manual.zh.md](docs/manual.zh.md)。**
+
 ---
 
 ## 仓库地图——该看哪里
@@ -424,7 +426,7 @@ drift/
   parity_test.py    # M2/M3 门禁 + 多 prompt --selftest
   common.py         # config + 完全一致的分词（oracle 与切分路径共用）
 config.yaml         # 模型、dtype、端口、分片表
-docs/               # 公开的基准测试方法论 + 实测结果 (benchmarks.md)
+docs/               # 公开文档 — benchmarks.md（方法论 + 结果）· manual.zh.md（如何运行）
 ```
 
 **审阅者的重点清单：** `engine_torch.py`（KV 重索引 + 自省）、`protocol.py`（冻结的线缆）、`orchestrator.py`（可注入传输层 + 解码循环）。

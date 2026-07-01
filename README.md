@@ -409,6 +409,8 @@ python -m drift.orchestrator --prompt "Explain pipeline parallelism." --ports 52
 
 Everything is configured in **`config.yaml`** — model id, dtype, port, and the per-shard layer ranges + device. To try Gemma 4, set `model_id: google/gemma-4-E2B-it` and the split to `0–18 / 18–35`.
 
+**Actually using it.** The `--prompt` call above *is* the real thing: the orchestrator tokenizes, routes the hidden state through every shard in turn, and streams the answer back — each machine computing only its own layer range. To put the shards on **different machines** (Mac + Windows), set each shard's `host`/`device` in `config.yaml`, start `drift.shard_server --host 0.0.0.0 …` on each box, and run the orchestrator from the node that holds the head. **Everything you can tune — models, split points, devices, ports, cross-machine setup, sampling, troubleshooting — is in the operations manual: [docs/manual.md](docs/manual.md).**
+
 ---
 
 ## Repository map — where to look
@@ -424,7 +426,7 @@ drift/
   parity_test.py    # M2/M3 gate + multi-prompt --selftest
   common.py         # config + identical tokenization (shared by oracle and split path)
 config.yaml         # model, dtype, port, shard table
-docs/               # public benchmark methodology + measured results (benchmarks.md)
+docs/               # public docs — benchmarks.md (methodology + results) · manual.md (how to run it)
 ```
 
 **Reviewer's shortlist:** `engine_torch.py` (the KV re-index + introspection), `protocol.py` (the frozen wire), `orchestrator.py` (the injectable transport + decode loop).

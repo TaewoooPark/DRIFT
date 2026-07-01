@@ -409,6 +409,8 @@ python -m drift.orchestrator --prompt "Explain pipeline parallelism." --ports 52
 
 모든 것은 **`config.yaml`**에서 설정된다: 모델 id, dtype, 포트, 그리고 샤드별 레이어 범위 + 디바이스가 그러하다. Gemma 4를 시도하고자 한다면 `model_id: google/gemma-4-E2B-it`로, 분할을 `0–18 / 18–35`로 설정하면 된다.
 
+**실제로 사용하기.** 위의 `--prompt` 호출이 곧 실제 사용이다: 오케스트레이터가 프롬프트를 토크나이즈하고 hidden state를 각 샤드로 차례로 라우팅한 뒤 답을 스트리밍해 돌려주며, 이때 각 기기는 자기 레이어 범위만 계산한다. 샤드를 **서로 다른 기기**(Mac + Windows)에 두려면 `config.yaml`에서 각 샤드의 `host`/`device`를 지정하고, 각 기기에서 `drift.shard_server --host 0.0.0.0 …`을 띄운 뒤, 헤드를 가진 노드에서 오케스트레이터를 실행하면 된다. **모델·분할 지점·디바이스·포트·크로스머신 구성·샘플링·문제 해결 등 조정 가능한 모든 것은 운영 매뉴얼에 있다: [docs/manual.ko.md](docs/manual.ko.md).**
+
 ---
 
 ## 저장소 지도: 어디를 봐야 하는가
@@ -424,7 +426,7 @@ drift/
   parity_test.py    # M2/M3 게이트 + 다중 프롬프트 --selftest
   common.py         # 설정 + 동일 토큰화 (오라클과 분할 경로가 공유)
 config.yaml         # 모델, dtype, 포트, 샤드 테이블
-docs/               # 공개 벤치마크 방법론 + 측정 결과 (benchmarks.md)
+docs/               # 공개 문서 — benchmarks.md (방법론 + 결과) · manual.ko.md (실행 방법)
 ```
 
 **리뷰어를 위한 짧은 목록:** `engine_torch.py`(KV 재인덱싱 + 인트로스펙션), `protocol.py`(고정된 와이어), `orchestrator.py`(주입 가능한 전송 계층 + 디코드 루프), 이들이 곧 먼저 살펴봄 직한 지점이라 하겠다.

@@ -14,6 +14,10 @@ bench_results.json
 # Exception: docs/benchmarks.md is the one public doc kept in the repo.
 docs/*
 !docs/benchmarks.md
+!docs/manual.md
+!docs/manual.ko.md
+!docs/manual.zh.md
+!docs/manual.ja.md
 DRIFT-implementation-spec.md
 .claude/
 
