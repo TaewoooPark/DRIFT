@@ -374,9 +374,9 @@ The Mac-only track (M0–M3) is ~80 % of the engineering and **100 % of the corr
 
 ## Quickstart
 
-Requires Python **3.12** and [`uv`](https://github.com/astral-sh/uv). Both default models are **ungated** — no Hugging Face login. The commands below are the real `drift` CLI (`scripts/install.sh` provides it).
+Requires Python **3.12** and [`uv`](https://github.com/astral-sh/uv). Both default models are **ungated** — no Hugging Face login. Everything below is the real `drift` CLI.
 
-**Install** — on each machine:
+**1 · Install** — on each machine:
 
 ```bash
 git clone https://github.com/TaewoooPark/DRIFT && cd DRIFT
@@ -384,23 +384,38 @@ bash scripts/install.sh          # macOS / Linux   ·   Windows: powershell -Fil
 drift doctor                     # checks Python, torch, device, config, ports
 ```
 
-**One machine** — the 30-second try:
+**2 · Try it on one machine:**
 
 ```bash
-drift up 2                       # spawn 2 local nodes, auto-split the model, open a chat
+drift up 2                       # 2 local nodes, auto-split the model, open a chat
                                  # (add --prompt "…" for a one-shot answer)
 ```
 
-**Across your machines** — one model, no datacenter:
+**3 · Run one model across your Mac + a CUDA PC** — the real thing.
+
+The **head** types the prompt and holds `embed`/`lm_head`; the decoder layers live on the **nodes**. To use *both* GPUs, the Mac runs a node **and** the head; the PC runs a node:
 
 ```bash
-drift node                       # on each worker: auto-detects the GPU, announces on the LAN
-drift run                        # on the head: auto-discovers the workers, splits, streams
+# Windows PC (NVIDIA)          — one terminal
+drift node --port 52601        # device = cuda, announced on the LAN
+
+# Mac (Apple)                  — terminal 1: a worker
+drift node --port 52600        # device = mps
+
+# Mac                          — terminal 2: the head (type the prompt)
+drift run --prompt "hello world"
 ```
 
-That is the whole thing — **no layer ranges, no IPs, no device flags.** `drift run` reads the model's layer count, splits it across the nodes it finds, and streams the answer; each machine computes only its slice. (No zeroconf on the LAN? `drift run --nodes host:port,…`.) To try Gemma 4, set `model_id: google/gemma-4-E2B-it` in `config.yaml` — the split is recomputed automatically.
+```text
+  node : 127.0.0.1:52600     layers [0:14)   · device=mps      ← the Mac computes these
+  node : 192.168.0.22:52601  layers [14:28)  · device=cuda     ← the PC computes these
 
-Changing models and split points, driving it by hand, the bitwise-parity gate, and benchmarks are all in the **operations manual → [docs/manual.md](docs/manual.md)** ([한국어](docs/manual.ko.md) · [中文](docs/manual.zh.md) · [日本語](docs/manual.ja.md)).
+  Hello! How can I help you today?
+```
+
+Two Macs or two Windows PCs run with the **same three commands** — devices auto-detect, `drift run` finds and splits. If Wi-Fi blocks mDNS, name the nodes: `drift run --nodes 192.168.0.22:52601,127.0.0.1:52600 --prompt "hello world"`. Across GPU vendors (MPS↔CUDA) fp16 rounds a little differently, so long answers may drift in later tokens — expected, not a bug.
+
+**Customize & fine-tune** — models, split points, devices, driving the shards by hand, and troubleshooting — is all in the **operations manual → [docs/manual.md](docs/manual.md)** ([한국어](docs/manual.ko.md) · [中文](docs/manual.zh.md) · [日本語](docs/manual.ja.md)).
 
 ---
 

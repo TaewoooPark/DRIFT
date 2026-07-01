@@ -374,9 +374,9 @@ Mac のみで完結するトラック（M0–M3）は、エンジニアリング
 
 ## クイックスタート
 
-Python **3.12** と [`uv`](https://github.com/astral-sh/uv) が必要です。デフォルトの 2 つのモデルはどちらも **ゲートなし** です — Hugging Face のログインは不要です。以下のコマンドは本物の `drift` CLI です（`scripts/install.sh` がそれを提供します）。
+Python **3.12** と [`uv`](https://github.com/astral-sh/uv) が必要です。デフォルトの 2 つのモデルはどちらも **ゲートなし** です — Hugging Face のログインは不要です。以下はすべて本物の `drift` CLI です。
 
-**インストール** — 各マシンで:
+**1 · インストール** — 各マシンで:
 
 ```bash
 git clone https://github.com/TaewoooPark/DRIFT && cd DRIFT
@@ -384,23 +384,38 @@ bash scripts/install.sh          # macOS / Linux   ·   Windows: powershell -Fil
 drift doctor                     # checks Python, torch, device, config, ports
 ```
 
-**1 台のマシン** — 30 秒で試す:
+**2 · 1 台のマシンで試す:**
 
 ```bash
-drift up 2                       # spawn 2 local nodes, auto-split the model, open a chat
+drift up 2                       # 2 local nodes, auto-split the model, open a chat
                                  # (add --prompt "…" for a one-shot answer)
 ```
 
-**複数のマシンにまたがって** — 1 つのモデル、データセンターなし:
+**3 · あなたの Mac + CUDA PC にまたがって 1 つのモデルを実行する** — これが本命です。
+
+**head** はプロンプトを打ち込み、`embed`/`lm_head` を保持します。デコーダーレイヤーは **ノード** 上に置かれます。*両方* の GPU を使うには、Mac がノードを **かつ** head を動かし、PC がノードを動かします:
 
 ```bash
-drift node                       # on each worker: auto-detects the GPU, announces on the LAN
-drift run                        # on the head: auto-discovers the workers, splits, streams
+# Windows PC (NVIDIA)          — one terminal
+drift node --port 52601        # device = cuda, announced on the LAN
+
+# Mac (Apple)                  — terminal 1: a worker
+drift node --port 52600        # device = mps
+
+# Mac                          — terminal 2: the head (type the prompt)
+drift run --prompt "hello world"
 ```
 
-これで全部です — **レイヤー範囲も、IP も、デバイスフラグもありません。** `drift run` はモデルのレイヤー数を読み取り、見つけたノード群にまたがって分割し、答えをストリーミングします。各マシンは自分のスライスだけを計算します。（LAN 上に zeroconf がない？ `drift run --nodes host:port,…`。）Gemma 4 を試すには、`config.yaml` で `model_id: google/gemma-4-E2B-it` を設定します — 分割は自動で再計算されます。
+```text
+  node : 127.0.0.1:52600     layers [0:14)   · device=mps      ← Mac がこれらを計算
+  node : 192.168.0.22:52601  layers [14:28)  · device=cuda     ← PC がこれらを計算
 
-モデルと分割点の変更、手動での操作、ビット単位パリティゲート、そしてベンチマークは、すべて **運用マニュアル → [docs/manual.ja.md](docs/manual.ja.md)** にあります ([English](docs/manual.md) · [한국어](docs/manual.ko.md) · [中文](docs/manual.zh.md))。
+  Hello! How can I help you today?
+```
+
+2 台の Mac でも 2 台の Windows PC でも、**同じ 3 つのコマンド** で動きます — デバイスは自動検出され、`drift run` が見つけて分割します。Wi-Fi が mDNS をブロックする場合は、ノードを名前で指定します: `drift run --nodes 192.168.0.22:52601,127.0.0.1:52600 --prompt "hello world"`。GPU ベンダーをまたぐ場合（MPS↔CUDA）、fp16 の丸めがわずかに異なるため、長い答えは後半のトークンでずれることがあります — 想定内であり、バグではありません。
+
+**カスタマイズとチューニング** — モデル、分割点、デバイス、シャードを手動で操作する方法、そしてトラブルシューティング — はすべて **運用マニュアル → [docs/manual.ja.md](docs/manual.ja.md)** にあります（[English](docs/manual.md) · [한국어](docs/manual.ko.md) · [中文](docs/manual.zh.md)）。
 
 ---
 
