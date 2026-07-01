@@ -26,11 +26,14 @@
   <img src="https://img.shields.io/badge/No%20torch.distributed-000000?style=flat-square&labelColor=000000" alt="No torch.distributed">
   <img src="https://img.shields.io/badge/Bitwise%20parity-000000?style=flat-square&labelColor=000000" alt="Bitwise parity">
   <img src="https://img.shields.io/badge/MPS%20%E2%86%94%20CUDA-000000?style=flat-square&labelColor=000000" alt="MPS to CUDA">
+  <img src="https://img.shields.io/badge/Up%20to%2035%20nodes-000000?style=flat-square&labelColor=000000" alt="Up to 35 nodes">
 </p>
 
 **DRIFT** 让**一个**大语言模型跨**异构个人设备**运行——一台 Mac（Apple GPU，PyTorch **MPS**）和一台 Windows PC（NVIDIA GPU，PyTorch **CUDA**）——做法是把模型**逐层切分**（pipeline parallelism），并只在节点之间通过一套**框架中立的字节协议**（TCP + msgpack）流式传输 **hidden state**。没有数据中心，没有 `torch.distributed`，没有 NCCL，没有厂商锁定。数据平面*不绑定任何*框架，于是那些本来永远无法对话的运行时——一张 Apple Metal 计算图和一张 NVIDIA CUDA 计算图——如今得以共同运行一个模型，而其输出与在单机上运行整个模型**逐位（bit-for-bit）完全相同**。
 
 **一句话讲清差异：** [Exo](https://github.com/exo-explore/exo) 把节点间通信绑定在 MLX（`mx.distributed`）上，因此只能*在 Apple 芯片之间*工作（Windows 在其路线图上还是 "Longer term"）。DRIFT 把这条边界抬升为一套**中立的线缆协议**——*不同的运行时、不同的 GPU 厂商、同一个模型*——并用一道**逐位一致性门禁（bitwise parity gate）**证明这种切分是精确的。一个不绑定任何框架的数据平面，正是核心贡献。
+
+**扩展。** 每个解码器层一个节点——默认 Qwen 最多可跨 **28** 台机器（Gemma 为 **35** 台）流式运行同一个模型。就当前模型而言，**2–4** 台是最佳区间。
 
 > *"这段对话记录就是模型的输出。有意思的地方在于这段计算实际上**在哪里**运行——以及它最终逐位地、分毫不差地对上了账。"*
 

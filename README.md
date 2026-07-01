@@ -26,11 +26,14 @@
   <img src="https://img.shields.io/badge/No%20torch.distributed-000000?style=flat-square&labelColor=000000" alt="No torch.distributed">
   <img src="https://img.shields.io/badge/Bitwise%20parity-000000?style=flat-square&labelColor=000000" alt="Bitwise parity">
   <img src="https://img.shields.io/badge/MPS%20%E2%86%94%20CUDA-000000?style=flat-square&labelColor=000000" alt="MPS to CUDA">
+  <img src="https://img.shields.io/badge/Up%20to%2035%20nodes-000000?style=flat-square&labelColor=000000" alt="Up to 35 nodes">
 </p>
 
 **DRIFT** runs **one** large language model across **heterogeneous personal machines** — a Mac (Apple GPU, PyTorch **MPS**) and a Windows PC (NVIDIA GPU, PyTorch **CUDA**) — by splitting the model **layer by layer** (pipeline parallelism) and streaming only the **hidden state** between nodes over a **framework-neutral byte protocol** (TCP + msgpack). No datacenter, no `torch.distributed`, no NCCL, no vendor lock. The data plane is bound to *no* framework, so runtimes that could never talk to each other — an Apple Metal graph and an NVIDIA CUDA graph — now run one model together, and the output is **bit-for-bit identical** to running the whole model on a single machine.
 
 **The differentiator in one line:** [Exo](https://github.com/exo-explore/exo) binds node-to-node communication to MLX (`mx.distributed`), so it is *Apple-silicon-to-Apple-silicon only* (Windows is "Longer term" on its roadmap). DRIFT lifts the boundary into a **neutral wire protocol** — *different runtimes, different GPU vendors, one model* — and proves the split is exact with a **bitwise parity gate.** A data plane bound to no framework is the core contribution.
+
+**Scale.** One node per decoder layer — split one model across up to **28** machines on the default Qwen (**35** on Gemma), streaming across all of them. Two to four is today's sweet spot.
 
 > *"The transcript is the model's output. The interesting part is **where** the computation actually ran — and that it added up, bit for bit."*
 
