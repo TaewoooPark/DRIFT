@@ -1,6 +1,6 @@
-# DRIFT
+<h1 align="center">DRIFT</h1>
 
-**Decentralized Routed Inference For Tokens — 1 つのモデルを、あなたの複数のマシンにまたがって分割。データセンター不要。**
+<p align="center"><b>Decentralized Routed Inference For Tokens — 1 つのモデルを、あなたの複数のマシンにまたがって分割。データセンター不要。</b></p>
 
 <p align="center">
   <a href="./README.md">English</a> ·
