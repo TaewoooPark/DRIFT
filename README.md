@@ -47,6 +47,7 @@
 - [Three correctness problems](#three-problems-a-correct-split-must-solve) — KV re-index, RoPE, mask
 - [The decode loop](#the-decode-loop--injectable-transport) — sequence + injectable transport
 - [Correctness & parity](#correctness--the-parity-gate) — the bitwise gate + measured results
+- [Benchmarks](#benchmarks) — fidelity 100% · ≤ 42% of the model per node · protocol overhead ≈ 0
 - [Model-agnostic by introspection](#model-agnostic-by-introspection) — Qwen, Gemma 4, and no hardcoding
 - [Design rationale (why-not)](#design-rationale-why-not) — the decisions and their reasons
 - [Milestones](#milestones) · [Quickstart](#quickstart) · [Repo map](#repository-map--where-to-look) · [FAQ](#faq) · [Roadmap](#roadmap)
@@ -272,6 +273,49 @@ The `--selftest` is the strongest evidence: it re-derives a fresh reference and 
 **MPS ↔ CUDA (M4).** Only at the true cross-machine step do the two GPU vendors' kernels round fp16 differently, so greedy decoding may diverge in *later* tokens — this is expected, and handled by a **relaxed gate** (early tokens match + coherent output). Divergence at token 1–2 is a **bug**, not float noise → bisect. The playbook for exactly this is **[docs/05-parity-debugging-playbook.md](docs/05-parity-debugging-playbook.md)**.
 
 This implementation was reviewed to **two consecutive all-OK rounds** — correctness plus a design comparison against Exo/Petals/llama.cpp — verifying the Exo coupling claim from Exo's own source. Ledger: **[docs/07-review-log.md](docs/07-review-log.md)**.
+
+---
+
+## Benchmarks
+
+*Methodology, controls, and the fair competitor protocol: **[docs/08-benchmark-plan.md](docs/08-benchmark-plan.md)**. Reproduce every number with `python -m drift.bench`.*
+
+`tokens/sec` is the wrong axis to lead with: on an Apple-only cluster Exo's native MLX path wins raw throughput, and on the axis DRIFT owns — Mac(MPS)↔Windows(CUDA) — no competitor even runs ([see the table](#why-this-is-different)). So the numbers live where a *correct* split genuinely leads, all on **one** Mac — Qwen2.5-1.5B-Instruct · fp16 · Apple MPS.
+
+**Fidelity — does splitting change the output?** *(split path vs the single-machine oracle, greedy)*
+
+| Metric | Result |
+|---|---|
+| token exact-match — 6 prompts, `n = 1…180` | **411 / 411 = 100.00 %** |
+| cases bitwise-identical | **6 / 6** |
+| first-step logit max-abs-diff (fp32) | 7.81 × 10⁻³ *(fp16 ULP)* |
+| KL divergence (nats) | ≤ 2.82 × 10⁻¹⁰ |
+
+Token ids are **bitwise-identical** to a single machine; the logits agree to the fp16 ULP and the argmax is invariant under that noise. No other tool in this space measures — let alone guarantees — this. *This is DRIFT's monopoly axis.*
+
+**Footprint — no single node holds the whole model**
+
+| Node | Holds | fp16 | % of full |
+|---|---|---:|---:|
+| orchestrator | embed + norm + lm_head | 0.47 GB | 15.1 % |
+| shard · mac | decoder layers [0, 14) | 1.31 GB | 42.4 % |
+| shard · windows | decoder layers [14, 28) | 1.31 GB | 42.4 % |
+| **full model** | — | **3.09 GB** | 100 % |
+
+The heaviest single node carries **42.4 %** of the model — one 2× too big for either machine alone runs across the pair. This is the reason pipeline splitting exists.
+
+**The neutral wire is thin, and nearly free**
+
+| Metric | Value |
+|---|---|
+| on the wire per token per hop | **3.10 KB** — only the fp16 hidden state |
+| weights : per-token wire | **≈ 970,000 ×** |
+| TPOT — in-process (M2) → TCP (M3) | 43.3 → 42.6 ms/token |
+| protocol overhead | **within noise** (\|Δ\| < 1 ms/token, ~1.6 % of TPOT) |
+
+The **same decode loop** runs over both transports, so the M3 − M2 delta is the *pure* cost of the framework-neutral protocol — the thing that lets MPS and CUDA cooperate. At localhost it is indistinguishable from zero: the 3 KB round-trip is dwarfed by compute. (A real LAN adds RTT on top, unchanged by DRIFT.)
+
+> Absolute, reproducible numbers — not a cherry-picked win. A head-to-head `tok/s` against Exo / llama.cpp RPC needs them installed on the same box; the honest protocol for that is in **[docs/08](docs/08-benchmark-plan.md)**. Today's comparative claim is the capability matrix above **plus** a distributed output that is *provably* identical to one machine.
 
 ---
 

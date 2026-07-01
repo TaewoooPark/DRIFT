@@ -32,6 +32,7 @@ out of scope (spec §1.5).
 | 02 | [`02-workflow-plan.md`](02-workflow-plan.md) | Build process + the runnable review Workflow |
 | 04 | [`04-skills-mcp-plan.md`](04-skills-mcp-plan.md) | Skills/MCP per milestone; the 3 project skills |
 | 07 | [`07-review-log.md`](07-review-log.md) | Doc-review rubric + the 2×OK ledger |
+| 08 | [`08-benchmark-plan.md`](08-benchmark-plan.md) | How to benchmark vs similar tools + measured results; harness is [`../drift/bench.py`](../drift/bench.py) |
 
 **Recommended path:** `03` (the map) → `01` (the steps) → `06` (do setup now) → `05`
 (have it ready for M2) → `02` → `04` → `07`.

@@ -6,6 +6,7 @@ __pycache__/
 
 # DRIFT runtime artifacts
 reference_out.npz
+bench_results.json
 
 # Claude Code local state (keep skills/ and workflows/ tracked)
 .claude/settings.local.json
