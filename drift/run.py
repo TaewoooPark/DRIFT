@@ -54,7 +54,7 @@ def build_over_nodes(model_id: str, dtype: str, head_device: str,
     for s, (a, b) in zip(shards, ranges):
         info = transport.configure(s["name"], a, b, model_id, dtype, s.get("device"))
         plan.append({**s, "start": a, "end": b, "device": info.get("device")})
-    head = HeadModel(model_id, head_device, dtype)
+    head = HeadModel(model_id, head_device, dtype, sliced=True)
     return Orchestrator(head, transport, names, head_device), plan
 
 

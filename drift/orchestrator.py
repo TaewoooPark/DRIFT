@@ -26,14 +26,28 @@ class HeadModel:
     Gemma's scaled embedding) is applied automatically — nothing hardcoded.
     """
 
-    def __init__(self, model_id: str, device: str, dtype: str):
+    def __init__(self, model_id: str, device: str, dtype: str, sliced: bool = False):
         import transformers
 
-        torch_dtype = {"float16": torch.float16, "float32": torch.float32,
-                       "bfloat16": torch.bfloat16}[dtype]
         self.device = device
-        self.lm = transformers.AutoModelForCausalLM.from_pretrained(model_id, dtype=torch_dtype)
-        self.lm.to(device).eval()
+        if sliced:
+            # Real head (socket): materialize ONLY embed_tokens + norm (+ lm_head
+            # if untied), never the decoder layers — the head holds ~15%, not 100%.
+            from .loader import build_sliced
+
+            cfg = transformers.AutoConfig.from_pretrained(model_id)
+            tie = bool(getattr(cfg, "tie_word_embeddings", False))
+            keep = ["model.embed_tokens.", "model.norm."]
+            if not tie:
+                keep.append("lm_head.")
+            self.lm, _ = build_sliced(model_id, dtype, device, keep_prefixes=keep,
+                                      need_rotary=False, tie=tie)
+        else:
+            # In-process (M2 baseline): full model, shared with the shard engines.
+            torch_dtype = {"float16": torch.float16, "float32": torch.float32,
+                           "bfloat16": torch.bfloat16}[dtype]
+            self.lm = transformers.AutoModelForCausalLM.from_pretrained(model_id, dtype=torch_dtype)
+            self.lm.to(device).eval()
         self.inner = self.lm.model
         self.tokenizer = transformers.AutoTokenizer.from_pretrained(model_id)
 
@@ -253,7 +267,7 @@ def build_inprocess(cfg: dict) -> Orchestrator:
 
 def build_socket(cfg: dict, ports: list | None = None) -> Orchestrator:
     device = cfg.get("device", "cpu")
-    head = HeadModel(cfg["model_id"], device, cfg.get("dtype", "float16"))
+    head = HeadModel(cfg["model_id"], device, cfg.get("dtype", "float16"), sliced=True)
     shards = [dict(s) for s in cfg["shards"]]
     if ports:
         for s, p in zip(shards, ports):

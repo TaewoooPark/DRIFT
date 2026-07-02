@@ -303,7 +303,7 @@ Token ids are **bitwise-identical** to a single machine; the logits agree to the
 | shard · windows | decoder layers [14, 28) | 1.31 GB | 42.4 % |
 | **full model** | — | **3.09 GB** | 100 % |
 
-The heaviest single node carries **42.4 %** of the model — one 2× too big for either machine alone runs across the pair. This is the reason pipeline splitting exists.
+The heaviest single node carries **42.4 %** of the model — one 2× too big for either machine alone runs across the pair. This is the reason pipeline splitting exists. **Since v0.10 these are measured on-device allocations, not just each node's compute share:** every node materializes only its slice (`init_empty_weights` + selective safetensors read), so the whole model is never resident on any one machine — and the parity gate proves the sliced load stays bit-for-bit identical to the full load.
 
 **The neutral wire is thin, and nearly free**
 
@@ -354,7 +354,7 @@ The interesting decisions are the ones DRIFT declined. Each is a deliberate, har
 - **Why not ship the KV cache between nodes?** KV is megabytes per token and grows with sequence length; sending it would dwarf the ~3 KB residual and destroy the economics. Each shard keeps its own KV locally; only the residual stream travels.
 - **Why fp16 on the wire (not fp32)?** With fp16 compute, the CPU fp16 round-trip is bit-lossless, so serialization can't perturb parity — while halving wire bytes vs fp32. (fp16 compute lives on the GPU where it's fast; CPU fp16 kernels are unreliable, which is why the parity baseline runs on MPS, not CPU.)
 - **Why sequential, single-session first?** Concurrency, batching, and speculative decoding are optimizations. The demo's value is *correctness under heterogeneity*, so they are deferred until parity is proven — and it is.
-- **Why load the full model on each node (v1)?** Simplicity and correctness. The memory-efficient path (`init_empty_weights` + per-shard safetensors) is a known follow-up; v1 loads the whole model and uses only its slice, which is trivially correct and fits a 1.5–4 B model on a laptop.
+- **Why not keep the whole model on every node?** v1 did, for simplicity. Since **v0.10** each node loads **only its slice**: `init_empty_weights` builds the skeleton on the meta device, then only the tensors that node actually runs — its decoder layers, or the head's `embed`/`norm`/`lm_head` — are read from the safetensors and placed on the device. The heaviest node holds **42 % of the weights in real memory**, and the parity gate proves the sliced load is bitwise-identical to the full load.
 - **Why freeze the wire contract at M0?** So node internals can change forever without a flag day. The `input_ids` field was added *before* freezing precisely so PLE models (Gemma 4) never force a breaking change.
 
 ---

@@ -17,7 +17,6 @@ import copy
 import inspect
 
 import torch
-from transformers import AutoModelForCausalLM
 from transformers.cache_utils import DynamicCache
 from transformers.masking_utils import (
     create_causal_mask,
@@ -67,13 +66,19 @@ class TorchShardEngine(ShardEngine):
         if self.lm is not None:
             return
         if self._shared_model is not None:
+            # In-process (M2 parity baseline): reference a full, shared model and
+            # use only its disjoint layer slice.
             self.lm = self._shared_model
         else:
-            self.lm = AutoModelForCausalLM.from_pretrained(
-                self.model_id, dtype=self.torch_dtype
+            # Real node (socket): materialize ONLY this shard's layer slice, so
+            # the node never holds the whole model in memory (drift/loader.py).
+            from .loader import build_sliced
+
+            keep = [f"model.layers.{i}." for i in range(self.start_layer, self.end_layer)]
+            self.lm, _ = build_sliced(
+                self.model_id, self.dtype, self.device,
+                keep_prefixes=keep, need_rotary=True, tie=False,
             )
-            self.lm.to(self.device)
-            self.lm.eval()
 
         self.inner = self.lm.model  # the text transformer (Qwen2Model / Gemma4TextModel)
         self.config = self.inner.config
