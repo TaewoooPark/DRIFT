@@ -273,7 +273,7 @@ flowchart LR
 
 The `--selftest` is the strongest evidence: it re-derives a fresh reference and compares, across prompt *kinds* (prose, source code, Korean) and *lengths* (a single-token generation up to a 180-token decode). Every token id matches — first divergence index `None` in all six.
 
-**MPS ↔ CUDA (M4).** Only at the true cross-machine step do the two GPU vendors' kernels round fp16 differently, so greedy decoding may diverge in *later* tokens — this is expected, and handled by a **relaxed gate**, now in the harness as `python -m drift.parity_test --prefix-match K` (the first K ids must match; later drift is allowed). Divergence at token 1–2 is a **bug**, not float noise → bisect.
+**MPS ↔ CUDA (M4).** Only at the true cross-machine step do the two GPU vendors' kernels round fp16 differently, so greedy decoding may diverge in *later* tokens — this is expected, and handled by a **relaxed gate**: `python -m drift.parity_test --prefix-match K` requires the first K ids to match and allows the drift after them. Divergence at token 1–2 is a **bug**, not float noise → bisect.
 
 ---
 
@@ -303,7 +303,7 @@ Token ids are **bitwise-identical** to a single machine; the logits agree to the
 | shard · windows | decoder layers [14, 28) | 1.31 GB | 42.4 % |
 | **full model** | — | **3.09 GB** | 100 % |
 
-The heaviest single node carries **42.4 %** of the model — one 2× too big for either machine alone runs across the pair. This is the reason pipeline splitting exists. **Since v0.10 these are measured on-device allocations, not just each node's compute share:** every node materializes only its slice (`init_empty_weights` + selective safetensors read), so the whole model is never resident on any one machine — and the parity gate proves the sliced load stays bit-for-bit identical to the full load.
+The heaviest single node carries **42.4 %** of the model — one 2× too big for either machine alone runs across the pair. This is the reason pipeline splitting exists. **These are measured on-device allocations, not just each node's compute share:** every node materializes only its slice (`init_empty_weights` + a selective safetensors read), so the whole model is never resident on any one machine — and the parity gate proves the sliced load stays bit-for-bit identical to a single-machine load.
 
 **The neutral wire is thin, and nearly free**
 
@@ -354,7 +354,7 @@ The interesting decisions are the ones DRIFT declined. Each is a deliberate, har
 - **Why not ship the KV cache between nodes?** KV is megabytes per token and grows with sequence length; sending it would dwarf the ~3 KB residual and destroy the economics. Each shard keeps its own KV locally; only the residual stream travels.
 - **Why fp16 on the wire (not fp32)?** With fp16 compute, the CPU fp16 round-trip is bit-lossless, so serialization can't perturb parity — while halving wire bytes vs fp32. (fp16 compute lives on the GPU where it's fast; CPU fp16 kernels are unreliable, which is why the parity baseline runs on MPS, not CPU.)
 - **Why sequential, single-session first?** Concurrency, batching, and speculative decoding are optimizations. The demo's value is *correctness under heterogeneity*, so they are deferred until parity is proven — and it is.
-- **Why not keep the whole model on every node?** v1 did, for simplicity. Since **v0.10** each node loads **only its slice**: `init_empty_weights` builds the skeleton on the meta device, then only the tensors that node actually runs — its decoder layers, or the head's `embed`/`norm`/`lm_head` — are read from the safetensors and placed on the device. The heaviest node holds **42 % of the weights in real memory**, and the parity gate proves the sliced load is bitwise-identical to the full load.
+- **Why not keep the whole model on every node?** Each node materializes **only its slice** — `init_empty_weights` builds the skeleton on the meta device, then only the tensors that node actually runs (its decoder layers, or the head's `embed`/`norm`/`lm_head`) are read from the safetensors and placed on the device. The heaviest node holds **42 % of the weights in real memory**, and the parity gate proves the sliced load is bitwise-identical to a single-machine load.
 - **Why freeze the wire contract at M0?** So node internals can change forever without a flag day. The `input_ids` field was added *before* freezing precisely so PLE models (Gemma 4) never force a breaking change.
 
 ---
@@ -460,7 +460,7 @@ docs/               # public docs — benchmarks.md (methodology + results) · m
 
 ## Roadmap
 
-- **M4 — cross-machine.** Mac (MPS) + Windows (CUDA) on one model over the LAN. The tooling ships now — the relaxed parity gate (`--prefix-match K`) and node version / byte-order validation (checked at ping before layers are assigned) — so only the physical second machine remains.
+- **M4 — cross-machine.** Mac (MPS) + Windows (CUDA) on one model over the LAN. The relaxed parity gate (`--prefix-match K`) absorbs the expected MPS↔CUDA float divergence, and nodes cross-check version / byte-order at ping before layers are assigned — the physical second machine is what's left.
 - **M5 — booth display.** Each node shows its live layer range + device; the orchestrator streams tokens as *"front half thought by Apple GPU, back half by NVIDIA."*
 - **M6 — graceful kill-node.** Detect a dropped shard mid-decode → notify → reconfigure/restart (no seamless failover — that needs replication).
 - **v2 — engine swap.** An `engine_mlx.py` behind the same `ShardEngine` interface — the wire stays frozen; only the node internals change. This is where the framework-neutral thesis pays off: an MLX shard and a CUDA shard, one model.
