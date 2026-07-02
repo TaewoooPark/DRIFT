@@ -41,9 +41,11 @@ agree only to the **fp16 ULP** (a batched `lm_head` GEMM rounds the last row sli
 differently than a full-sequence forward). That the *decision* is invariant under that noise
 is the robustness result — not a hand-wave that "everything is exactly zero."
 
-**2 · Footprint — why you split at all.** Parameter bytes held per node. Pipeline splitting
-exists so a model too big for one machine runs anyway; the number that proves it is the
-heaviest single node as a % of the full model.
+**2 · Footprint — why you split at all.** Parameter bytes held per node, and — on an
+accelerator — the **actual on-device allocation** measured by loading each node's slice
+(`init_empty_weights` + selective safetensors). Pipeline splitting exists so a model too big
+for one machine runs anyway; the number that proves it is the heaviest single node as a % of
+the full model — now confirmed in real memory, not just parameter accounting.
 
 **3 · Overhead — the price of a neutral wire.** DRIFT runs the **same decode loop** over two
 transports: an in-process callable and the TCP protocol. So `TPOT(TCP) − TPOT(in-process)`
@@ -101,7 +103,11 @@ the socket parity test (the fp16 CPU round-trip is lossless).
 | **full model** | — | **3.09 GB** | 100% |
 
 The heaviest single node carries **42.4%** of the model — one 2× too large for either machine
-alone runs across the pair.
+alone runs across the pair. Since v0.10 these are also the **measured on-device allocations**:
+`python -m drift.bench` loads each slice and reads the accelerator's allocated bytes, and the
+heaviest node measures **1.31 GB on MPS**, matching the parameter-byte split exactly. Each node
+loads only its slice, so the whole model is never resident on any one machine — and the parity
+gate proves the sliced load stays bitwise-identical to the full load.
 
 ### Wire — a few KB against a few GB
 
@@ -119,16 +125,16 @@ Only `hidden_states` (fp16) + `position_ids` + `input_ids` cross a boundary — 
 
 | Transport | TPOT | tok/s |
 |---|---:|---:|
-| in-process callable | 43.25 ms/token | 23.1 |
-| TCP + msgpack (localhost, 2 hops) | 42.57 ms/token | 23.5 |
-| **protocol overhead** | **−0.68 ms/token — within noise** | — |
+| in-process callable | 40.68 ms/token | 24.6 |
+| TCP + msgpack (localhost, 2 hops) | 43.13 ms/token | 23.2 |
+| **protocol overhead** | **+2.45 ms/token (~1.2 ms/hop) — within run-to-run noise** | — |
 
-Both TPOTs come from the *same* run. The delta is **negative by 0.68 ms/token** — the TCP path
-was marginally *faster* on this run, which only means the difference is **below run-to-run
-noise** (|Δ| < 1 ms/token, ~1.6% of TPOT). The honest reading: at localhost the neutral
-protocol costs **nothing measurable** — the ~3 KB round-trip is dwarfed by the ~43 ms/token of
-compute. (A real LAN adds RTT on top, unchanged by DRIFT. Average several runs for a robust
-point estimate; the delta straddles zero.)
+Both TPOTs come from the *same* run. The delta is **+2.45 ms/token (~1.2 ms/hop)** — a small,
+real localhost round-trip cost, ~6% of the ~41 ms/token of compute. It is noisy at this scale:
+an earlier run measured it slightly *negative* (the TCP path came out marginally faster), so
+run-to-run the delta straddles a few ms either side of zero. The honest reading: at localhost
+the neutral protocol costs about **a millisecond per hop** — dwarfed by compute. (A real LAN
+adds RTT on top, unchanged by DRIFT. Average several runs for a robust point estimate.)
 
 ---
 

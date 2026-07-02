@@ -50,7 +50,7 @@
 - [Three correctness problems](#three-problems-a-correct-split-must-solve) — KV re-index, RoPE, mask
 - [The decode loop](#the-decode-loop--injectable-transport) — sequence + injectable transport
 - [Correctness & parity](#correctness--the-parity-gate) — the bitwise gate + measured results
-- [Benchmarks](#benchmarks) — fidelity 100% · ≤ 42% of the model per node · protocol overhead ≈ 0
+- [Benchmarks](#benchmarks) — fidelity 100% · ≤ 42% of the model per node (measured) · protocol overhead ≈ 1 ms/hop
 - [Model-agnostic by introspection](#model-agnostic-by-introspection) — Qwen, Gemma 4, and no hardcoding
 - [Design rationale (why-not)](#design-rationale-why-not) — the decisions and their reasons
 - [Milestones](#milestones) · [Quickstart](#quickstart) · [Repo map](#repository-map--where-to-look) · [FAQ](#faq) · [Roadmap](#roadmap)
@@ -311,10 +311,10 @@ The heaviest single node carries **42.4 %** of the model — one 2× too big for
 |---|---|
 | on the wire per token per hop | **3.10 KB** — only the fp16 hidden state |
 | weights : per-token wire | **≈ 970,000 ×** |
-| TPOT — in-process (M2) → TCP (M3) | 43.3 → 42.6 ms/token |
-| protocol overhead | **within noise** (\|Δ\| < 1 ms/token, ~1.6 % of TPOT) |
+| TPOT — in-process (M2) → TCP (M3) | 40.7 → 43.1 ms/token |
+| protocol overhead | **+2.45 ms/token** (~1.2 ms/hop, ~6 % of TPOT) |
 
-The **same decode loop** runs over both transports, so the M3 − M2 delta is the *pure* cost of the framework-neutral protocol — the thing that lets MPS and CUDA cooperate. At localhost it is indistinguishable from zero: the 3 KB round-trip is dwarfed by compute. (A real LAN adds RTT on top, unchanged by DRIFT.)
+The **same decode loop** runs over both transports, so the M3 − M2 delta is the *pure* cost of the framework-neutral protocol — the thing that lets MPS and CUDA cooperate. At localhost it is a small per-hop round-trip (~1.2 ms/hop), dwarfed by the ~41 ms/token of compute; it is noisy enough at this scale to straddle zero run-to-run (an earlier run measured it slightly *negative*). (A real LAN adds RTT on top, unchanged by DRIFT.)
 
 > Absolute, reproducible numbers — not a cherry-picked win. A head-to-head `tok/s` against Exo / llama.cpp RPC needs them installed on the same box; the honest protocol for that is in **[docs/benchmarks.md](docs/benchmarks.md)**. Today's comparative claim is the capability matrix above **plus** a distributed output that is *provably* identical to one machine.
 

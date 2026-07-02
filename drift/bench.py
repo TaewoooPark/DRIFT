@@ -75,6 +75,17 @@ def _free() -> None:
         torch.cuda.empty_cache()
 
 
+def _device_allocated(device: str):
+    """Current accelerator bytes allocated, or None on CPU (no allocator counter)."""
+    import torch
+
+    if device == "mps" and torch.backends.mps.is_available():
+        return torch.mps.current_allocated_memory()
+    if device == "cuda" and torch.cuda.is_available():
+        return torch.cuda.memory_allocated()
+    return None
+
+
 def _kl_divergence(ref_logits: np.ndarray, split_logits: np.ndarray) -> float:
     """KL(P_ref || P_split) over the first-step vocab distribution, in nats.
 
@@ -176,12 +187,15 @@ def measure_fidelity(cfg: dict, orch, cases) -> dict:
 
 # -------------------------------------------------------------------- footprint
 def measure_footprint(cfg: dict) -> dict:
-    """Decoder-layer parameter bytes per node (orchestrator + each shard)."""
+    """Per-node parameter bytes (the theoretical split) plus, on an accelerator,
+    the MEASURED on-device allocation from actually loading each node's slice."""
     import torch
     from transformers import AutoModelForCausalLM
 
+    device = cfg.get("device", "cpu")
+    dtype_name = cfg.get("dtype", "float16")
     dtype = {"float16": torch.float16, "float32": torch.float32,
-             "bfloat16": torch.bfloat16}[cfg.get("dtype", "float16")]
+             "bfloat16": torch.bfloat16}[dtype_name]
     model = AutoModelForCausalLM.from_pretrained(cfg["model_id"], dtype=dtype).eval()
     inner = model.model
 
@@ -212,14 +226,51 @@ def measure_footprint(cfg: dict) -> dict:
 
     del model
     _free()
-    print(f"[footprint] full={total_bytes/1e9:.2f} GB · heaviest node "
-          f"{heaviest['role']}={heaviest['bytes']/1e9:.2f} GB "
-          f"({heaviest['pct_of_full']*100:.1f}% of full)", flush=True)
+
+    # Measured on-device allocation: actually load each node's slice with the
+    # sliced loader and read the accelerator's allocated bytes. Turns the
+    # footprint from a theoretical split into a reproducible measurement, and
+    # cross-checks that a node really holds only its fraction in memory.
+    heaviest_meas = None
+    if _device_allocated(device) is not None:
+        from transformers import AutoConfig
+
+        from .loader import build_sliced
+
+        tie = bool(getattr(AutoConfig.from_pretrained(cfg["model_id"]),
+                           "tie_word_embeddings", False))
+        head_keep = ["model.embed_tokens.", "model.norm."] + ([] if tie else ["lm_head."])
+        plan = {"orchestrator": (head_keep, False, tie)}
+        for s in cfg["shards"]:
+            plan[f"shard:{s['name']}"] = (
+                [f"model.layers.{i}." for i in range(s["start_layer"], s["end_layer"])],
+                True, False)
+        for nd in nodes:
+            keep, need_rot, tie_n = plan[nd["role"]]
+            _free()
+            base = _device_allocated(device)
+            lm, _ = build_sliced(cfg["model_id"], dtype_name, device, keep,
+                                 need_rotary=need_rot, tie=tie_n)
+            _sync(device)
+            nd["measured_device_bytes"] = _device_allocated(device) - base
+            del lm
+            _free()
+        heaviest_meas = max(nd["measured_device_bytes"] for nd in nodes)
+
+    msg = (f"[footprint] full={total_bytes/1e9:.2f} GB · heaviest node "
+           f"{heaviest['role']}={heaviest['bytes']/1e9:.2f} GB "
+           f"({heaviest['pct_of_full']*100:.1f}% of full)")
+    if heaviest_meas is not None:
+        msg += f" · measured heaviest {heaviest_meas/1e9:.2f} GB on {device}"
+    print(msg, flush=True)
     return {
         "full_model_bytes": total_bytes,
         "tie_word_embeddings": tied,
         "nodes": nodes,
         "heaviest_node_pct": heaviest["pct_of_full"],
+        "measured_device": device if heaviest_meas is not None else None,
+        "measured_heaviest_bytes": heaviest_meas,
+        "measured_heaviest_pct": (heaviest_meas / total_bytes) if heaviest_meas else None,
     }
 
 
@@ -286,7 +337,8 @@ def measure_overhead(cfg: dict, orch_inproc, do_socket: bool) -> dict:
     if not do_socket:
         return result
 
-    # Free the in-process orchestrator's model before spawning full-model servers.
+    # Spawn the shard servers (each loads only its own slice via the sliced
+    # loader; the in-process orchestrator's model is freed by the caller).
     procs = []
     try:
         ports = [s["port"] for s in cfg["shards"]]
@@ -391,8 +443,12 @@ def main(argv=None) -> int:
     print(f"Fidelity   : {f['exact_match_rate']*100:.2f}% exact-match "
           f"({f['cases_bitwise_equal']}/{f['cases_total']} cases bitwise) · "
           f"logit diff {f['max_logit_abs_diff_fp32']:.2e} · KL {f['max_kl_nats']:.2e}", flush=True)
-    print(f"Footprint  : heaviest node = {fp['heaviest_node_pct']*100:.1f}% of the "
-          f"full {fp['full_model_bytes']/1e9:.2f} GB model", flush=True)
+    fp_line = (f"Footprint  : heaviest node = {fp['heaviest_node_pct']*100:.1f}% of the "
+               f"full {fp['full_model_bytes']/1e9:.2f} GB model")
+    if fp.get("measured_heaviest_bytes"):
+        fp_line += (f" · measured {fp['measured_heaviest_bytes']/1e9:.2f} GB "
+                    f"on {fp['measured_device']}")
+    print(fp_line, flush=True)
     print(f"Wire       : {w['decode_kb_per_token_per_hop']:.2f} KB/token/hop", flush=True)
     if "tpot_m3_ms" in o:
         print(f"Overhead   : M2 {o['tpot_m2_ms']:.2f} → M3 {o['tpot_m3_ms']:.2f} ms/token "
