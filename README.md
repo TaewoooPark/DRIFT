@@ -97,31 +97,7 @@ The name is the system:
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    subgraph ORCH["🧠 Orchestrator"]
-        direction TB
-        TOK["tokenizer"] --> EMB["embed_tokens"]
-        NRM["final norm"] --> HEAD["lm_head"] --> SMP["sampler / argmax"]
-    end
-
-    subgraph SA["🖥️ ShardServer A · Mac"]
-        direction TB
-        LA["decoder layers [0, 14)<br/>device = mps<br/>per-session KV cache<br/>RoPE self-computed"]
-    end
-
-    subgraph SB["🪟 ShardServer B · Windows"]
-        direction TB
-        LB["decoder layers [14, 28)<br/>device = cuda<br/>per-session KV cache<br/>RoPE self-computed"]
-    end
-
-    EMB -- "hidden_states + position_ids + input_ids<br/>TCP · msgpack · fp16 · ~3 KB/token" --> LA
-    LA -- "hidden_states" --> LB
-    LB -- "hidden_states" --> NRM
-
-    classDef n fill:#111,stroke:#555,color:#eee;
-    class ORCH,SA,SB,LA,LB,TOK,EMB,NRM,HEAD,SMP n;
-```
+<p align="center"><img src="docs/img/arch.png" alt="DRIFT architecture — orchestrator head, per-layer shards, neutral wire" width="900"></p>
 
 DRIFT separates cleanly into three planes:
 
@@ -174,23 +150,7 @@ Splitting layers across processes sounds trivial until you try to make the outpu
 
 Hugging Face's `DynamicCache` is indexed by a layer's `layer_idx`, and it reports "past length" from **layer 0's** slot. A shard that keeps global layers `[14, 28)` and naïvely reuses their global indices leaves cache slot 0 **empty** — so during decode the causal mask is built as if there were *no past*, and parity silently breaks after the very first token.
 
-```mermaid
-flowchart TB
-    subgraph BUG["❌ naïve — keep global layer_idx 14…27"]
-        direction TB
-        b1["cache slots 0…13 = EMPTY"] --> b2["get_seq_length() reads slot 0 → 0"]
-        b2 --> b3["decode mask thinks 'no past tokens'"]
-        b3 --> b4["💥 diverges after token 1"]
-    end
-    subgraph FIX["✅ DRIFT — re-index kept layers to local 0…13"]
-        direction TB
-        f1["self_attn.layer_idx : 14…27 → 0…13"] --> f2["cache slots 0…13 = this shard's KV"]
-        f2 --> f3["get_seq_length() reads slot 0 → correct past"]
-        f3 --> f4["✅ bitwise parity, prefill + decode"]
-    end
-    classDef n fill:#111,stroke:#555,color:#eee;
-    class BUG,FIX,b1,b2,b3,b4,f1,f2,f3,f4 n;
-```
+<p align="center"><img src="docs/img/kv-reindex.png" alt="KV-cache local re-indexing — the fix that keeps decode parity" width="900"></p>
 
 DRIFT re-indexes each shard's kept layers to **local, 0-based** cache slots at load time, and sizes the per-session `DynamicCache` to the shard's local layer count. In-process, two shards can share one loaded model because they own **disjoint** layer objects — re-indexing one never touches the other.
 
@@ -206,35 +166,7 @@ For prefill the mask is causal-full; for decode it is KV-length-aware. DRIFT reb
 
 ## The decode loop & injectable transport
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant O as Orchestrator
-    participant A as Shard A · mps · [0,14)
-    participant B as Shard B · cuda · [14,28)
-
-    Note over O,B: prefill (whole prompt, positions 0…S-1)
-    O->>O: h = embed_tokens(input_ids)
-    O->>A: forward(h, pos 0…S-1, ids, "prefill")
-    A->>A: cos,sin = rotary(pos) · run layers[0:14] · fill KV
-    A-->>O: h′
-    O->>B: forward(h′, pos, ids, "prefill")
-    B->>B: run layers[14:28] · fill KV
-    B-->>O: h″
-    O->>O: logits = lm_head(norm(h″[:, -1])) · next = argmax
-
-    Note over O,B: decode (one token at a time, p = S, S+1, …)
-    loop until max_new_tokens / EOS
-        O->>O: h = embed_tokens(next)
-        O->>A: forward(h, pos=[p], [next], "decode")
-        A->>A: rotary(p) · layers[0:14] · KV.append
-        A-->>O: h′
-        O->>B: forward(h′, pos=[p], [next], "decode")
-        B->>B: layers[14:28] · KV.append
-        B-->>O: h″
-        O->>O: next = argmax(lm_head(norm(h″))) · p += 1
-    end
-```
+<p align="center"><img src="docs/img/decode-loop.png" alt="The decode loop over an injectable transport (in-process / TCP)" width="900"></p>
 
 The loop routes through an **injectable transport** with a single signature — `transport(shard, session, hidden, position_ids, input_ids, mode)`. The decode loop is written **once**; only the transport is swapped:
 
@@ -251,16 +183,7 @@ Because the loop is identical, the **network is the only variable between M2 and
 
 DRIFT is **correctness-first**: every networked step must reproduce the single-machine reference **bitwise** before any performance work. Speed is not the point of the demo — *heterogeneous split inference being exact* is.
 
-```mermaid
-flowchart LR
-    M1["M1 · reference oracle<br/>full model · greedy"] -->|token ids| GATE{"exactly equal?"}
-    SPLIT["split path<br/>2 shards"] -->|token ids| GATE
-    GATE -->|yes| PASS["✅ parity — advance"]
-    GATE -->|no| BISECT["🔎 fp32 max-abs-diff<br/>+ layer bisection"]
-    BISECT -.->|localize broken boundary| SPLIT
-    classDef n fill:#111,stroke:#555,color:#eee;
-    class M1,SPLIT,GATE,PASS,BISECT n;
-```
+<p align="center"><img src="docs/img/parity-gate.png" alt="The parity gate — strict bitwise on one device, relaxed across GPU vendors" width="900"></p>
 
 **Measured results** — Qwen2.5-1.5B-Instruct, Apple MPS, fp16:
 

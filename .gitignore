@@ -18,6 +18,8 @@ docs/*
 !docs/manual.ko.md
 !docs/manual.zh.md
 !docs/manual.ja.md
+!docs/img/
+docs/img/_build/
 DRIFT-implementation-spec.md
 .claude/
 
