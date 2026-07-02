@@ -105,6 +105,10 @@ DRIFT 干净地分成三个平面：
 - **数据平面**——跨越 stage 边界的只有 `hidden_states`（浮点）以及 `position_ids` + `input_ids`（整数）。与框架无关，而且——关键在于——**它的大小取决于 `hidden_size`，而非参数量。** 只要 `hidden_size` 相同，一个 1.5 B 模型和一个 70 B 模型每 token 推送的都是同样的 ~3 KB。
 - **KV 缓存平面**——每个分片按会话、在自己的设备上保存*属于自己*那段层范围的 KV。**缓存永远不跨越线缆**（否则将是每 token 数 MB，会彻底葬送整个设计）。只有残差流（residual stream）在传输。
 
+**切分可以扩展到两台以上** —— 每个解码器层一个节点，最多 28 个（Gemma 为 35 个），头节点与线缆保持不变：
+
+<p align="center"><img src="docs/img/scale.png" alt="DRIFT scales one model across 2 to 28 nodes, one decoder layer per node" width="900"></p>
+
 ---
 
 ## 线缆契约（真正跨越边界的东西）

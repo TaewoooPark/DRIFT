@@ -105,6 +105,10 @@ DRIFT separates cleanly into three planes:
 - **Data plane** — the only things that cross a stage boundary are `hidden_states` (floats) and `position_ids` + `input_ids` (ints). Framework-agnostic, and — crucially — **its size depends on `hidden_size`, not on the parameter count.** A 1.5 B model and a 70 B model push the same ~3 KB/token if `hidden_size` matches.
 - **KV cache plane** — each shard keeps the KV for *its own* layer range, per session, on its own device. **The cache never crosses the wire** (that would be megabytes/token and would defeat the whole design). Only the residual stream travels.
 
+**The split scales past two** — one node per decoder layer, up to 28 (35 on Gemma), with the head and the wire unchanged:
+
+<p align="center"><img src="docs/img/scale.png" alt="DRIFT scales one model across 2 to 28 nodes, one decoder layer per node" width="900"></p>
+
 ---
 
 ## The wire contract (what actually crosses the boundary)

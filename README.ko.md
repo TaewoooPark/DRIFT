@@ -105,6 +105,10 @@ DRIFT는 세 개의 플레인(plane)으로 정연하게 분리된다:
 - **데이터 플레인(data plane)**: 스테이지 경계를 넘는 것은 오직 `hidden_states`(부동소수점)와 `position_ids` + `input_ids`(정수)뿐이며, 프레임워크에 독립적일 뿐 아니라, 결정적으로, **그 크기가 파라미터 수가 아니라 `hidden_size`에 좌우된다.** 하여 `hidden_size`만 같다면 1.5 B 모델과 70 B 모델이 토큰당 동일한 ~3 KB를 밀어 보내게 된다.
 - **KV 캐시 플레인(KV cache plane)**: 각 샤드는 세션별로 *자기 자신의* 레이어 범위에 해당하는 KV를 자기 디바이스에 보관한다. **캐시는 결코 와이어를 넘지 않는데**(그랬다간 토큰당 메가바이트 단위로 불어나 설계 전체를 무너뜨린다), 경계를 오가는 것은 오직 residual stream뿐이다.
 
+**분할은 두 대를 넘어 확장된다.** 디코더 레이어 하나당 노드 하나로 최대 28대(Gemma는 35대)까지 늘어나되, 헤드와 와이어는 그대로다:
+
+<p align="center"><img src="docs/img/scale.png" alt="DRIFT scales one model across 2 to 28 nodes, one decoder layer per node" width="900"></p>
+
 ---
 
 ## 와이어 계약 (경계를 실제로 넘는 것)

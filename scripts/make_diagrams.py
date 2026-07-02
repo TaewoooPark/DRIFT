@@ -265,11 +265,76 @@ def d4():
     return W, H, "".join(s)
 
 
+# ------------------------------------------------------------------ D5 scale
+def d5():
+    W, H = 1180, 432
+    s = [svg_open(W, H)]
+    s.append(txt(40, 40, "Scale — one model, from 2 nodes to one per layer", size=17, fill=INK, weight=600))
+    s.append(txt(40, 62, "the split is just a list of layer ranges in config.yaml; add a node → add a range, and "
+                         "the orchestrator routes through it in order.", size=13, fill=FAINT))
+    s.append(txt(40, 82, "the head (embed · norm · lm_head) and the wire contract are identical at every N.",
+                 size=13, fill=FAINT))
+
+    x0, x1, N = 250, 1140, 28
+    cw = (x1 - x0) / N
+
+    # ruler
+    s.append(txt(x0, 116, "decoder layers", size=12.5, fill=WIRE))
+    s.append(f'<line x1="{x0}" y1="126" x2="{x1}" y2="126" stroke="{STROKE}" stroke-width="1"/>')
+    for lyr in (0, 14, 28):
+        tx = x0 + lyr * cw
+        s.append(f'<line x1="{tx}" y1="122" x2="{tx}" y2="130" stroke="{FAINT}" stroke-width="1"/>')
+        s.append(txt(tx, 144, str(lyr), size=11.5, fill=FAINT, anchor="middle"))
+
+    def rowlabel(y, big, small):
+        s.append(txt(228, y + 30, big, size=15, fill=INK, weight=600, anchor="end"))
+        s.append(txt(228, y + 49, small, size=11, fill=FAINT, anchor="end"))
+
+    def seg(a, b, y, h, text, sub, idx):
+        gap = 7
+        sx = x0 + a * cw
+        w = (b - a) * cw - gap
+        fill = CARD_HI if idx % 2 == 0 else "#0d0d10"
+        out = [f'<rect x="{sx:.1f}" y="{y}" width="{w:.1f}" height="{h}" rx="9" '
+               f'fill="{fill}" stroke="{STROKE}" stroke-width="1"/>']
+        cx = sx + w / 2
+        out.append(txt(cx, y + h / 2 - 3, text, size=13, fill=INK, weight=600, anchor="middle"))
+        out.append(txt(cx, y + h / 2 + 15, sub, size=11, fill=FAINT, anchor="middle", font=MONO))
+        return "".join(out)
+
+    # row: 2 nodes (today's sweet spot)
+    yA = 162
+    rowlabel(yA, "2 nodes", "today's sweet spot")
+    s.append(seg(0, 14, yA, 58, "node 1", "[0, 14) · mps", 0))
+    s.append(seg(14, 28, yA, 58, "node 2", "[14, 28) · cuda", 1))
+
+    # row: 4 nodes
+    yB = 246
+    rowlabel(yB, "4 nodes", "same wire")
+    for i, (a, b) in enumerate([(0, 7), (7, 14), (14, 21), (21, 28)]):
+        s.append(seg(a, b, yB, 58, f"node {i+1}", f"[{a}, {b})", i))
+
+    # row: 28 nodes (one per layer)
+    yC = 330
+    rowlabel(yC, "28 nodes", "one layer each")
+    gap = 5
+    for i in range(N):
+        sx = x0 + i * cw
+        fill = CARD_HI if i % 2 == 0 else "#0d0d10"
+        s.append(f'<rect x="{sx:.1f}" y="{yC}" width="{cw - gap:.1f}" height="58" rx="6" '
+                 f'fill="{fill}" stroke="{STROKE}" stroke-width="1"/>')
+    s.append(txt((x0 + x1) / 2, yC + 34, "one decoder layer per node — the maximum split (35 on Gemma)",
+                 size=12.5, fill=BODY, anchor="middle"))
+    s.append("</svg>")
+    return W, H, "".join(s)
+
+
 # ------------------------------------------------------------------ emit
 def main():
     os.makedirs(OUT, exist_ok=True)
     manifest = []
-    for name, fn in [("arch", d1), ("kv-reindex", d2), ("decode-loop", d3), ("parity-gate", d4)]:
+    for name, fn in [("arch", d1), ("kv-reindex", d2), ("decode-loop", d3),
+                     ("parity-gate", d4), ("scale", d5)]:
         w, h, body = fn()
         page = (f'<!doctype html><html><head><meta charset="utf-8">'
                 f'<style>html,body{{margin:0;padding:0;background:{BG}}}</style></head>'
