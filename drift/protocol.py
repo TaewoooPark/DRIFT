@@ -18,7 +18,11 @@ Request schema:
     }
 Response schema:
     { "ok": bool, "shape": [B,S,D], "dtype": "float16", "tensor": <bytes>, "error": str|null }
-ping response: { "ok": true, "assigned": bool, "name", "start_layer", "end_layer", "device" }
+ping response: { "ok": true, "assigned": bool, "name", "start_layer", "end_layer", "device",
+                 "torch", "transformers", "endian" }
+    The `endian`/`torch`/`transformers` fields let the head reject a byte-order
+    mismatch (the fp16 tensor bytes are native-endian) and warn on version skew
+    before assigning layers — both silently break cross-machine parity otherwise.
 
 `configure` lets the orchestrator assign a layer range to an *unassigned* node
 (so users never hand-write ranges): a new message TYPE — the 4B+msgpack framing

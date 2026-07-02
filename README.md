@@ -273,7 +273,7 @@ flowchart LR
 
 The `--selftest` is the strongest evidence: it re-derives a fresh reference and compares, across prompt *kinds* (prose, source code, Korean) and *lengths* (a single-token generation up to a 180-token decode). Every token id matches — first divergence index `None` in all six.
 
-**MPS ↔ CUDA (M4).** Only at the true cross-machine step do the two GPU vendors' kernels round fp16 differently, so greedy decoding may diverge in *later* tokens — this is expected, and handled by a **relaxed gate** (early tokens match + coherent output). Divergence at token 1–2 is a **bug**, not float noise → bisect.
+**MPS ↔ CUDA (M4).** Only at the true cross-machine step do the two GPU vendors' kernels round fp16 differently, so greedy decoding may diverge in *later* tokens — this is expected, and handled by a **relaxed gate**, now in the harness as `python -m drift.parity_test --prefix-match K` (the first K ids must match; later drift is allowed). Divergence at token 1–2 is a **bug**, not float noise → bisect.
 
 ---
 
@@ -460,7 +460,7 @@ docs/               # public docs — benchmarks.md (methodology + results) · m
 
 ## Roadmap
 
-- **M4 — cross-machine.** Mac (MPS) + Windows (CUDA) on one model over the LAN; relaxed parity gate for expected MPS↔CUDA float divergence; version-lock validation across both nodes.
+- **M4 — cross-machine.** Mac (MPS) + Windows (CUDA) on one model over the LAN. The tooling ships now — the relaxed parity gate (`--prefix-match K`) and node version / byte-order validation (checked at ping before layers are assigned) — so only the physical second machine remains.
 - **M5 — booth display.** Each node shows its live layer range + device; the orchestrator streams tokens as *"front half thought by Apple GPU, back half by NVIDIA."*
 - **M6 — graceful kill-node.** Detect a dropped shard mid-decode → notify → reconfigure/restart (no seamless failover — that needs replication).
 - **v2 — engine swap.** An `engine_mlx.py` behind the same `ShardEngine` interface — the wire stays frozen; only the node internals change. This is where the framework-neutral thesis pays off: an MLX shard and a CUDA shard, one model.

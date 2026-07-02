@@ -39,6 +39,31 @@ def _wait_ready(transport: SocketTransport, names: list[str], timeout: float = 1
     return False
 
 
+def _check_env(transport: SocketTransport, names: list[str]) -> None:
+    """Catch cross-machine parity hazards before assigning layers.
+
+    Endianness is a hard stop (the fp16 wire bytes are native-endian); torch /
+    transformers version skew only warns (mask/RoPE internals can shift and break
+    bitwise parity, but the run may still be usable under the relaxed gate).
+    """
+    from .common import env_info
+
+    local = env_info()
+    for n in names:
+        info = transport.ping(n)
+        remote_endian = info.get("endian")
+        if remote_endian and remote_endian != local["endian"]:
+            raise RuntimeError(
+                f"node {n} is {remote_endian}-endian but the head is {local['endian']}-endian; "
+                "the fp16 hidden-state bytes are native-endian on the wire and would be misread"
+            )
+        for key in ("torch", "transformers"):
+            rv = info.get(key)
+            if rv and rv != local[key]:
+                print(f"[warn] node {n} {key}={rv} != head {key}={local[key]} — mask/RoPE "
+                      f"internals can differ across versions and break bitwise parity", flush=True)
+
+
 def build_over_nodes(model_id: str, dtype: str, head_device: str,
                      endpoints: list[dict]) -> tuple[Orchestrator, list[dict]]:
     """Endpoints [{name,host,port,device?}] → auto-split, configure, return
@@ -50,6 +75,7 @@ def build_over_nodes(model_id: str, dtype: str, head_device: str,
     transport = SocketTransport(shards, dtype, head_device)
     if not _wait_ready(transport, names):
         raise RuntimeError("nodes not reachable — try `drift doctor --nodes <host:port,…>`")
+    _check_env(transport, names)
     plan = []
     for s, (a, b) in zip(shards, ranges):
         info = transport.configure(s["name"], a, b, model_id, dtype, s.get("device"))

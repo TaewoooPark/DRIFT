@@ -56,10 +56,12 @@ class Node:
     def handle(self, msg: dict) -> dict:
         mtype = msg.get("type")
         if mtype == "ping":
+            from .common import env_info
+
             if self.engine is not None:
-                return {"ok": True, "assigned": True, **self.engine.ping_info()}
+                return {"ok": True, "assigned": True, **self.engine.ping_info(), **env_info()}
             return {"ok": True, "assigned": False, "name": self.name,
-                    "device": self.device, "loaded": False}
+                    "device": self.device, "loaded": False, **env_info()}
         if mtype == "configure":
             return self.configure(
                 start=msg["start_layer"], end=msg["end_layer"],

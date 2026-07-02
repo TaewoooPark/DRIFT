@@ -1,9 +1,15 @@
-"""M2/M3 parity gate (spec §9 M2/M3).
+"""M2/M3/M4 parity gate (spec §9).
 
 Runs the split path (in-process for M2, TCP for M3) and asserts the greedy
 token-id sequence is BITWISE equal to the M1 reference (reference_out.npz).
 Also reports the fp32 max-abs-diff of the first-step logits for diagnostics
 (see docs/05 — boundary diff ~0 but ids differ => bug after the shards).
+
+Same-device runs are held to the strict bitwise gate. For the cross-device M4
+step (Mac MPS + Windows CUDA), the two vendors' fp16 kernels round differently,
+so greedy decoding may diverge in *later* tokens — `--prefix-match K` switches to
+a relaxed gate that requires only the first K ids to match. Divergence WITHIN the
+first K is a real bug (bisect), not float noise.
 """
 
 from __future__ import annotations
@@ -85,6 +91,10 @@ def main(argv=None) -> int:
     ap.add_argument("--ref", default="reference_out.npz")
     ap.add_argument("--selftest", action="store_true",
                     help="multi-prompt in-process parity vs a clean reference (no npz)")
+    ap.add_argument("--prefix-match", type=int, default=None, metavar="K",
+                    help="relaxed cross-device gate: require the first K token ids to match "
+                         "the reference; later divergence from MPS↔CUDA fp16 rounding is "
+                         "allowed. Divergence WITHIN the first K is a real bug, not float noise.")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -111,6 +121,20 @@ def main(argv=None) -> int:
     print(f"[parity:{label}] first-step logits max-abs-diff (fp32): {max_logit_diff:.3e}", flush=True)
     print(f"[parity:{label}] ref first10: {ref_ids[:10]}", flush=True)
     print(f"[parity:{label}] got first10: {got[:10]}", flush=True)
+
+    # Relaxed gate (cross-device): early tokens must match; later fp16-rounding
+    # divergence between MPS and CUDA kernels is expected, not a bug.
+    if args.prefix_match is not None:
+        k = min(args.prefix_match, len(ref_ids), len(got))
+        matched = sum(1 for i in range(min(len(ref_ids), len(got))) if ref_ids[i] == got[i])
+        if ref_ids[:k] == got[:k]:
+            print(f"[parity:{label}] RELAXED PASS — first {k}/{k} ids match; "
+                  f"{matched}/{n} total (later drift allowed for cross-device fp16)", flush=True)
+            return 0
+        print(f"[parity:{label}] RELAXED FAIL — diverged at token {div} < {k} "
+              f"(a real bug, not float noise): ref={ref_ids[div]} got={got[div]}", flush=True)
+        return 1
+
     if exact:
         print(f"[parity:{label}] PASS — {n}/{n} token ids match the reference bitwise", flush=True)
         return 0

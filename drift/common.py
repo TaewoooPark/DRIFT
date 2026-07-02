@@ -108,3 +108,25 @@ def lan_ip() -> str:
         return "127.0.0.1"
     finally:
         s.close()
+
+
+def env_info() -> dict:
+    """Runtime identity a node advertises so the head can catch parity hazards.
+
+    - `endian`: the fp16 tensor bytes on the wire are native byte order
+      (`numpy.tobytes()`), so two nodes MUST agree — a big-endian ↔ little-endian
+      pair would misread every hidden state. (ARM Macs and x86 PCs are both
+      little-endian, so this is a guard, not a common failure.)
+    - `torch` / `transformers`: version skew silently changes mask/RoPE internals
+      and can break bitwise parity across machines — worth a warning.
+    """
+    import sys
+
+    import torch
+    import transformers
+
+    return {
+        "torch": torch.__version__,
+        "transformers": transformers.__version__,
+        "endian": sys.byteorder,
+    }
