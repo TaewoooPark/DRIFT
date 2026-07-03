@@ -24,9 +24,14 @@ import os
 
 import torch
 from accelerate import init_empty_weights
-from huggingface_hub import snapshot_download
+from huggingface_hub import hf_hub_download, snapshot_download
 from safetensors import safe_open
 from transformers import AutoConfig, AutoModelForCausalLM
+
+try:
+    from huggingface_hub.errors import EntryNotFoundError
+except Exception:  # older huggingface_hub layout
+    from huggingface_hub.utils import EntryNotFoundError
 
 _TORCH_DTYPE = {
     "float16": torch.float16,
@@ -35,20 +40,43 @@ _TORCH_DTYPE = {
 }
 
 
-def _safetensors_files(model_id: str) -> list[str]:
-    """Local paths to the model's safetensors shards (index-aware, single-file ok)."""
-    path = snapshot_download(model_id, allow_patterns=["*.safetensors*", "*.json"])
-    idx = os.path.join(path, "model.safetensors.index.json")
-    if os.path.exists(idx):
-        with open(idx) as f:
+def _needed_files(model_id: str, keep_prefixes: list[str]) -> list[str]:
+    """Local paths to ONLY the safetensors shards that hold a kept tensor.
+
+    For a sharded checkpoint (`model.safetensors.index.json`), download just the
+    shards whose `weight_map` names a tensor this node keeps — not the whole
+    model. So a node's *disk* footprint is its slice too, and a model too big for
+    any single machine can still run once it is split across enough nodes.
+    A single-file checkpoint has one shard (the whole model); nothing to prune.
+    """
+    def want(name: str) -> bool:
+        return any(name.startswith(p) for p in keep_prefixes)
+
+    try:
+        idx_path = hf_hub_download(model_id, "model.safetensors.index.json")
+    except EntryNotFoundError:
+        idx_path = None
+
+    if idx_path is not None:
+        with open(idx_path) as f:
             weight_map = json.load(f)["weight_map"]
-        return [os.path.join(path, f) for f in sorted(set(weight_map.values()))]
+        need = sorted({shard for name, shard in weight_map.items() if want(name)})
+        if not need:  # nothing matched (unexpected) — don't silently load nothing
+            need = sorted(set(weight_map.values()))
+        return [hf_hub_download(model_id, shard) for shard in need]
+
+    # single-file checkpoint (no index): one shard = the whole model
+    try:
+        return [hf_hub_download(model_id, "model.safetensors")]
+    except EntryNotFoundError:
+        pass
+    # last resort: pull whatever .safetensors exist and glob them
+    path = snapshot_download(model_id, allow_patterns=["*.safetensors"])
     files = sorted(glob.glob(os.path.join(path, "*.safetensors")))
     if not files:
-        # Fail loudly instead of silently leaving every weight on meta.
         raise FileNotFoundError(
             f"no safetensors weights for {model_id}; sliced loading needs a "
-            f".safetensors checkpoint (got only: {sorted(os.listdir(path))})"
+            f".safetensors checkpoint"
         )
     return files
 
@@ -65,7 +93,7 @@ def _read_subset(model_id: str, keep_prefixes: list[str], device: str,
         return any(name.startswith(p) for p in keep_prefixes)
 
     sd: dict = {}
-    for fp in _safetensors_files(model_id):
+    for fp in _needed_files(model_id, keep_prefixes):
         with safe_open(fp, framework="pt") as sf:
             for name in sf.keys():
                 if want(name):
