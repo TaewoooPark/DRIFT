@@ -27,6 +27,9 @@ def main(argv=None) -> int:
                     help="listen port (default: $DRIFT_PORT or an OS-assigned free port)")
     ap.add_argument("--quiet", action="store_true", help="one-line banner (used by `drift up`)")
     ap.add_argument("--no-advertise", action="store_true", help="do not announce over mDNS")
+    ap.add_argument("--tunnel", action="store_true",
+                    help="expose this node over a public bore.pub tunnel (for NAT/Colab/cloud) — "
+                         "no account needed; the head connects with `drift run --nodes <printed>`")
     args = ap.parse_args(argv)
 
     cfg = {}
@@ -41,21 +44,38 @@ def main(argv=None) -> int:
                 dtype=cfg.get("dtype", "float16"), device=device)
     ip = lan_ip()
 
+    # Public tunnel (for a node behind NAT / on Colab / on a cloud VM).
+    tunnel_addr, tunnel_proc = None, None
+    if args.tunnel:
+        from . import tunnel as _tunnel
+        print(f"[node] opening a bore.pub tunnel to :{port} …", flush=True)
+        try:
+            tunnel_addr, tunnel_proc = _tunnel.open_bore(port)
+        except Exception as e:
+            print(f"[node] tunnel unavailable ({e}); LAN address only", flush=True)
+        if tunnel_addr:
+            print(f"[node] public address: {tunnel_addr}", flush=True)
+        else:
+            print("[node] tunnel did not come up (bore.pub busy?) — LAN address only", flush=True)
+
     advertised = not args.no_advertise and discovery.HAVE_ZEROCONF
     disc_line = ("this node auto-announces on the LAN — the head can just run `drift run`"
                  if advertised else
                  "zeroconf not active — the head must use `drift run --nodes …`")
+    head_addr = tunnel_addr or f"{ip}:{port}"
     if args.quiet:
-        banner = f"[node] {ip}:{port} device={device} advertise={advertised} — ready"
+        extra = f" tunnel={tunnel_addr}" if tunnel_addr else ""
+        banner = f"[node] {ip}:{port} device={device} advertise={advertised}{extra} — ready"
     else:
+        tunnel_line = f"    tunnel  : {tunnel_addr}  (reachable from anywhere)\n" if tunnel_addr else ""
         banner = (
             "\n  DRIFT node ready\n"
             f"    address : {ip}:{port}\n"
+            f"{tunnel_line}"
             f"    device  : {device}\n"
             f"    discover: {disc_line}\n"
             "    status  : waiting for the head to assign layers…\n\n"
-            f"  head:  drift run          (auto-discovers this node)\n"
-            f"  head:  drift run --nodes {ip}:{port},<others…>   (explicit)\n"
+            f"  head:  drift run --nodes {head_addr},<others…>\n"
         )
 
     handle = None if args.no_advertise else discovery.advertise(port, device, name=node.name)
@@ -65,6 +85,8 @@ def main(argv=None) -> int:
         print("\n[node] shutting down", flush=True)
     finally:
         discovery.unadvertise(handle)
+        if tunnel_proc is not None:
+            tunnel_proc.terminate()
     return 0
 
 

@@ -42,37 +42,6 @@ def _has_cuda() -> bool:
         return False
 
 
-_BORE_URL = ("https://github.com/ekzhang/bore/releases/download/v0.6.0/"
-             "bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz")
-
-
-def _run_bore(port: int):
-    """Download bore (no account) and expose `port` via bore.pub; poll for the
-    assigned public address. Returns (addr, log) — addr is None on failure."""
-    import io
-    import re
-    import tarfile
-    import urllib.request
-
-    if not os.path.exists("bore"):
-        buf = io.BytesIO(urllib.request.urlopen(_BORE_URL).read())
-        tarfile.open(fileobj=buf).extractall(".")
-    os.chmod("bore", 0o755)
-    logf = "/tmp/bore.log"
-    subprocess.Popen(f"./bore local {port} --to bore.pub > {logf} 2>&1",
-                     shell=True, start_new_session=True)
-    for _ in range(40):
-        time.sleep(1)
-        try:
-            log = open(logf).read()
-        except FileNotFoundError:
-            log = ""
-        m = re.search(r"bore\.pub:(\d+)", log) or re.search(r"remote_port[=:\s]+(\d+)", log)
-        if m:
-            return f"bore.pub:{m.group(1)}", log
-    return None, (open(logf).read() if os.path.exists(logf) else "")
-
-
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="DRIFT CUDA node for Colab (node + ngrok tunnel)")
     ap.add_argument("--port", type=int, default=52601)
@@ -105,9 +74,9 @@ def main(argv=None) -> int:
     print(f"[colab] drift node listening on 0.0.0.0:{args.port} (device=cuda)", flush=True)
 
     if args.bore:
-        addr, log = _run_bore(args.port)
-        if log:
-            print(log, flush=True)
+        from drift.tunnel import open_bore
+
+        addr, _tp = open_bore(args.port)
         if not addr:
             print("!! bore did not report an address (bore.pub may be busy) — retry, "
                   "or use ngrok.", flush=True)
