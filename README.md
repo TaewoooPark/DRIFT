@@ -91,7 +91,7 @@ The name is the system:
 | **I** — Inference | the workload is LLM inference (extensible to training) |
 | **For T** — For Tokens | the double meaning of "token": the **inference** token (the atom of machine thought) **and** the **value** token (earned by contributing, spent on inference) — DRIFT's vision is to make the unit of thought and the unit of value one |
 
-> **Scope of this repository.** This is the working demo of the **D·R·I** slice — *heterogeneous split inference.* The **"For Tokens"** economic layer (trustless verification, a token economy, global P2P discovery) is the vision and **future work**, deliberately out of scope here. What ships today is the hard technical core: *does a model split across a Mac and a Windows box actually produce the right answer?* — and the answer is yes, provably.
+> **Scope of this repository.** The hard technical core — *does a model split across a Mac and a Windows box produce the right answer?* — ships and is proven bitwise. On top of it, the **"For Tokens"** substrate now has working v1 seeds: trustless spot-check verification, join-from-anywhere, fault tolerance, and running a model too big for any one machine (see [Beyond the split](#beyond-the-split--the-decentralization-seeds)). A full token economy and consensus are still the vision.
 
 ---
 
@@ -298,7 +298,7 @@ The interesting decisions are the ones DRIFT declined. Each is a deliberate, har
 | **M3** | localhost 2-process parity (TCP) | Mac | ✅ **bitwise** |
 | **M4** | cross-machine — Mac MPS + NVIDIA CUDA | Mac + CUDA (Colab ok) | ✅ **measured** — 100% token match, ~2.7 tok/s |
 | **M5** | booth display + interactive streaming | + Windows | ⬜ |
-| **M6** | graceful kill-node recovery | + Windows | ⬜ |
+| **M6** | graceful kill-node recovery | done | ✅ clean `NodeUnavailable` + reconnect |
 
 The Mac-only track (M0–M3) is ~80 % of the engineering and **100 % of the correctness risk** — done and reviewed. M4–M6 only add the second machine and the show.
 
@@ -387,11 +387,26 @@ docs/               # public docs — benchmarks.md (methodology + results) · m
 
 ---
 
+## Beyond the split — the decentralization seeds
+
+The hard core (a correct, bitwise-verified heterogeneous split) is done. On top of it, the pieces a *decentralized* network needs now have working v1 seeds:
+
+| capability | what it does | try it |
+|---|---|---|
+| **Run a model too big for one machine** | each node downloads and loads **only the shards holding its own layers** — its slice on disk *and* in VRAM | split across enough nodes |
+| **Join from anywhere** | `drift node --tunnel` exposes a node behind NAT / on Colab / on a VM at a public `bore.pub:PORT` — no account, no token | `drift node --tunnel` |
+| **Tolerate a dropped node** | a mid-run drop is detected and retried once, else surfaced as a clean `NodeUnavailable` — not a raw traceback | kill a node mid-decode |
+| **Trust a node you don't own** | the head challenges a node with a fixed input and flags any output outside the M4-measured honest envelope (honest → bitwise; tampered → caught) | `python -m drift.verify --nodes …` |
+
+Seeds, not the finished economy: verification is a spot-check (not consensus/crypto), the tunnel is a relay (not a DHT), kill-node detects but does not replicate. But *run-what-no-machine-can · reach-any-node · tolerate-drops · trust-a-stranger* is no longer only a diagram.
+
+---
+
 ## Roadmap
 
 - **M4 — cross-machine (done).** Measured on a Mac (Apple MPS) + a Colab NVIDIA T4 (CUDA): the split reproduced the single machine **exactly** (130/130 tokens, 3 prompts) at ~2.7 tok/s over a public tunnel, and the version / byte-order check flagged the torch skew. Reproduce with `scripts/colab_node.py --bore` + `python -m drift.bench_m4`.
 - **M5 — booth display.** Each node shows its live layer range + device; the orchestrator streams tokens as *"front half thought by Apple GPU, back half by NVIDIA."*
-- **M6 — graceful kill-node.** Detect a dropped shard mid-decode → notify → reconfigure/restart (no seamless failover — that needs replication).
+- **M6 — graceful kill-node (done).** A dropped node mid-decode is detected, retried once, and surfaced as a clean `NodeUnavailable` naming the node — no seamless failover yet (that needs replication).
 - **v2 — engine swap.** An `engine_mlx.py` behind the same `ShardEngine` interface — the wire stays frozen; only the node internals change. This is where the framework-neutral thesis pays off: an MLX shard and a CUDA shard, one model.
 
 ---
