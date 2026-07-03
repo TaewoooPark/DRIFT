@@ -42,12 +42,45 @@ def _has_cuda() -> bool:
         return False
 
 
+_BORE_URL = ("https://github.com/ekzhang/bore/releases/download/v0.6.0/"
+             "bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz")
+
+
+def _run_bore(port: int):
+    """Download bore (no account) and expose `port` via bore.pub; poll for the
+    assigned public address. Returns (addr, log) — addr is None on failure."""
+    import io
+    import re
+    import tarfile
+    import urllib.request
+
+    if not os.path.exists("bore"):
+        buf = io.BytesIO(urllib.request.urlopen(_BORE_URL).read())
+        tarfile.open(fileobj=buf).extractall(".")
+    os.chmod("bore", 0o755)
+    logf = "/tmp/bore.log"
+    subprocess.Popen(f"./bore local {port} --to bore.pub > {logf} 2>&1",
+                     shell=True, start_new_session=True)
+    for _ in range(40):
+        time.sleep(1)
+        try:
+            log = open(logf).read()
+        except FileNotFoundError:
+            log = ""
+        m = re.search(r"bore\.pub:(\d+)", log) or re.search(r"remote_port[=:\s]+(\d+)", log)
+        if m:
+            return f"bore.pub:{m.group(1)}", log
+    return None, (open(logf).read() if os.path.exists(logf) else "")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="DRIFT CUDA node for Colab (node + ngrok tunnel)")
     ap.add_argument("--port", type=int, default=52601)
     ap.add_argument("--ngrok-token", default=os.environ.get("NGROK_AUTHTOKEN"))
     ap.add_argument("--no-tunnel", action="store_true",
                     help="just run the node; expose the port with your own tunnel")
+    ap.add_argument("--bore", action="store_true",
+                    help="expose via bore.pub (no account, no token) instead of ngrok")
     args = ap.parse_args(argv)
 
     if not _has_cuda():
@@ -70,6 +103,30 @@ def main(argv=None) -> int:
         print("!! drift node exited early — check the install (pip install -e .).", flush=True)
         return 1
     print(f"[colab] drift node listening on 0.0.0.0:{args.port} (device=cuda)", flush=True)
+
+    if args.bore:
+        addr, log = _run_bore(args.port)
+        if log:
+            print(log, flush=True)
+        if not addr:
+            print("!! bore did not report an address (bore.pub may be busy) — retry, "
+                  "or use ngrok.", flush=True)
+            node.terminate()
+            return 1
+        print("\n" + "=" * 64, flush=True)
+        print(f"  CUDA node is reachable at:   {addr}", flush=True)
+        print("  On your Mac, run:", flush=True)
+        print(f"    python -m drift.bench_m4 --nodes {addr} --json m4_results.json", flush=True)
+        print(f"  (both GPUs: also `drift node --port 52600` on the Mac, then "
+              f"--nodes 127.0.0.1:52600,{addr} )", flush=True)
+        print("=" * 64 + "\n  keep this cell running.\n", flush=True)
+        try:
+            node.wait()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            node.terminate()
+        return 0
 
     if args.no_tunnel:
         print(f"\n[colab] node up. Expose port {args.port} with your own tunnel, e.g.:\n"
