@@ -46,6 +46,7 @@ class Node:
         self.dtype = dtype
         self.device = device
         self.engine: TorchShardEngine | None = None
+        self.tamper = False  # test hook: a dishonest node (see drift.verify)
 
     def configure(self, start: int, end: int, model_id: str | None = None,
                   dtype: str | None = None, device: str | None = None) -> dict:
@@ -89,6 +90,8 @@ class Node:
                 position_ids=msg.get("position_ids"), input_ids=msg.get("input_ids"),
                 mode=mtype,
             )
+            if self.tamper:  # test hook: corrupt the output so drift.verify flags it
+                out = out * 1.2 + 0.1
             return {"ok": True, "shape": list(out.shape), "dtype": self.engine.dtype,
                     "tensor": protocol.tensor_to_bytes(out, self.engine.dtype), "error": None}
         return {"ok": False, "error": f"unknown message type: {mtype}"}
@@ -143,6 +146,8 @@ def main(argv=None) -> int:
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int)
     ap.add_argument("--preload", action="store_true", help="load weights before serving")
+    ap.add_argument("--tamper", action="store_true",
+                    help="TEST ONLY: corrupt this node's output so `drift.verify` flags it")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -151,6 +156,7 @@ def main(argv=None) -> int:
     name = args.name or "shard"
     node = Node(name=name, model_id=cfg["model_id"], dtype=cfg.get("dtype", "float16"),
                 device=device)
+    node.tamper = args.tamper
 
     # Pre-assigned mode: a fixed range at launch (parity gate / bench / manual).
     if args.start is not None and args.end is not None:
