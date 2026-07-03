@@ -202,6 +202,8 @@ DRIFT は **正しさ優先（correctness-first）** です。ネットワーク
 
 **MPS ↔ CUDA（M4）— 実測済み。** 前半を Mac（Apple MPS）、後半を Colab の NVIDIA T4（CUDA）で実行したところ、分割経路は単一マシンの参照を**完全に再現しました。3 プロンプトで 130/130 トークン一致、分岐なし**です — 2 つのベンダーの fp16 カーネル差（および torch 2.11 と 2.12 の差）で初手の logit 差は ~2×10⁻²（同一デバイスは ~8×10⁻³）に広がりましたが、argmax を反転させるには至りませんでした。より大きな規模ではこの差が後半のトークンを反転させ得るため、そのための**緩和されたゲート** `python -m drift.parity_test --prefix-match K` があります。公開トンネル経由のマシン間スループットは約 2.7 tok/s（ネットワーク律速）でした。トークン 1〜2 での分岐は浮動小数点ノイズではなく **バグ** です → 二分探索へ。
 
+<p align="center"><img src="docs/img/m4-result.png" alt="M4 measured — Mac Apple MPS + Colab NVIDIA T4 CUDA, 130/130 token match vs one machine" width="900"></p>
+
 ---
 
 ## ベンチマーク

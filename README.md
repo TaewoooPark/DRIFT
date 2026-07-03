@@ -202,6 +202,8 @@ The `--selftest` is the strongest evidence: it re-derives a fresh reference and 
 
 **MPS ↔ CUDA (M4) — measured.** Running the front half on a Mac (Apple MPS) and the back half on a Colab NVIDIA T4 (CUDA), the split reproduced the single-machine reference **exactly: 130/130 tokens across 3 prompts, no divergence** — even though the two vendors' fp16 kernels (plus a torch 2.11 vs 2.12 skew) widened the first-step logit gap to ~2×10⁻² (vs ~8×10⁻³ same-device), which wasn't enough to flip an argmax here. At larger scale that gap can flip a late token; the **relaxed gate** `python -m drift.parity_test --prefix-match K` is there for that. Cross-machine throughput over a public tunnel was ~2.7 tok/s (network-bound). Divergence at token 1–2 would be a **bug**, not float noise → bisect.
 
+<p align="center"><img src="docs/img/m4-result.png" alt="M4 measured — Mac Apple MPS + Colab NVIDIA T4 CUDA, 130/130 token match vs one machine" width="900"></p>
+
 ---
 
 ## Benchmarks

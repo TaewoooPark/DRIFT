@@ -329,12 +329,60 @@ def d5():
     return W, H, "".join(s)
 
 
+# ------------------------------------------------------------------ D6 m4
+def d6():
+    W, H = 1180, 468
+    s = [svg_open(W, H)]
+    s.append(txt(40, 40, "M4 — measured across two GPU vendors", size=17, fill=INK, weight=600))
+    s.append(txt(40, 62, "Mac (Apple MPS) + Colab (NVIDIA T4, CUDA), one model over a public tunnel — "
+                         "vs the same model on one machine", size=13, fill=FAINT))
+
+    # topology
+    s.append(titled_card(60, 96, 400, 120, "Mac · Apple MPS", [
+        ("head: embed · norm · lm_head", "code"),
+        ("decoder layers [0, 14)", "code"),
+    ]))
+    s.append(titled_card(720, 96, 400, 120, "Colab · NVIDIA T4 · CUDA", [
+        ("decoder layers [14, 28)", "code"),
+        ("sliced load onto the T4", "faint"),
+    ]))
+    s.append(arrow(460, 138, 720, 138))
+    s.append(label(590, 126, "fp16 hidden  ·  bore.pub tunnel"))
+    s.append(f'<path d="M 720,176 L 460,176" fill="none" stroke="{FAINT}" stroke-width="1.5" '
+             f'stroke-dasharray="5 5" marker-end="url(#ah)"/>')
+    s.append(label(590, 196, "hidden back  ·  ~2.7 tok/s (network-bound)", size=11, fill=FAINT))
+
+    # agreement bar
+    by, bx, bw = 250, 60, 1060
+    s.append(f'<rect x="{bx}" y="{by}" width="{bw}" height="34" rx="9" fill="#0e1712" '
+             f'stroke="{FIX_S}" stroke-width="1"/>')
+    s.append(txt(bx + bw / 2, by + 23, "✓  130 / 130 tokens identical to the single machine  —  "
+                "3 prompts, first divergence none", size=13.5, fill=FIX_I, weight=600, anchor="middle"))
+
+    # metric tiles
+    tiles = [
+        ("130 / 130", "token match vs 1 machine", "100% · exact", FIX_I),
+        ("~2 × 10⁻²", "first-step logit gap (fp32)", "vs 8 × 10⁻³ same-device", INK),
+        ("~2.7 tok/s", "cross-machine throughput", "public tunnel", INK),
+        ("✓ flagged", "torch 2.11 vs 2.12 skew", "version guard at ping", FIX_I),
+    ]
+    tx, tw, gap = 60, 253, 16
+    for i, (big, lab, sub, ac) in enumerate(tiles):
+        x = tx + i * (tw + gap)
+        s.append(card(x, 312, tw, 116))
+        s.append(txt(x + tw / 2, 356, big, size=22, fill=ac, weight=700, anchor="middle"))
+        s.append(txt(x + tw / 2, 386, lab, size=12.5, fill=BODY, anchor="middle"))
+        s.append(txt(x + tw / 2, 408, sub, size=11.5, fill=FAINT, anchor="middle"))
+    s.append("</svg>")
+    return W, H, "".join(s)
+
+
 # ------------------------------------------------------------------ emit
 def main():
     os.makedirs(OUT, exist_ok=True)
     manifest = []
     for name, fn in [("arch", d1), ("kv-reindex", d2), ("decode-loop", d3),
-                     ("parity-gate", d4), ("scale", d5)]:
+                     ("parity-gate", d4), ("scale", d5), ("m4-result", d6)]:
         w, h, body = fn()
         page = (f'<!doctype html><html><head><meta charset="utf-8">'
                 f'<style>html,body{{margin:0;padding:0;background:{BG}}}</style></head>'
