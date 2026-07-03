@@ -200,7 +200,7 @@ DRIFT is **correctness-first**: every networked step must reproduce the single-m
 
 The `--selftest` is the strongest evidence: it re-derives a fresh reference and compares, across prompt *kinds* (prose, source code, Korean) and *lengths* (a single-token generation up to a 180-token decode). Every token id matches — first divergence index `None` in all six.
 
-**MPS ↔ CUDA (M4).** Only at the true cross-machine step do the two GPU vendors' kernels round fp16 differently, so greedy decoding may diverge in *later* tokens — this is expected, and handled by a **relaxed gate**: `python -m drift.parity_test --prefix-match K` requires the first K ids to match and allows the drift after them. Divergence at token 1–2 is a **bug**, not float noise → bisect.
+**MPS ↔ CUDA (M4) — measured.** Running the front half on a Mac (Apple MPS) and the back half on a Colab NVIDIA T4 (CUDA), the split reproduced the single-machine reference **exactly: 130/130 tokens across 3 prompts, no divergence** — even though the two vendors' fp16 kernels (plus a torch 2.11 vs 2.12 skew) widened the first-step logit gap to ~2×10⁻² (vs ~8×10⁻³ same-device), which wasn't enough to flip an argmax here. At larger scale that gap can flip a late token; the **relaxed gate** `python -m drift.parity_test --prefix-match K` is there for that. Cross-machine throughput over a public tunnel was ~2.7 tok/s (network-bound). Divergence at token 1–2 would be a **bug**, not float noise → bisect.
 
 ---
 
@@ -294,7 +294,7 @@ The interesting decisions are the ones DRIFT declined. Each is a deliberate, har
 | **M1** | single-machine reference oracle | Mac | ✅ done |
 | **M2** | in-process 2-shard parity (no network) | Mac | ✅ **bitwise** |
 | **M3** | localhost 2-process parity (TCP) | Mac | ✅ **bitwise** |
-| **M4** | cross-machine — Mac MPS + Windows CUDA | + Windows | ⬜ needs 2nd node |
+| **M4** | cross-machine — Mac MPS + NVIDIA CUDA | Mac + CUDA (Colab ok) | ✅ **measured** — 100% token match, ~2.7 tok/s |
 | **M5** | booth display + interactive streaming | + Windows | ⬜ |
 | **M6** | graceful kill-node recovery | + Windows | ⬜ |
 
@@ -387,7 +387,7 @@ docs/               # public docs — benchmarks.md (methodology + results) · m
 
 ## Roadmap
 
-- **M4 — cross-machine.** Mac (MPS) + Windows (CUDA) on one model over the LAN. The relaxed parity gate (`--prefix-match K`) absorbs the expected MPS↔CUDA float divergence, and nodes cross-check version / byte-order at ping before layers are assigned — the physical second machine is what's left.
+- **M4 — cross-machine (done).** Measured on a Mac (Apple MPS) + a Colab NVIDIA T4 (CUDA): the split reproduced the single machine **exactly** (130/130 tokens, 3 prompts) at ~2.7 tok/s over a public tunnel, and the version / byte-order check flagged the torch skew. Reproduce with `scripts/colab_node.py --bore` + `python -m drift.bench_m4`.
 - **M5 — booth display.** Each node shows its live layer range + device; the orchestrator streams tokens as *"front half thought by Apple GPU, back half by NVIDIA."*
 - **M6 — graceful kill-node.** Detect a dropped shard mid-decode → notify → reconfigure/restart (no seamless failover — that needs replication).
 - **v2 — engine swap.** An `engine_mlx.py` behind the same `ShardEngine` interface — the wire stays frozen; only the node internals change. This is where the framework-neutral thesis pays off: an MLX shard and a CUDA shard, one model.

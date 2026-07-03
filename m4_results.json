@@ -1,0 +1,84 @@
+{
+  "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+  "dtype": "float16",
+  "head_device": "mps",
+  "cross_vendor": true,
+  "plan": [
+    {
+      "name": "n0",
+      "host": "127.0.0.1",
+      "port": 52600,
+      "start": 0,
+      "end": 14,
+      "device": "mps"
+    },
+    {
+      "name": "n1",
+      "host": "bore.pub",
+      "port": 34183,
+      "start": 14,
+      "end": 28,
+      "device": "cuda"
+    }
+  ],
+  "fidelity_relaxed": {
+    "per_case": [
+      {
+        "prompt": "Give me a short introduction to large language models.",
+        "n": 50,
+        "first_divergence": null,
+        "prefix_match": {
+          "k": 16,
+          "ok": true
+        },
+        "match_rate": 1.0,
+        "exact": true,
+        "logit_max_abs_diff": 0.01953125,
+        "ref_text": "Large language models, also known as generative pre-trained models, are a type of artificial intelligence that can generate human-like text based on the input provided. These models are trained on vast amounts of text data, such as books, articles, and other",
+        "split_text": "Large language models, also known as generative pre-trained models, are a type of artificial intelligence that can generate human-like text based on the input provided. These models are trained on vast amounts of text data, such as books, articles, and other"
+      },
+      {
+        "prompt": "def fibonacci(n):",
+        "n": 40,
+        "first_divergence": null,
+        "prefix_match": {
+          "k": 16,
+          "ok": true
+        },
+        "match_rate": 1.0,
+        "exact": true,
+        "logit_max_abs_diff": 0.025390625,
+        "ref_text": "The Fibonacci sequence is a series of numbers where each number is the sum of the two preceding ones, usually starting with 0 and 1. Here's how you can implement the Fibonacci function in Python",
+        "split_text": "The Fibonacci sequence is a series of numbers where each number is the sum of the two preceding ones, usually starting with 0 and 1. Here's how you can implement the Fibonacci function in Python"
+      },
+      {
+        "prompt": "한국어로 인공지능을 한 문장으로 설명해줘.",
+        "n": 40,
+        "first_divergence": null,
+        "prefix_match": {
+          "k": 16,
+          "ok": true
+        },
+        "match_rate": 1.0,
+        "exact": true,
+        "logit_max_abs_diff": 0.0263671875,
+        "ref_text": "인공지능은 컴퓨터가 인간과 비슷한 지능을 가진 것처럼 행동하는 기술입니다. 이는 인공지능 알고리즘과 데이터를 사용하여 컴퓨터",
+        "split_text": "인공지능은 컴퓨터가 인간과 비슷한 지능을 가진 것처럼 행동하는 기술입니다. 이는 인공지능 알고리즘과 데이터를 사용하여 컴퓨터"
+      }
+    ],
+    "min_first_divergence": null,
+    "all_prefix_ok": true,
+    "any_exact": true,
+    "mean_match_rate": 1.0
+  },
+  "latency": {
+    "tpot_ms": 366.7669114996291,
+    "tok_per_s": 2.726527308342021,
+    "n1": 8,
+    "n2": 32
+  },
+  "wire": {
+    "hidden_size": 1536,
+    "decode_bytes_per_token_per_hop": 3072
+  }
+}
