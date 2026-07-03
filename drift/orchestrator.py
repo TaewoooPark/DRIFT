@@ -18,6 +18,10 @@ from .common import build_input_ids, load_config
 from .engine_torch import TorchShardEngine
 
 
+class NodeUnavailable(RuntimeError):
+    """A shard node dropped and could not be reached again (M6 kill-node)."""
+
+
 # ----------------------------------------------------------------- head model
 class HeadModel:
     """Holds embed_tokens + final norm + lm_head (spec §8 v1 simplification).
@@ -99,6 +103,29 @@ class SocketTransport:
             self.socks[name] = sk
         return self.socks[name]
 
+    def _drop(self, name):
+        """Forget a node's socket so the next call reconnects."""
+        sk = self.socks.pop(name, None)
+        if sk is not None:
+            try:
+                sk.close()
+            except Exception:
+                pass
+
+    def _roundtrip(self, name, msg):
+        """Send + receive one message, with a single reconnect for a transient
+        drop. Raises NodeUnavailable if the node is truly gone (M6)."""
+        for attempt in (1, 2):
+            try:
+                sk = self._sock(name)
+                protocol.send_msg(sk, msg)
+                return protocol.recv_msg(sk)
+            except (ConnectionError, OSError) as e:
+                self._drop(name)
+                if attempt == 2:
+                    raise NodeUnavailable(
+                        f"node {name} dropped mid-run and did not come back: {e}") from e
+
     def forward(self, name, session_id, hidden, position_ids, input_ids, mode):
         self.seq += 1
         msg = {
@@ -111,17 +138,19 @@ class SocketTransport:
             "input_ids": list(input_ids),
             "tensor": protocol.tensor_to_bytes(hidden, self.dtype),
         }
-        sk = self._sock(name)
-        protocol.send_msg(sk, msg)
-        reply = protocol.recv_msg(sk)
+        reply = self._roundtrip(name, msg)
         if not reply.get("ok"):
             raise RuntimeError(f"shard {name} error: {reply.get('error')}")
         return protocol.bytes_to_tensor(reply["tensor"], reply["shape"], reply["dtype"], self.device)
 
     def reset(self, name, session_id):
-        sk = self._sock(name)
-        protocol.send_msg(sk, {"type": "reset", "session_id": session_id})
-        protocol.recv_msg(sk)
+        # Cleanup path — a dropped node needs no reset, so never raise here.
+        try:
+            sk = self._sock(name)
+            protocol.send_msg(sk, {"type": "reset", "session_id": session_id})
+            protocol.recv_msg(sk)
+        except (ConnectionError, OSError):
+            self._drop(name)
 
     def configure(self, name, start_layer, end_layer, model_id, dtype, device=None):
         """Push a layer range to an unassigned (fungible) node."""

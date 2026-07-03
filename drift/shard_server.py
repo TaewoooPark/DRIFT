@@ -18,11 +18,18 @@ import argparse
 import os
 import socket
 import sys
+import threading
 
 import yaml
 
 from . import protocol
 from .engine_torch import TorchShardEngine
+
+# The engine (model forward + per-session KV) is serialized: concurrent sessions
+# may connect, but only one forward runs at a time (the GPU serializes anyway).
+# What this buys is overlap — while one session's reply travels the network, the
+# next session computes — which is the throughput win on a network-bound link.
+_ENGINE_LOCK = threading.Lock()
 
 
 def load_config(path: str = "config.yaml") -> dict:
@@ -101,20 +108,29 @@ def serve(node: Node, host: str, port: int, banner: str | None = None) -> None:
               f"device={node.device}", flush=True)
     while True:
         conn, _ = srv.accept()
-        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        try:
-            while True:
-                try:
-                    msg = protocol.recv_msg(conn)
-                except ConnectionError:
-                    break
-                try:
+        threading.Thread(target=_serve_conn, args=(node, conn), daemon=True).start()
+
+
+def _serve_conn(node: Node, conn: socket.socket) -> None:
+    """Handle one client connection (one session) until it closes."""
+    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    try:
+        while True:
+            try:
+                msg = protocol.recv_msg(conn)
+            except ConnectionError:
+                break
+            try:
+                with _ENGINE_LOCK:  # serialize the forward; overlap the network
                     reply = node.handle(msg)
-                except Exception as e:  # surface engine errors to the caller
-                    reply = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+            except Exception as e:  # surface engine errors to the caller
+                reply = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+            try:
                 protocol.send_msg(conn, reply)
-        finally:
-            conn.close()
+            except (ConnectionError, OSError):
+                break
+    finally:
+        conn.close()
 
 
 def main(argv=None) -> int:
