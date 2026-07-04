@@ -29,6 +29,12 @@
   <img src="https://img.shields.io/badge/Up%20to%2035%20nodes-000000?style=flat-square&labelColor=000000" alt="Up to 35 nodes">
 </p>
 
+<p align="center">
+  <img src="docs/img/hero.png" alt="하나의 모델을 지구 반대편에 쪼개다 — 뉴욕과 서울이 한 모델을 함께, 데이터센터 없이" width="900">
+</p>
+
+<p align="center"><sub>뉴욕의 친구가 잠든 사이 노드를 켜 두고, 당신은 서울에 있다. DRIFT는 <b>하나의</b> 모델을 두 머신에 쪼갠다. 친구의 GPU가 앞쪽 레이어를, 당신의 GPU가 뒤쪽을 계산하고, 오직 hidden state만 바다를 건넌다. 그리하여 어느 한 대도 홀로 담지 못할 모델을 둘이 함께 돌리되, 그 답은 단일 머신과 비트 단위로 같다.</sub></p>
+
 **DRIFT**는 **하나의** 대규모 언어 모델을 **이종(heterogeneous) 개인 머신들**, 곧 Mac(Apple GPU, PyTorch **MPS**)과 Windows PC(NVIDIA GPU, PyTorch **CUDA**)에 걸쳐 실행하되, 모델을 **레이어 단위로** 분할(파이프라인 병렬화, pipeline parallelism)하고 노드 사이로는 오직 **hidden state**만을 **프레임워크 중립 바이트 프로토콜**(TCP + msgpack) 위로 흘려보내는 방식을 취한다. 데이터센터도, `torch.distributed`도, NCCL도, 벤더 종속도 개입하지 않는바, 데이터 플레인(data plane)이 *어떤* 프레임워크에도 묶여 있지 않기에 서로 결코 대화할 수 없던 런타임, 곧 Apple Metal 그래프와 NVIDIA CUDA 그래프가 비로소 하나의 모델을 함께 돌릴 수 있으며, 그 출력은 전체 모델을 단일 머신에서 실행한 결과와 **비트 하나까지 동일하다**. 이종성(heterogeneity) 아래에서도 연산의 정확성이 조금도 훼손되지 않는다는 점, 바로 그것이 본 저장소가 겨냥하는 핵심이다.
 
 **한 줄로 요약한 차별점:** [Exo](https://github.com/exo-explore/exo)는 노드 간 통신을 MLX(`mx.distributed`)에 결박해 둔 탓에 *Apple 실리콘 대 Apple 실리콘 전용*에 머무는바(Windows는 로드맵상 "Longer term"으로 미뤄져 있다), 이종 협업의 여지가 원천적으로 닫혀 있다. 그러나 DRIFT는 그 경계를 **중립 와이어 프로토콜**로 끌어올림으로써(*서로 다른 런타임, 서로 다른 GPU 벤더, 하나의 모델*) 분할이 정확함을 **비트 단위 패리티 게이트(bitwise parity gate)**로 입증한다. 결국 어떤 프레임워크에도 묶이지 않은 데이터 플레인, 바로 그것이 본 프로젝트의 핵심 기여라 하여도 과언이 아니다.

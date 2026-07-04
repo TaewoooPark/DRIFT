@@ -29,6 +29,12 @@
   <img src="https://img.shields.io/badge/Up%20to%2035%20nodes-000000?style=flat-square&labelColor=000000" alt="Up to 35 nodes">
 </p>
 
+<p align="center">
+  <img src="docs/img/hero.png" alt="One model, split across the Earth — New York and Seoul running one model together, no datacenter" width="900">
+</p>
+
+<p align="center"><sub>A friend in New York leaves a node running while they sleep; you're in Seoul. DRIFT splits <b>one</b> model across both machines — their GPU computes the front layers, yours the back, and only the hidden state crosses the ocean — so together you run a model neither could hold alone, provably the same answer as one machine.</sub></p>
+
 **DRIFT** runs **one** large language model across **heterogeneous personal machines** — a Mac (Apple GPU, PyTorch **MPS**) and a Windows PC (NVIDIA GPU, PyTorch **CUDA**) — by splitting the model **layer by layer** (pipeline parallelism) and streaming only the **hidden state** between nodes over a **framework-neutral byte protocol** (TCP + msgpack). No datacenter, no `torch.distributed`, no NCCL, no vendor lock. The data plane is bound to *no* framework, so runtimes that could never talk to each other — an Apple Metal graph and an NVIDIA CUDA graph — now run one model together, and the output is **bit-for-bit identical** to running the whole model on a single machine.
 
 **The differentiator in one line:** [Exo](https://github.com/exo-explore/exo) binds node-to-node communication to MLX (`mx.distributed`), so it is *Apple-silicon-to-Apple-silicon only* (Windows is "Longer term" on its roadmap). DRIFT lifts the boundary into a **neutral wire protocol** — *different runtimes, different GPU vendors, one model* — and proves the split is exact with a **bitwise parity gate.** A data plane bound to no framework is the core contribution.
