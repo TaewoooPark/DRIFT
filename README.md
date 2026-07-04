@@ -107,7 +107,7 @@ The name is the system:
 
 DRIFT separates cleanly into three planes:
 
-- **Control plane** — the orchestrator calls shards in a fixed configured order. No discovery service, no leader election; the address list lives in `config.yaml`. (Discovery is a "For Tokens" concern, out of scope.)
+- **Control plane** — the orchestrator routes through the nodes in order; no leader election. Nodes are found three ways: zero-config LAN discovery (mDNS), an explicit `--nodes host:port` list, or — for a node behind NAT / on Colab / a cloud VM — a public `bore.pub` tunnel it opens with `drift node --tunnel`.
 - **Data plane** — the only things that cross a stage boundary are `hidden_states` (floats) and `position_ids` + `input_ids` (ints). Framework-agnostic, and — crucially — **its size depends on `hidden_size`, not on the parameter count.** A 1.5 B model and a 70 B model push the same ~3 KB/token if `hidden_size` matches.
 - **KV cache plane** — each shard keeps the KV for *its own* layer range, per session, on its own device. **The cache never crosses the wire** (that would be megabytes/token and would defeat the whole design). Only the residual stream travels.
 
@@ -124,7 +124,7 @@ The contract (`drift/protocol.py`) is **frozen**: every message is a **4-byte bi
 ```jsonc
 // request  (orchestrator → shard)
 {
-  "type":         "prefill" | "decode" | "reset" | "ping",
+  "type":         "prefill" | "decode" | "reset" | "ping" | "configure",
   "session_id":   "s0",               // one generation sequence
   "seq_id":       42,                 // monotonic, for ordering / debug
   "shape":        [1, 1, 1536],       // hidden_states shape (decode: S=1)
@@ -137,8 +137,11 @@ The contract (`drift/protocol.py`) is **frozen**: every message is a **4-byte bi
 // response (shard → orchestrator)
 { "ok": true, "shape": [1,1,1536], "dtype": "float16", "tensor": "<bytes>", "error": null }
 
-// ping response  →  { "ok": true, "name", "start_layer", "end_layer", "device" }
+// ping response  →  { "ok": true, "assigned", "name", "start_layer", "end_layer",
+//                     "device", "torch", "transformers", "endian" }
 ```
+
+`configure` assigns a layer range to a **fungible** node (so users never hand-write ranges); the ping's `torch` / `transformers` / `endian` let the head reject a version or byte-order mismatch before it assigns layers.
 
 **Bytes per token.** During decode the activation is `[1, 1, hidden]` in fp16 = `hidden × 2` bytes. For Qwen's `hidden = 1536` that is **3 072 bytes ≈ 3 KB**, plus one `position_id`, one `input_id`, and a few bytes of msgpack framing. A two-shard pipeline does ~4 such crossings per token (orchestrator→A, A→orchestrator, orchestrator→B, B→orchestrator) ≈ **12 KB/token of wire traffic** — on a LAN, trivial next to the compute.
 
@@ -288,7 +291,7 @@ The interesting decisions are the ones DRIFT declined. Each is a deliberate, har
 - **Why not `torch.distributed` / NCCL / gloo across nodes?** NCCL cannot place an Apple Metal device and an NVIDIA CUDA device in one process group — full stop. And any of these couples the *data plane* to a specific backend, which is exactly what DRIFT refuses. The wire is neutral bytes so the runtimes need agree on nothing but framing.
 - **Why not ship the KV cache between nodes?** KV is megabytes per token and grows with sequence length; sending it would dwarf the ~3 KB residual and destroy the economics. Each shard keeps its own KV locally; only the residual stream travels.
 - **Why fp16 on the wire (not fp32)?** With fp16 compute, the CPU fp16 round-trip is bit-lossless, so serialization can't perturb parity — while halving wire bytes vs fp32. (fp16 compute lives on the GPU where it's fast; CPU fp16 kernels are unreliable, which is why the parity baseline runs on MPS, not CPU.)
-- **Why sequential, single-session first?** Concurrency, batching, and speculative decoding are optimizations. The demo's value is *correctness under heterogeneity*, so they are deferred until parity is proven — and it is.
+- **Why prove correctness before speed?** Getting *heterogeneous split inference exact* is the hard part, so it comes first. Concurrency sits on top: the shard server serves a thread per session, overlapping one session's network round-trip with the next's compute. Batching within a generation and speculative decoding are future work.
 - **Why not keep the whole model on every node?** Each node materializes **only its slice** — `init_empty_weights` builds the skeleton on the meta device, then only the tensors that node actually runs (its decoder layers, or the head's `embed`/`norm`/`lm_head`) are read from the safetensors and placed on the device. The heaviest node holds **42 % of the weights in real memory**, and the parity gate proves the sliced load is bitwise-identical to a single-machine load.
 - **Why freeze the wire contract at M0?** So node internals can change forever without a flag day. The `input_ids` field was added *before* freezing precisely so PLE models (Gemma 4) never force a breaking change.
 
@@ -306,7 +309,7 @@ The interesting decisions are the ones DRIFT declined. Each is a deliberate, har
 | **M5** | booth display + interactive streaming | + Windows | ⬜ |
 | **M6** | graceful kill-node recovery | done | ✅ clean `NodeUnavailable` + reconnect |
 
-The Mac-only track (M0–M3) is ~80 % of the engineering and **100 % of the correctness risk** — done and reviewed. M4–M6 only add the second machine and the show.
+The Mac-only track (M0–M3) carries **100 % of the correctness risk** and is done and reviewed; M4 (cross-vendor) and M6 (kill-node) are measured and working, leaving M5's booth display as the one piece not yet built.
 
 ---
 
@@ -353,6 +356,8 @@ drift run --prompt "hello world"
 
 Two Macs or two Windows PCs run with the **same three commands** — devices auto-detect, `drift run` finds and splits. If Wi-Fi blocks mDNS, name the nodes: `drift run --nodes 192.168.0.22:52601,127.0.0.1:52600 --prompt "hello world"`. Across GPU vendors (MPS↔CUDA) fp16 rounds a little differently, so long answers may drift in later tokens — expected, not a bug.
 
+**Across the internet** — a node on another network runs `drift node --tunnel`, which prints a public `bore.pub:PORT`; the head just points at it: `drift run --nodes bore.pub:PORT --prompt "hello world"`. No VPN, no port-forwarding.
+
 **Customize & fine-tune** — models, split points, devices, driving the shards by hand, and troubleshooting — is all in the **operations manual → [docs/manual.md](docs/manual.md)** ([한국어](docs/manual.ko.md) · [中文](docs/manual.zh.md) · [日本語](docs/manual.ja.md)).
 
 ---
@@ -364,13 +369,19 @@ drift/
   protocol.py       # THE CONTRACT — 4B length prefix + msgpack; fp16 tensor ser/deser
   engine_base.py    # ShardEngine ABC — the swappable-runtime seam
   engine_torch.py   # PyTorch shard: introspected layer calls, local KV re-index, self-RoPE  ← the crux
-  shard_server.py   # TCP server: ping / reset / prefill / decode
+  loader.py         # sliced weights — init_empty_weights + only the shards a node runs
+  shard_server.py   # concurrent TCP server: ping / configure / reset / prefill / decode
   orchestrator.py   # embed + norm + lm_head + sampler; injectable transport; decode loop
+  run.py, node.py   # `drift run` head + `drift node` worker (auto-split, discovery, --tunnel)
+  discovery.py      # zero-config LAN discovery (mDNS)
+  tunnel.py         # public bore.pub tunnel — a node behind NAT joins from anywhere
+  verify.py         # trustless spot-check — challenge a node, flag dishonest output
   reference.py      # M1 single-machine oracle
   parity_test.py    # M2/M3 gate + multi-prompt --selftest
+  bench.py, bench_m4.py   # single-machine + cross-machine (M4) benchmarks
   common.py         # config + identical tokenization (shared by oracle and split path)
 config.yaml         # model, dtype, port, shard table
-docs/               # public docs — benchmarks.md (methodology + results) · manual.md (how to run it)
+docs/               # public docs — benchmarks.md · manual.md
 ```
 
 **Reviewer's shortlist:** `engine_torch.py` (the KV re-index + introspection), `protocol.py` (the frozen wire), `orchestrator.py` (the injectable transport + decode loop).
@@ -381,13 +392,13 @@ docs/               # public docs — benchmarks.md (methodology + results) · m
 
 **Is this just pipeline parallelism?** The *idea* is, but the contribution is the **boundary**: PP in vLLM/Megatron is welded to `torch.distributed`+NCCL and can't bridge MPS↔CUDA. DRIFT's boundary is neutral bytes, so heterogeneous vendors join — and it's proven bitwise-exact.
 
-**Does the network see my tokens?** Only integer `input_ids` and float `hidden_states` cross the wire — no text, no KV. On a LAN this stays on your machines. (Encryption/trust is a "For Tokens" concern, out of scope here.)
+**Does the network see my tokens?** Only integer `input_ids` and float `hidden_states` cross the wire — no text, no KV. And you don't have to trust a node you don't own: `python -m drift.verify` challenges a node with a fixed input and flags any output outside the honest envelope — an honest node matches bitwise, a tampered one is caught.
 
 **Can I add a third node?** Yes — the split is a list of layer ranges in `config.yaml`; add a shard entry and the orchestrator routes through it in order. The wire contract doesn't change.
 
 **Why is the reference on MPS, not CPU?** Because the compute dtype is fp16 and CPU fp16 kernels in PyTorch are unreliable; MPS runs fp16 correctly and deterministically, so M1–M3 are all on MPS and match bitwise. CPU/CUDA are configurable.
 
-**What about batching / throughput?** Deferred by design (correctness-first). Sequential single-session is enough to prove the split is exact; batching is future work.
+**What about throughput?** The shard server handles concurrent sessions — a thread each — so multiple generations overlap the network round-trips. Batching within a single generation and speculative decoding are future work.
 
 **Why Qwen and Gemma 4 specifically?** Both are ungated (no license wall) and cover two ends of the architecture space — a plain decoder and one with Per-Layer Embeddings + hybrid attention — which stress-tests the "introspect, don't hardcode" engine.
 
