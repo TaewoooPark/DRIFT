@@ -4,13 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "drift"
-version = "0.27.0"
+version = "1.0.0"
 description = "Decentralized Routed Inference For Tokens — one model, split across your machines, no datacenter."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 authors = [{ name = "Taewoo Park" }]
-keywords = ["llm", "inference", "pipeline-parallel", "distributed", "mps", "cuda"]
+keywords = ["llm", "inference", "pipeline-parallel", "distributed", "decentralized",
+            "peer-to-peer", "mps", "cuda", "encryption"]
 dependencies = [
   "torch",
   "transformers>=5.5",

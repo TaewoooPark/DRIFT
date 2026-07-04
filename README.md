@@ -19,29 +19,30 @@
   <img src="https://img.shields.io/badge/PyTorch-2.12-000000?style=flat-square&logo=pytorch&logoColor=white&labelColor=000000" alt="PyTorch">
   <img src="https://img.shields.io/badge/Apple%20MPS-000000?style=flat-square&logo=apple&logoColor=white&labelColor=000000" alt="Apple MPS">
   <img src="https://img.shields.io/badge/CUDA-000000?style=flat-square&logo=nvidia&logoColor=white&labelColor=000000" alt="CUDA">
-  <img src="https://img.shields.io/badge/%F0%9F%A4%97%20Transformers%205.12-000000?style=flat-square&labelColor=000000" alt="Transformers">
   &nbsp;
-  <img src="https://img.shields.io/badge/Pipeline--parallel-000000?style=flat-square&labelColor=000000" alt="Pipeline parallel">
-  <img src="https://img.shields.io/badge/Framework--neutral%20wire-000000?style=flat-square&labelColor=000000" alt="Framework neutral">
-  <img src="https://img.shields.io/badge/No%20torch.distributed-000000?style=flat-square&labelColor=000000" alt="No torch.distributed">
+  <img src="https://img.shields.io/badge/Peer--to--peer%20chain-000000?style=flat-square&labelColor=000000" alt="Peer to peer chain">
+  <img src="https://img.shields.io/badge/Encrypted%20wire-000000?style=flat-square&labelColor=000000" alt="Encrypted wire">
+  <img src="https://img.shields.io/badge/Signed%20receipts-000000?style=flat-square&labelColor=000000" alt="Signed receipts">
+  <img src="https://img.shields.io/badge/Bitwise%20failover-000000?style=flat-square&labelColor=000000" alt="Bitwise failover">
   <img src="https://img.shields.io/badge/Bitwise%20parity-000000?style=flat-square&labelColor=000000" alt="Bitwise parity">
   <img src="https://img.shields.io/badge/MPS%20%E2%86%94%20CUDA-000000?style=flat-square&labelColor=000000" alt="MPS to CUDA">
-  <img src="https://img.shields.io/badge/Up%20to%2035%20nodes-000000?style=flat-square&labelColor=000000" alt="Up to 35 nodes">
 </p>
 
 <p align="center">
   <img src="docs/img/hero.png" alt="One model, split across the Earth — New York and Seoul running one model together, no datacenter" width="900">
 </p>
 
-<p align="center"><sub>A friend in New York leaves a node running while they sleep; you're in Seoul. DRIFT splits <b>one</b> model across both machines — their GPU computes the front layers, yours the back, and only the hidden state crosses the ocean — so together you run a model neither could hold alone, provably the same answer as one machine.</sub></p>
+<p align="center"><sub>A friend in New York leaves a node running while they sleep; you're in Seoul. DRIFT splits <b>one</b> model across both machines — their GPU computes the front layers, yours the back, the hidden state streams <b>node-to-node</b> over an <b>encrypted</b> wire, and every hop <b>signs a receipt</b> — so together you run a model neither could hold alone, provably the same answer as one machine.</sub></p>
 
-**DRIFT** runs **one** large language model across **heterogeneous personal machines** — a Mac (Apple GPU, PyTorch **MPS**) and a Windows PC (NVIDIA GPU, PyTorch **CUDA**) — by splitting the model **layer by layer** (pipeline parallelism) and streaming only the **hidden state** between nodes over a **framework-neutral byte protocol** (TCP + msgpack). No datacenter, no `torch.distributed`, no NCCL, no vendor lock. The data plane is bound to *no* framework, so runtimes that could never talk to each other — an Apple Metal graph and an NVIDIA CUDA graph — now run one model together, and the output is **bit-for-bit identical** to running the whole model on a single machine.
+**DRIFT** runs **one** large language model across **heterogeneous personal machines** — a Mac (Apple GPU, PyTorch **MPS**) and a Windows/Linux PC (NVIDIA GPU, PyTorch **CUDA**) — by splitting the model **layer by layer** (pipeline parallelism) and streaming only the **hidden state** between nodes over a **framework-neutral byte protocol** (TCP + msgpack). No datacenter, no `torch.distributed`, no NCCL, no vendor lock. The data plane is bound to *no* framework, so runtimes that could never talk to each other — an Apple Metal graph and an NVIDIA CUDA graph — now run one model together, and the output is **bit-for-bit identical** to running the whole model on a single machine.
 
-**The differentiator in one line:** [Exo](https://github.com/exo-explore/exo) binds node-to-node communication to MLX (`mx.distributed`), so it is *Apple-silicon-to-Apple-silicon only* (Windows is "Longer term" on its roadmap). DRIFT lifts the boundary into a **neutral wire protocol** — *different runtimes, different GPU vendors, one model* — and proves the split is exact with a **bitwise parity gate.** A data plane bound to no framework is the core contribution.
+On top of that exact core, DRIFT has grown a real **decentralization layer**: the hidden state now streams **peer-to-peer** (the head is no longer a bandwidth hub), the wire is **encrypted and membership-authenticated**, a dropped node is recovered **bitwise**, the head can be **weightless**, every hop **signs a receipt** the head verifies on live traffic, nodes **gossip-discover** each other, and their contribution is tallied in a **ledger**.
+
+**The differentiator in one line:** [Exo](https://github.com/exo-explore/exo) binds node-to-node communication to MLX (`mx.distributed`), so it is *Apple-silicon-to-Apple-silicon only*. DRIFT lifts the boundary into a **neutral, encrypted wire protocol** — *different runtimes, different GPU vendors, one model* — proves the split is exact with a **bitwise parity gate**, and makes it **self-verifying** with signed per-hop receipts. A data plane bound to no framework, provably exact, and checkable without trusting the nodes — that is the core contribution.
 
 **Scale.** One node per decoder layer — split one model across up to **28** machines on the default Qwen (**35** on Gemma), streaming across all of them. Two to four is today's sweet spot.
 
-> *"The transcript is the model's output. The interesting part is **where** the computation actually ran — and that it added up, bit for bit."*
+> *"The transcript is the model's output. The interesting part is **where** the computation actually ran — that it added up bit for bit, that the wire was encrypted, and that every hop signed for its work."*
 
 [**taewoopark.com** — author site](https://taewoopark.com)
 
@@ -51,15 +52,16 @@
 
 - [Why this is different](#why-this-is-different) — the comparison table engineers came for
 - [What is DRIFT](#what-is-drift) — the name, the vision, the scope
-- [Architecture](#architecture) — control / data / KV planes
+- [The five planes](#the-five-planes) — control / data / KV / security / trust
 - [The wire contract](#the-wire-contract-what-actually-crosses-the-boundary) — schema + bytes-per-token
 - [Three correctness problems](#three-problems-a-correct-split-must-solve) — KV re-index, RoPE, mask
-- [The decode loop](#the-decode-loop--injectable-transport) — sequence + injectable transport
+- [Peer-to-peer, weightless head](#peer-to-peer-and-a-weightless-head) — the chain + thin head
+- [Trust without trusting the nodes](#trust-without-trusting-the-nodes) — encryption, signed receipts, failover
 - [Correctness & parity](#correctness--the-parity-gate) — the bitwise gate + measured results
-- [Benchmarks](#benchmarks) — fidelity 100% · ≤ 42% of the model per node (measured) · protocol overhead ≈ 1 ms/hop
-- [Model-agnostic by introspection](#model-agnostic-by-introspection) — Qwen, Gemma 4, and no hardcoding
+- [Benchmarks](#benchmarks) — fidelity 100% · ½ the wire on int8 · O(1) head bandwidth
+- [Model-agnostic by introspection](#model-agnostic-by-introspection) — Qwen, Gemma, no hardcoding
 - [Design rationale (why-not)](#design-rationale-why-not) — the decisions and their reasons
-- [Milestones](#milestones) · [Quickstart](#quickstart) · [Repo map](#repository-map--where-to-look) · [FAQ](#faq) · [Roadmap](#roadmap)
+- [Milestones](#milestones) · [Quickstart](#quickstart) · [Repo map](#repository-map--where-to-look) · [FAQ](#faq) · [What's still the vision](#whats-shipped-vs-still-the-vision)
 
 ---
 
@@ -71,16 +73,16 @@ The whole point of DRIFT lives at the **boundary between nodes.** Here is how th
 |---|---|---|---|---|---|
 | **Split unit** | decoder layers | layers | transformer blocks | layers / tensors | layers (stages) |
 | **Node↔node transport** | **TCP + msgpack** | MLX `mx.distributed` | gRPC (torch tensors) | custom RPC (ggml) | `torch.distributed` + NCCL |
-| **Boundary payload** | **raw fp16 bytes + ints** | MLX arrays | torch objects | ggml tensors | torch tensors / NCCL bufs |
 | **Framework-neutral wire** | **✅ yes** | ❌ MLX-bound | ❌ torch-bound | ggml-bound | ❌ torch/NCCL-bound |
 | **Heterogeneous GPU vendors** | **✅ MPS + CUDA at once** | ❌ Apple only | partial | ✅ (ggml backends) | ❌ NCCL can't bridge |
-| **Mac + Windows together** | **✅** | ❌ ("Longer term") | ~ | ✅ | ❌ |
-| **Engine swappable behind an interface** | **✅ `ShardEngine` ABC** | ❌ | ❌ | n/a | ❌ |
-| **KV cache location** | per-shard, local | per-shard | per-block | per-node | per-stage |
-| **What crosses per token** | **~3 KB (hidden only)** | activations | activations | activations | activations |
+| **Data plane topology** | **✅ peer-to-peer chain** | activations | activations | activations | activations |
+| **Wire encryption + node auth** | **✅ X25519 + ChaCha20 + PSK** | ❌ | ❌ | ❌ | ❌ |
+| **Self-verifying (per-hop signed)** | **✅ Ed25519 receipts, live** | ❌ | ❌ | ❌ | ❌ |
+| **Bitwise-exact failover** | **✅ re-split + replay** | ❌ | ~ (re-route) | ❌ | ❌ |
+| **What crosses per token** | **~1.5–3 KB (hidden only)** | activations | activations | activations | activations |
 | **Correctness contract** | **bitwise parity vs 1-machine** | — | — | — | — |
 
-Read the table top-to-bottom and the thesis falls out: **everyone passes activations; only DRIFT makes the passing framework-neutral *and* proves the result is bitwise-exact.** NCCL cannot put an Apple GPU and an NVIDIA GPU in the same process group. MLX cannot leave the Apple ecosystem. DRIFT's answer is to make the wire carry *nothing but bytes* — no torch object, no MLX array, no CUDA handle — so the two worlds meet at a contract they can both implement.
+Read the table top-to-bottom and the thesis falls out: **everyone passes activations; only DRIFT makes the passing framework-neutral, encrypted, peer-to-peer, *and* provably bitwise-exact — then lets you check a node isn't lying without re-running the model.** NCCL cannot put an Apple GPU and an NVIDIA GPU in one process group. MLX cannot leave the Apple ecosystem. DRIFT's answer is a wire that carries *nothing but bytes* — no torch object, no MLX array, no CUDA handle — so the two worlds meet at a contract they can both implement, and then hardens that contract.
 
 ---
 
@@ -92,24 +94,26 @@ The name is the system:
 
 | letter | meaning |
 |---|---|
-| **D** — Decentralized | no datacenter — heterogeneous personal devices, not a hyperscaler, run the model together. *Honest status: today an orchestrator still coordinates the route and holds embed/head, so it is a single point of failure. A peer-to-peer data plane (nodes stream to each other, not through the head) and a de-privileged head are the active roadmap below — being built, not yet shipped.* |
+| **D** — Decentralized | no datacenter; the hidden state streams **peer-to-peer** node→node, the wire is encrypted + membership-authenticated, and a dropped node is recovered. An orchestrator still starts the run and the head can be made weightless — full leaderless consensus is still the vision (see [what's still the vision](#whats-shipped-vs-still-the-vision)). |
 | **R** — Routed | an orchestrator *routes* hidden state through the nodes to carry inference forward |
 | **I** — Inference | the workload is LLM inference (extensible to training) |
-| **For T** — For Tokens | the double meaning of "token": the **inference** token (the atom of machine thought) **and** the **value** token (earned by contributing, spent on inference) — DRIFT's vision is to make the unit of thought and the unit of value one |
+| **For T** — For Tokens | the double meaning of "token": the **inference** token (the atom of machine thought) **and** the **value** token (earned by contributing, spent on inference). Every hop now signs a receipt and `drift ledger` tallies contribution — the input a payout layer consumes. DRIFT's vision is to make the unit of thought and the unit of value one. |
 
-> **Scope of this repository.** The hard technical core — *does a model split across a Mac and a Windows box produce the right answer?* — ships and is proven bitwise. On top of it, the **"For Tokens"** substrate now has working v1 seeds: trustless spot-check verification, join-from-anywhere, fault tolerance, and running a model too big for any one machine (see [Beyond the split](#beyond-the-split--the-decentralization-seeds)). A full token economy and consensus are still the vision.
+> **Scope of this repository.** The hard technical core — *does a model split across a Mac and a Windows box produce the right answer?* — ships and is proven **bitwise**. On top of it, the **"For Tokens"** substrate is no longer only a diagram: a **peer-to-peer encrypted data plane**, **bitwise failover**, a **weightless head**, **signed-receipt verification on live traffic**, **gossip membership**, and a **contribution ledger** are all implemented and gated. A full token economy, on-chain settlement, and leaderless consensus remain the vision.
 
 ---
 
-## Architecture
+## The five planes
 
 <p align="center"><img src="docs/img/arch.png" alt="DRIFT architecture — orchestrator head, per-layer shards, neutral wire" width="900"></p>
 
-DRIFT separates cleanly into three planes:
+DRIFT separates cleanly into planes:
 
-- **Control plane** — the orchestrator routes through the nodes in order; no leader election. Nodes are found three ways: zero-config LAN discovery (mDNS), an explicit `--nodes host:port` list, or — for a node behind NAT / on Colab / a cloud VM — a public `bore.pub` tunnel it opens with `drift node --tunnel`.
-- **Data plane** — the only things that cross a stage boundary are `hidden_states` (floats) and `position_ids` + `input_ids` (ints). Framework-agnostic, and — crucially — **its size depends on `hidden_size`, not on the parameter count.** A 1.5 B model and a 70 B model push the same ~3 KB/token if `hidden_size` matches.
-- **KV cache plane** — each shard keeps the KV for *its own* layer range, per session, on its own device. **The cache never crosses the wire** (that would be megabytes/token and would defeat the whole design). Only the residual stream travels.
+- **Control plane** — an orchestrator assigns each node a layer range (`configure`) and drives the decode loop. Nodes are found four ways: zero-config LAN discovery (mDNS), an explicit `--nodes host:port` list, a public `bore.pub` tunnel a NAT'd node opens with `drift node --tunnel`, or **gossip** — a node `--join`s one seed and the network learns its own membership, which `drift run --expand` then splits across.
+- **Data plane** — the only things that cross a stage boundary are `hidden_states` (floats) + `position_ids` + `input_ids` (ints). Framework-agnostic, and — crucially — its size depends on `hidden_size`, not on the parameter count. **It now flows peer-to-peer** (`--chain`): head → n0 → n1 → … → tail → head, so tensor crossings/token drop from 2N to **N+1** and the head's bandwidth becomes **O(1)** in the node count instead of O(N). Optionally **int8** (`--int8`) halves the bytes.
+- **KV cache plane** — each shard keeps the KV for *its own* layer range, per session, on its own device. The cache never crosses the wire (that would be megabytes/token and defeat the design). Only the residual stream travels.
+- **Security plane** — a network shares one pre-shared key (`drift keygen`). Every connection then runs an X25519 ECDH → HKDF(mix PSK) → ChaCha20-Poly1305 channel, so the stream is confidential and a dialer without the key is dropped. `drift node --tunnel` refuses to run unkeyed (no open public compute), and the length prefix is capped (no alloc-DoS).
+- **Trust plane** — every hop signs an **Ed25519 receipt** over `(in_hash, out_hash, layer range)`. The head verifies signatures + adjacency + end-anchors on **every token** of real traffic (not a separate challenge), so wire corruption, dropped/forged hops, and a node lying about what it computed vs. sent are caught live. A dropped node is recovered **bitwise** by re-splitting over the survivors and replaying.
 
 **The split scales past two** — one node per decoder layer, up to 28 (35 on Gemma), with the head and the wire unchanged:
 
@@ -119,97 +123,104 @@ DRIFT separates cleanly into three planes:
 
 ## The wire contract (what actually crosses the boundary)
 
-The contract (`drift/protocol.py`) is **frozen**: every message is a **4-byte big-endian length prefix + a msgpack dict.** Any future runtime — MLX, ggml, JAX, a Rust node — only has to implement this framing to join the pipeline. There is no PyTorch on the wire.
+The contract (`drift/protocol.py`) is **frozen**: every message is a **4-byte big-endian length prefix + a msgpack dict** (encrypted as one ChaCha20-Poly1305 frame when a network key is set). Any future runtime — MLX, ggml, JAX, a Rust node — only has to implement this framing to join. There is no PyTorch on the wire.
 
 ```jsonc
-// request  (orchestrator → shard)
+// request  (orchestrator → shard, or shard → shard in chain mode)
 {
   "type":         "prefill" | "decode" | "reset" | "ping" | "configure",
   "session_id":   "s0",               // one generation sequence
   "seq_id":       42,                 // monotonic, for ordering / debug
   "shape":        [1, 1, 1536],       // hidden_states shape (decode: S=1)
-  "dtype":        "float16",
+  "dtype":        "float16" | "int8",  // int8 → half the wire (lossy)
+  "scale":        "<per-group fp16>",  // int8 dequant scales (absent for fp16)
   "position_ids": [37],               // absolute positions  → RoPE, computed on-shard
-  "input_ids":    [785],              // token ids → per-layer embeddings (PLE, Gemma 4)
-  "tensor":       "<raw fp16 bytes>"  // row-major hidden_states
+  "input_ids":    [785],              // token ids → per-layer embeddings (PLE) / thin-head embed
+  "tensor":       "<raw bytes>",       // row-major hidden_states
+  "route":        [["10.0.0.2", 52601]], // chain mode: the downstream nodes
+  "collect":      ["10.0.0.9", 6000]     // chain mode: the head's sink
 }
 
-// response (shard → orchestrator)
-{ "ok": true, "shape": [1,1,1536], "dtype": "float16", "tensor": "<bytes>", "error": null }
-
-// ping response  →  { "ok": true, "assigned", "name", "start_layer", "end_layer",
-//                     "device", "torch", "transformers", "endian" }
+// response (shard → next hop / head)
+{ "ok": true, "shape": [1,1,1536], "dtype": "float16", "tensor": "<bytes>",
+  "receipt": { "node": "<pubkey>", "in_hash", "out_hash", "start", "end", "sig" },
+  "token":  785 }   // thin-head tail returns a token id instead of a tensor
 ```
 
-`configure` assigns a layer range to a **fungible** node (so users never hand-write ranges); the ping's `torch` / `transformers` / `endian` let the head reject a version or byte-order mismatch before it assigns layers.
+`route` / `collect` are **additive and optional** — a node without them behaves exactly like the classic star. `configure` assigns a layer range (and thin-head edge duties) to a **fungible** node, so users never hand-write ranges.
 
-**Bytes per token.** During decode the activation is `[1, 1, hidden]` in fp16 = `hidden × 2` bytes. For Qwen's `hidden = 1536` that is **3 072 bytes ≈ 3 KB**, plus one `position_id`, one `input_id`, and a few bytes of msgpack framing. A two-shard pipeline does ~4 such crossings per token (orchestrator→A, A→orchestrator, orchestrator→B, B→orchestrator) ≈ **12 KB/token of wire traffic** — on a LAN, trivial next to the compute.
+**Bytes per token.** During decode the activation is `[1, 1, hidden]`. For Qwen's `hidden = 1536` that is **3 072 bytes** in fp16, or **1 560 bytes** in int8 (H int8 + per-group fp16 scales ≈ 0.51×). A chain does `N+1` such crossings per token; a star does `2N`. On a LAN, trivial next to the compute.
 
-**Why these three fields, and only these:**
-
-- `hidden_states` — the residual stream; the one thing a downstream layer genuinely needs.
-- `position_ids` — so each shard computes its **own** RoPE from absolute positions (see below). Sending positions instead of precomputed `cos/sin` keeps the payload tiny and the node self-sufficient.
-- `input_ids` — reserved from **M0** so **Per-Layer-Embedding** models (Gemma 4) work without ever re-freezing the contract: a downstream shard reconstructs its per-layer embedding signal locally from token ids. Plain models (Qwen) simply ignore it.
-
-**Why fp16 on the wire is safe.** Serialization is a CPU fp16 round-trip: `tensor.detach().to("cpu", float16).contiguous().numpy().tobytes()` on the way out, `np.frombuffer(buf, np.float16).reshape(shape).copy()` on the way back. If the compute dtype is already fp16, that round-trip is **bit-lossless** — which is the premise that lets the split path reproduce a single machine *exactly*, not approximately.
+**Why fp16 on the wire is safe (bitwise).** Serialization is a CPU fp16 round-trip. If the compute dtype is fp16, that round-trip is **bit-lossless** — the premise that lets the split path reproduce a single machine *exactly*, not approximately. int8 is *not* lossless and is opt-in; it runs under a relaxed gate, never the bitwise one.
 
 ---
 
 ## Three problems a correct split must solve
 
-Splitting layers across processes sounds trivial until you try to make the output *identical* to the unsplit model. Three things bite, and DRIFT handles each explicitly. These are where the real engineering is — and what a reviewer should scrutinize.
+Splitting layers across processes sounds trivial until you try to make the output *identical* to the unsplit model. Three things bite, and DRIFT handles each explicitly.
 
 ### 1 · KV cache indexing — the subtle one
 
-Hugging Face's `DynamicCache` is indexed by a layer's `layer_idx`, and it reports "past length" from **layer 0's** slot. A shard that keeps global layers `[14, 28)` and naïvely reuses their global indices leaves cache slot 0 **empty** — so during decode the causal mask is built as if there were *no past*, and parity silently breaks after the very first token.
+Hugging Face's `DynamicCache` reports "past length" from **layer 0's** slot. A shard that keeps global layers `[14, 28)` and reuses their global indices leaves cache slot 0 **empty** — so during decode the causal mask is built as if there were *no past*, and parity silently breaks after the very first token.
 
 <p align="center"><img src="docs/img/kv-reindex.png" alt="KV-cache local re-indexing — the fix that keeps decode parity" width="900"></p>
 
-DRIFT re-indexes each shard's kept layers to **local, 0-based** cache slots at load time, and sizes the per-session `DynamicCache` to the shard's local layer count. In-process, two shards can share one loaded model because they own **disjoint** layer objects — re-indexing one never touches the other.
+DRIFT re-indexes each shard's kept layers to **local, 0-based** cache slots at load time, and sizes the per-session `DynamicCache` to the shard's local layer count.
 
 ### 2 · RoPE self-computation — keep the wire tiny
 
-Rotary position embeddings depend only on `position_ids`, not on which layer consumes them. So each shard computes its own `cos/sin` from **absolute** positions via the model's own `rotary_emb` module — a shard holding layers `[14, 28)` still gets it right. The boundary therefore carries a handful of integers instead of a full `[S, head_dim]` `cos/sin` tensor, and every node stays self-sufficient.
+Rotary position embeddings depend only on `position_ids`. So each shard computes its own `cos/sin` from **absolute** positions via the model's own `rotary_emb`. The boundary carries a handful of integers instead of a full `cos/sin` tensor, and every node stays self-sufficient.
 
 ### 3 · Attention mask per stage
 
-For prefill the mask is causal-full; for decode it is KV-length-aware. DRIFT rebuilds the mask on each shard with the installed Transformers masking utilities (`create_causal_mask`, and `create_sliding_window_causal_mask` for models like Gemma that alternate local/global attention per layer). The mask is chosen **per layer** by the layer's own attention type — nothing hardcoded.
+For prefill the mask is causal-full; for decode it is KV-length-aware. DRIFT rebuilds the mask per shard with the installed Transformers masking utilities, chosen **per layer** by the layer's own attention type (Gemma alternates local/global) — nothing hardcoded.
 
 ---
 
-## The decode loop & injectable transport
+## Peer-to-peer, and a weightless head
 
-<p align="center"><img src="docs/img/decode-loop.png" alt="The decode loop over an injectable transport (in-process / TCP)" width="900"></p>
+**Chain streaming (`--chain`).** Instead of star-routing every hop back through the head, the hidden state flows node→node along the route and the tail delivers the final state to the head's collect sink. Two wins: tensor crossings/token drop from **2N to N+1**, and — the point — the head's data-plane bandwidth becomes **O(1)** in the node count, not O(N). The head stops being the hub every activation passes through.
 
-The loop routes through an **injectable transport** with a single signature — `transport(shard, session, hidden, position_ids, input_ids, mode)`. The decode loop is written **once**; only the transport is swapped:
+**Thin head (`--thin`).** The head can hold **zero model weights**: `embed_tokens` moves to the first node's duty, `norm` + `lm_head` + `argmax` to the last node's. Combined with the chain, the head sends **one integer token id** into the pipeline and gets **one integer token id** back — it does no tensor math and materializes no parameters. Parity holds because `norm`+`lm_head`+`argmax` runs on the same device with the same (tied) weights over the bitwise-identical hidden state — the argmax is invariant to whether the head or the tail computes it.
 
-| Transport | Milestone | Boundary | Purpose |
-|---|---|---|---|
-| **in-process callable** | M2 | direct `engine.forward(...)`, no socket | prove the split logic in isolation |
-| **socket client** | M3+ | the §6 protocol over TCP | prove serialization / framing |
+The decode loop is written **once** over an injectable transport; only the transport (in-process / star / chain) is swapped, so the network is the only variable between milestones and any regression is *provably* a transport bug, never a logic bug.
 
-Because the loop is identical, the **network is the only variable between M2 and M3** — so any M3 regression is *provably* a serialization bug, never a logic bug. This is the single most important structural decision in the codebase.
+<p align="center"><img src="docs/img/decode-loop.png" alt="The decode loop over an injectable transport (in-process / TCP / chain)" width="900"></p>
+
+---
+
+## Trust without trusting the nodes
+
+**Encrypted, authenticated wire (`drift keygen`).** A network shares one 32-byte pre-shared key. Keyed connections do an X25519 ECDH (ephemeral → forward secrecy) → HKDF-SHA256 with the PSK mixed in → ChaCha20-Poly1305 with a per-direction counter nonce. Mixing the PSK into the KDF is the membership check: a peer without it derives a different key and its first frame fails to decrypt. Unkeyed stays plaintext for local dev; keying is network-wide.
+
+**Signed receipts on live traffic.** Every hop signs an Ed25519 receipt over `(session, seq, mode, layer range, in_hash, out_hash)`. On **each token** the head checks signatures, adjacency (hop *i*'s `out_hash` == hop *i+1*'s `in_hash`), and end-anchors (the first hop's input matches what the head sent, the last hop's output matches what it received). A tampering node is caught on ordinary generation — no separate challenge to be honest on — and marked SUSPECT in a local reputation table. *What this catches:* wire corruption, dropped/reordered/forged hops, a node lying about what it computed vs. sent. *What it doesn't* (a node that consistently miscomputes and signs the result) is the job of the recompute audit (`drift verify`) or redundant N-of-M execution (future).
+
+<p align="center"><img src="docs/img/parity-gate.png" alt="The parity gate — strict bitwise on one device, relaxed across GPU vendors" width="900"></p>
+
+**Bitwise failover.** A node dying mid-generation no longer kills the session. The orchestrator re-splits the model across the survivors (plus any spare), re-prefills the sequence-so-far to rebuild every node's KV, and resumes. Because greedy decoding is deterministic over a fixed prefix, the resumed continuation is **bitwise-identical** to never having dropped — verified by killing a node mid-decode and checking the finished sequence against an uninterrupted reference.
+
+**Contribution ledger.** The head journals every verified receipt; `drift ledger` folds it into a per-node tally (tokens carried, layer-tokens served, sessions) with `--verify` re-checking every signature and `--csv` export. That is the settlement layer's input substrate.
 
 ---
 
 ## Correctness — the parity gate
 
-DRIFT is **correctness-first**: every networked step must reproduce the single-machine reference **bitwise** before any performance work. Speed is not the point of the demo — *heterogeneous split inference being exact* is.
-
-<p align="center"><img src="docs/img/parity-gate.png" alt="The parity gate — strict bitwise on one device, relaxed across GPU vendors" width="900"></p>
+DRIFT is **correctness-first**: every networked step must reproduce the single-machine reference **bitwise** before any performance or decentralization work. Speed is not the point — *heterogeneous split inference being exact* is, and every feature above is gated against that.
 
 **Measured results** — Qwen2.5-1.5B-Instruct, Apple MPS, fp16:
 
 | Gate | What it isolates | Result |
 |---|---|---|
-| **M0** ping | neutral protocol reachability | ✅ both shards reply |
-| **M2** in-process 2-shard | sharding · RoPE · KV · mask | ✅ **50 / 50 token ids bitwise == reference** |
-| **M3** TCP 2-process | serialization / framing | ✅ **50 / 50 bitwise == reference** |
-| **`--selftest`** (6 prompts) | overfitting to one prompt | ✅ **6 / 6 bitwise** — English · code · Korean; `n = 1, 40, 50, 60, 80, 180` |
+| **in-process** 2-shard | sharding · RoPE · KV · mask | ✅ **6 / 6 prompts bitwise** (`n = 1…180`) |
+| **TCP star** 2-process | serialization / framing | ✅ **bitwise == reference** |
+| **chain** 2 & 3 nodes | peer-to-peer relay | ✅ **bitwise == reference** |
+| **chain + encrypted** | AEAD channel transparency | ✅ **bitwise** (encryption doesn't perturb tokens) |
+| **thin head** 2 & 3 nodes | weightless head, edge embed/lm_head | ✅ **bitwise** |
+| **kill mid-decode** (chain / star, entry / middle / tail) | failover replay | ✅ **48 / 48 bitwise**, recovery triggered |
+| **tamper a node** | live receipt verification | ✅ **caught on live traffic**, honest run 0 suspects |
+| **MPS ↔ CUDA (M4)** | cross-vendor fp16 rounding | ✅ **130 / 130 tokens** match across 3 prompts |
 
-The `--selftest` is the strongest evidence: it re-derives a fresh reference and compares, across prompt *kinds* (prose, source code, Korean) and *lengths* (a single-token generation up to a 180-token decode). Every token id matches — first divergence index `None` in all six.
-
-**MPS ↔ CUDA (M4) — measured.** Running the front half on a Mac (Apple MPS) and the back half on a Colab NVIDIA T4 (CUDA), the split reproduced the single-machine reference **exactly: 130/130 tokens across 3 prompts, no divergence** — even though the two vendors' fp16 kernels (plus a torch 2.11 vs 2.12 skew) widened the first-step logit gap to ~2×10⁻² (vs ~8×10⁻³ same-device), which wasn't enough to flip an argmax here. At larger scale that gap can flip a late token; the **relaxed gate** `python -m drift.parity_test --prefix-match K` is there for that. Cross-machine throughput over a public tunnel was ~2.7 tok/s (network-bound). Divergence at token 1–2 would be a **bug**, not float noise → bisect.
+**MPS ↔ CUDA (M4).** Running the front half on a Mac (Apple MPS) and the back half on a Colab NVIDIA T4 (CUDA), the split reproduced the single machine **exactly (130/130 tokens)** — even though the two vendors' fp16 kernels widened the first-step logit gap to ~2×10⁻² (vs ~8×10⁻³ same-device), not enough to flip an argmax here. At larger scale that gap can flip a late token; the **relaxed gate** `python -m drift.parity_test --prefix-match K` is there for that.
 
 <p align="center"><img src="docs/img/m4-result.png" alt="M4 measured — Mac Apple MPS + Colab NVIDIA T4 CUDA, 130/130 token match vs one machine" width="900"></p>
 
@@ -217,105 +228,80 @@ The `--selftest` is the strongest evidence: it re-derives a fresh reference and 
 
 ## Benchmarks
 
-*Methodology, controls, and the fair competitor protocol: **[docs/benchmarks.md](docs/benchmarks.md)**. Reproduce every number with `python -m drift.bench`.*
-
-`tokens/sec` is the wrong axis to lead with: on an Apple-only cluster Exo's native MLX path wins raw throughput, and on the axis DRIFT owns — Mac(MPS)↔Windows(CUDA) — no competitor even runs ([see the table](#why-this-is-different)). So the numbers live where a *correct* split genuinely leads, all on **one** Mac — Qwen2.5-1.5B-Instruct · fp16 · Apple MPS.
+*Reproduce the single-machine numbers with `python -m drift.bench`; the integration gates with `python -m drift.itest …`.*
 
 **Fidelity — does splitting change the output?** *(split path vs the single-machine oracle, greedy)*
 
 | Metric | Result |
 |---|---|
 | token exact-match — 6 prompts, `n = 1…180` | **411 / 411 = 100.00 %** |
-| cases bitwise-identical | **6 / 6** |
 | first-step logit max-abs-diff (fp32) | 7.81 × 10⁻³ *(fp16 ULP)* |
 | KL divergence (nats) | ≤ 2.82 × 10⁻¹⁰ |
 
-Token ids are **bitwise-identical** to a single machine; the logits agree to the fp16 ULP and the argmax is invariant under that noise. No other tool in this space measures — let alone guarantees — this. *This is DRIFT's monopoly axis.*
+**Footprint — no single node holds the whole model** (heaviest node = **42 %** of the weights, measured on-device, not just compute share). Each node materializes only its slice (`init_empty_weights` + a selective safetensors read), so the whole model is never resident on any one machine.
 
-**Footprint — no single node holds the whole model**
-
-| Node | Holds | fp16 | % of full |
-|---|---|---:|---:|
-| orchestrator | embed + norm + lm_head | 0.47 GB | 15.1 % |
-| shard · mac | decoder layers [0, 14) | 1.31 GB | 42.4 % |
-| shard · windows | decoder layers [14, 28) | 1.31 GB | 42.4 % |
-| **full model** | — | **3.09 GB** | 100 % |
-
-The heaviest single node carries **42.4 %** of the model — one 2× too big for either machine alone runs across the pair. This is the reason pipeline splitting exists. **These are measured on-device allocations, not just each node's compute share:** every node materializes only its slice (`init_empty_weights` + a selective safetensors read), so the whole model is never resident on any one machine — and the parity gate proves the sliced load stays bit-for-bit identical to a single-machine load.
-
-**The neutral wire is thin, and nearly free**
+**The wire is thin, peer-to-peer, and optionally half-size**
 
 | Metric | Value |
 |---|---|
-| on the wire per token per hop | **3.10 KB** — only the fp16 hidden state |
-| weights : per-token wire | **≈ 970,000 ×** |
-| TPOT — in-process (M2) → TCP (M3) | 40.7 → 43.1 ms/token |
-| protocol overhead | **+2.45 ms/token** (~1.2 ms/hop, ~6 % of TPOT) |
+| on the wire per token per hop (fp16) | **3.10 KB** — only the hidden state |
+| on the wire per token per hop (**int8**) | **1.52 KB** — 51 % of fp16 (measured fidelity ~67 %, relaxed) |
+| tensor crossings/token — star → **chain** | 2N → **N+1** |
+| head data-plane bandwidth — star → **chain** | O(N) → **O(1)** |
+| protocol overhead (localhost, fp16 star) | ~1.2 ms/hop, dwarfed by ~41 ms/token compute |
 
-The **same decode loop** runs over both transports, so the M3 − M2 delta is the *pure* cost of the framework-neutral protocol — the thing that lets MPS and CUDA cooperate. At localhost it is a small per-hop round-trip (~1.2 ms/hop), dwarfed by the ~41 ms/token of compute; it is noisy enough at this scale to straddle zero run-to-run (an earlier run measured it slightly *negative*). (A real LAN adds RTT on top, unchanged by DRIFT.)
-
-> Absolute, reproducible numbers — not a cherry-picked win. A head-to-head `tok/s` against Exo / llama.cpp RPC needs them installed on the same box; the honest protocol for that is in **[docs/benchmarks.md](docs/benchmarks.md)**. Today's comparative claim is the capability matrix above **plus** a distributed output that is *provably* identical to one machine.
+> Absolute, reproducible numbers — not a cherry-picked win. On an Apple-only cluster Exo's native MLX path wins raw throughput; DRIFT's axis is *heterogeneous, exact, and verifiable* — where no competitor even runs.
 
 ---
 
 ## Model-agnostic by introspection
 
-The engine never hardcodes a model architecture. At load it **introspects** the loaded model and adapts:
+The engine never hardcodes a model architecture. At load it **introspects** the loaded model and adapts — the loaded model is the source of truth, not a fixed class. Two very different families drop into the *same* engine:
 
-```python
-# drift/engine_torch.py — the loaded model is the source of truth, not a fixed class
-layer_cls   = type(self.layers[0])                       # Qwen2DecoderLayer / Gemma4DecoderLayer / …
-self._layer_params = set(inspect.signature(layer_cls.forward).parameters)
-self.rotary       = self.inner.rotary_emb                # self-computed RoPE, any model
-self.has_sliding  = getattr(self.inner, "has_sliding_layers", False)
-self.layer_types  = [cfg.layer_types[i] for i in range(start, end)]   # per-layer attention type
-# … at call time, pass only the kwargs this version's layer actually accepts:
-call_kwargs = {k: v for k, v in call_kwargs.items() if k in self._layer_params}
-```
+| Model | Layers → split | Quirks DRIFT handles (introspected, never hardcoded) |
+|---|---|---|
+| **Qwen/Qwen2.5-1.5B-Instruct** *(primary)* | 28 → `0–14 / 14–28` | plain decoder, single RoPE θ, `DynamicCache`, tied `lm_head` — the correctness baseline |
+| **google/gemma-4-E2B-it** *(secondary)* | 35 → `0–18 / 18–35` | **Per-Layer Embeddings** · sqrt(hidden) embed scaling · **dual RoPE θ** · **hybrid** sliding/global attention · `HybridCache` + KV-sharing groups; needs `transformers ≥ 5.5` |
 
-That is why two very different families drop into the *same* engine:
-
-| Model | Layers → split | Gated | Architectural quirks DRIFT handles (introspected, never hardcoded) |
-|---|---|---|---|
-| **Qwen/Qwen2.5-1.5B-Instruct** *(primary)* | 28 → `0–14 / 14–28` | no | plain decoder, single RoPE θ, `DynamicCache`, tied `lm_head` — the correctness baseline |
-| **google/gemma-4-E2B-it** *(secondary)* | 35 → `0–18 / 18–35` | no (Apache-2.0) | **Per-Layer Embeddings** (shard self-computes from `input_ids`) · sqrt(hidden) embed scaling (orchestrator) · **dual RoPE θ** local/global · **hybrid** per-layer sliding/global attention · `HybridCache` + KV-sharing groups · no final-logit softcap; needs `transformers ≥ 5.5` |
-
-Each Gemma 4 quirk maps cleanly onto a plane — **orchestrator** (embed scaling), **shard** (dual-θ RoPE, hybrid mask, hybrid cache), or the **wire** (`input_ids` for PLE) — and every one is discovered from `config`/signature at load, so the code that runs Qwen runs Gemma 4 unchanged. That is the model-agnostic payoff of the same principle the neutral wire embodies: *depend on what you can observe, hardcode nothing.*
+Every quirk maps cleanly onto a plane and is discovered from `config`/signature at load, so the code that runs Qwen runs Gemma unchanged: *depend on what you can observe, hardcode nothing.*
 
 ---
 
 ## Design rationale (why-not)
 
-The interesting decisions are the ones DRIFT declined. Each is a deliberate, hard constraint.
-
-- **Why not `torch.distributed` / NCCL / gloo across nodes?** NCCL cannot place an Apple Metal device and an NVIDIA CUDA device in one process group — full stop. And any of these couples the *data plane* to a specific backend, which is exactly what DRIFT refuses. The wire is neutral bytes so the runtimes need agree on nothing but framing.
-- **Why not ship the KV cache between nodes?** KV is megabytes per token and grows with sequence length; sending it would dwarf the ~3 KB residual and destroy the economics. Each shard keeps its own KV locally; only the residual stream travels.
-- **Why fp16 on the wire (not fp32)?** With fp16 compute, the CPU fp16 round-trip is bit-lossless, so serialization can't perturb parity — while halving wire bytes vs fp32. (fp16 compute lives on the GPU where it's fast; CPU fp16 kernels are unreliable, which is why the parity baseline runs on MPS, not CPU.)
-- **Why prove correctness before speed?** Getting *heterogeneous split inference exact* is the hard part, so it comes first. Concurrency sits on top: the shard server serves a thread per session, overlapping one session's network round-trip with the next's compute. Batching within a generation and speculative decoding are future work.
-- **Why not keep the whole model on every node?** Each node materializes **only its slice** — `init_empty_weights` builds the skeleton on the meta device, then only the tensors that node actually runs (its decoder layers, or the head's `embed`/`norm`/`lm_head`) are read from the safetensors and placed on the device. The heaviest node holds **42 % of the weights in real memory**, and the parity gate proves the sliced load is bitwise-identical to a single-machine load.
-- **Why freeze the wire contract at M0?** So node internals can change forever without a flag day. The `input_ids` field was added *before* freezing precisely so PLE models (Gemma 4) never force a breaking change.
+- **Why not `torch.distributed` / NCCL across nodes?** NCCL cannot place an Apple Metal device and an NVIDIA CUDA device in one process group — full stop. And it couples the data plane to a backend, which is exactly what DRIFT refuses.
+- **Why peer-to-peer chain, not a star?** The star makes the head an O(N) bandwidth hub — a single point every activation passes through. The chain drops it to O(1) and is the prerequisite for a de-privileged head.
+- **Why sign a receipt on every hop instead of a spot-check?** A fixed challenge is escaped by a node honest only on the challenge. Binding verification to the real traffic means there is nothing to be selectively honest on.
+- **Why re-prefill on failover instead of replicating KV?** Replication is bandwidth the design refuses; re-prefill is O(sequence) once and — because greedy is deterministic — bitwise-exact. Correct and cheap beats seamless and heavy for a v1.
+- **Why group-wise int8, not per-tensor?** The residual stream has outlier channels; one scale per tensor crushes everything else (measured: 0% match). A scale per 128-dim block keeps fidelity usable while still ~halving the wire.
+- **Why freeze the wire at M0?** So node internals change forever without a flag day. `route` / `collect` / `scale` were all added as *optional* fields — never a breaking change.
 
 ---
 
 ## Milestones
 
-| # | Milestone | Needs | Status |
-|---|---|---|---|
-| **M0** | env + neutral protocol framing (ping) | Mac | ✅ done |
-| **M1** | single-machine reference oracle | Mac | ✅ done |
-| **M2** | in-process 2-shard parity (no network) | Mac | ✅ **bitwise** |
-| **M3** | localhost 2-process parity (TCP) | Mac | ✅ **bitwise** |
-| **M4** | cross-machine — Mac MPS + NVIDIA CUDA | Mac + CUDA (Colab ok) | ✅ **measured** — 100% token match, ~2.7 tok/s |
-| **M5** | booth display + interactive streaming | + Windows | ⬜ |
-| **M6** | graceful kill-node recovery | done | ✅ clean `NodeUnavailable` + reconnect |
+| # | Milestone | Status |
+|---|---|---|
+| **M0–M3** | env · reference oracle · in-process + TCP 2-shard parity | ✅ **bitwise** |
+| **M4** | cross-machine — Mac MPS + NVIDIA CUDA | ✅ **measured** — 130/130 tokens |
+| **M6** | graceful kill-node detection | ✅ clean `NodeUnavailable` |
+| **M7** | peer-to-peer chain data plane | ✅ **bitwise** · 2N→N+1 crossings, O(1) head |
+| **M8** | encrypted + authenticated wire (PSK + X25519 + ChaCha20) | ✅ **bitwise** · tamper-tunnel closed |
+| **M9** | bitwise failover — re-split + replay | ✅ **48/48 bitwise** after a mid-run kill |
+| **M10** | thin head — zero-weight orchestrator | ✅ **bitwise** |
+| **M11** | signed-receipt verification on live traffic | ✅ tamper **caught live**, honest run clean |
+| **M12** | gossip membership + dynamic join | ✅ seed learns all, head expands + splits |
+| **M13** | contribution ledger (`drift ledger`) | ✅ tally reconciles, forged line rejected |
+| **M14** | WAN performance — group-wise int8 wire | ✅ **½ the wire**, ~67% measured fidelity |
+| **M15** | docs overhaul — this README | ✅ |
 
-The Mac-only track (M0–M3) carries **100 % of the correctness risk** and is done and reviewed; M4 (cross-vendor) and M6 (kill-node) are measured and working, leaving M5's booth display as the one piece not yet built.
+Everything above is exercised by `drift itest` (spawns real local nodes and gates the split against the in-process reference). Speculative decoding, leaderless consensus, and a token economy are the vision, not shipped — see below.
 
 ---
 
 ## Quickstart
 
-Requires Python **3.12** and [`uv`](https://github.com/astral-sh/uv). Both default models are **ungated** — no Hugging Face login. Everything below is the real `drift` CLI.
+Requires Python **3.12** and [`uv`](https://github.com/astral-sh/uv). Both default models are **ungated** — no Hugging Face login.
 
 **1 · Install** — on each machine:
 
@@ -328,37 +314,47 @@ drift doctor                     # checks Python, torch, device, config, ports
 **2 · Try it on one machine:**
 
 ```bash
-drift up 2                       # 2 local nodes, auto-split the model, open a chat
-                                 # (add --prompt "…" for a one-shot answer)
+drift up 2                       # 2 local nodes, auto-split, open a chat
+drift up 3 --chain               # peer-to-peer: nodes stream to each other
+drift up 2 --thin                # weightless head (embed + lm_head on the nodes)
+drift up 2 --int8                # half-size wire (lossy, opt-in)
 ```
 
-**3 · Run one model across your Mac + a CUDA PC** — the real thing.
-
-The **head** types the prompt and holds `embed`/`lm_head`; the decoder layers live on the **nodes**. To use *both* GPUs, the Mac runs a node **and** the head; the PC runs a node:
+**3 · Run one model across your Mac + a CUDA PC** — the real thing:
 
 ```bash
-# Windows PC (NVIDIA)          — one terminal
+# Windows/Linux PC (NVIDIA)     — one terminal
 drift node --port 52601        # device = cuda, announced on the LAN
 
 # Mac (Apple)                  — terminal 1: a worker
 drift node --port 52600        # device = mps
 
 # Mac                          — terminal 2: the head (type the prompt)
-drift run --prompt "hello world"
+drift run --chain --prompt "hello world"
 ```
 
-```text
-  node : 127.0.0.1:52600     layers [0:14)   · device=mps      ← the Mac computes these
-  node : 192.168.0.22:52601  layers [14:28)  · device=cuda     ← the PC computes these
+**Encrypt the wire** (share one key across machines):
 
-  Hello! How can I help you today?
+```bash
+drift keygen                     # prints DRIFT_NETWORK_KEY=<hex>
+export DRIFT_NETWORK_KEY=<hex>   # on every machine — the wire is now encrypted + authenticated
 ```
 
-Two Macs or two Windows PCs run with the **same three commands** — devices auto-detect, `drift run` finds and splits. If Wi-Fi blocks mDNS, name the nodes: `drift run --nodes 192.168.0.22:52601,127.0.0.1:52600 --prompt "hello world"`. Across GPU vendors (MPS↔CUDA) fp16 rounds a little differently, so long answers may drift in later tokens — expected, not a bug.
+**Join from anywhere** — a NAT'd node opens a tunnel and gossips into the network:
 
-**Across the internet** — a node on another network runs `drift node --tunnel`, which prints a public `bore.pub:PORT`; the head just points at it: `drift run --nodes bore.pub:PORT --prompt "hello world"`. No VPN, no port-forwarding.
+```bash
+drift node --tunnel --join bore.pub:PORT      # needs a network key (no open compute)
+drift run --expand --nodes bore.pub:PORT      # discover the whole membership, split across it
+```
 
-**Customize & fine-tune** — models, split points, devices, driving the shards by hand, and troubleshooting — is all in the **operations manual → [docs/manual.md](docs/manual.md)** ([한국어](docs/manual.ko.md) · [中文](docs/manual.zh.md) · [日本語](docs/manual.ja.md)).
+**Who computed what:**
+
+```bash
+export DRIFT_JOURNAL=~/drift.jsonl && drift run --chain --prompt "…"
+drift ledger ~/drift.jsonl --verify           # per-node contribution, signatures re-checked
+```
+
+**Customize & fine-tune** — models, split points, devices, troubleshooting — is all in the **operations manual → [docs/manual.md](docs/manual.md)** ([한국어](docs/manual.ko.md) · [中文](docs/manual.zh.md) · [日本語](docs/manual.ja.md)).
 
 ---
 
@@ -366,65 +362,58 @@ Two Macs or two Windows PCs run with the **same three commands** — devices aut
 
 ```text
 drift/
-  protocol.py       # THE CONTRACT — 4B length prefix + msgpack; fp16 tensor ser/deser
-  engine_base.py    # ShardEngine ABC — the swappable-runtime seam
+  protocol.py       # THE CONTRACT — 4B length prefix + msgpack; fp16/int8 tensor ser/deser
+  crypto.py         # network key + node identity; X25519+ChaCha20 channel; keygen
   engine_torch.py   # PyTorch shard: introspected layer calls, local KV re-index, self-RoPE  ← the crux
   loader.py         # sliced weights — init_empty_weights + only the shards a node runs
-  shard_server.py   # concurrent TCP server: ping / configure / reset / prefill / decode
-  orchestrator.py   # embed + norm + lm_head + sampler; injectable transport; decode loop
-  run.py, node.py   # `drift run` head + `drift node` worker (auto-split, discovery, --tunnel)
-  discovery.py      # zero-config LAN discovery (mDNS)
-  tunnel.py         # public bore.pub tunnel — a node behind NAT joins from anywhere
-  verify.py         # trustless spot-check — challenge a node, flag dishonest output
-  reference.py      # M1 single-machine oracle
-  parity_test.py    # M2/M3 gate + multi-prompt --selftest
+  shard_server.py   # concurrent TCP server: ping / configure / prefill / decode / relay / gossip
+  orchestrator.py   # head + injectable transport (in-process / star / chain) + decode loop + verifier
+  run.py, node.py   # `drift run` head + `drift node` worker (auto-split, discovery, tunnel, --join)
+  receipts.py       # signed per-hop receipts + live verifier + journal (the ledger source)
+  membership.py     # gossip peer table — signed entries, anti-entropy, --expand
+  ledger.py         # `drift ledger` — per-node contribution from the receipt journal
+  verify.py         # trustless spot-check (recompute audit — complements the live receipts)
+  parity_test.py    # in-process / TCP bitwise gate + multi-prompt --selftest
+  itest.py          # integration gate over REAL nodes: chain / secure / thin / kill / tamper / expand / ledger / int8
   bench.py, bench_m4.py   # single-machine + cross-machine (M4) benchmarks
-  common.py         # config + identical tokenization (shared by oracle and split path)
 config.yaml         # model, dtype, port, shard table
-docs/               # public docs — benchmarks.md · manual.md
 ```
 
-**Reviewer's shortlist:** `engine_torch.py` (the KV re-index + introspection), `protocol.py` (the frozen wire), `orchestrator.py` (the injectable transport + decode loop).
+**Reviewer's shortlist:** `engine_torch.py` (KV re-index + introspection), `protocol.py` (the frozen wire), `orchestrator.py` (injectable transport + chain + verifier), `receipts.py` (the trust layer).
 
 ---
 
 ## FAQ
 
-**Is this just pipeline parallelism?** The *idea* is, but the contribution is the **boundary**: PP in vLLM/Megatron is welded to `torch.distributed`+NCCL and can't bridge MPS↔CUDA. DRIFT's boundary is neutral bytes, so heterogeneous vendors join — and it's proven bitwise-exact.
+**Is this just pipeline parallelism?** The *idea* is, but the contribution is the **boundary**: PP in vLLM/Megatron is welded to `torch.distributed`+NCCL and can't bridge MPS↔CUDA. DRIFT's boundary is neutral, encrypted bytes flowing peer-to-peer — proven bitwise-exact and self-verifying.
 
-**Does the network see my tokens?** Be clear-eyed: `input_ids` are integer token ids, but that is a *reversible* encoding — anyone with the (public) tokenizer turns them straight back into your text, and a downstream shard genuinely needs them for Per-Layer-Embedding models. So **a node operator can read your prompt today.** No KV and no raw strings cross the wire, but "the network can't see my text" would be false. Wire encryption (only nodes you share a key with can read the stream) is on the roadmap below. What you *can* already do is check a node isn't lying about its compute: `python -m drift.verify` challenges a node with a fixed input and flags any output outside the honest envelope — an honest node matches bitwise, a tampered one is caught.
+**Does the network see my tokens?** Be clear-eyed: `input_ids` are integer token ids, but that is a *reversible* encoding — anyone with the (public) tokenizer turns them back into your text, and a downstream shard needs them. So **a node operator can read your prompt** unless you encrypt the wire. `drift keygen` + `DRIFT_NETWORK_KEY` makes the stream confidential to nodes that share the key; without it, DRIFT is plaintext (fine for a LAN you own). And you can check a node isn't lying about its compute — every hop signs a receipt the head verifies live, and `drift verify` recompute-audits a node you don't own.
 
-**Can I add a third node?** Yes — the split is a list of layer ranges in `config.yaml`; add a shard entry and the orchestrator routes through it in order. The wire contract doesn't change.
+**What happens if a node dies mid-generation?** The session survives: DRIFT re-splits over the survivors (plus any spare), replays the sequence-so-far, and continues — bitwise-identical to never having dropped. No seamless (zero-replay) failover yet; that needs replication.
 
-**Why is the reference on MPS, not CPU?** Because the compute dtype is fp16 and CPU fp16 kernels in PyTorch are unreliable; MPS runs fp16 correctly and deterministically, so M1–M3 are all on MPS and match bitwise. CPU/CUDA are configurable.
+**Can I add a third node?** Yes — `drift up 3`, or `drift run --expand` to gossip-discover every member and split across all of them. The wire contract doesn't change.
 
-**What about throughput?** The shard server handles concurrent sessions — a thread each — so multiple generations overlap the network round-trips. Batching within a single generation and speculative decoding are future work.
-
-**Why Qwen and Gemma 4 specifically?** Both are ungated (no license wall) and cover two ends of the architecture space — a plain decoder and one with Per-Layer Embeddings + hybrid attention — which stress-tests the "introspect, don't hardcode" engine.
+**Why is the reference on MPS, not CPU?** The compute dtype is fp16 and CPU fp16 kernels in PyTorch are unreliable; MPS runs fp16 correctly and deterministically, so the parity baseline is on MPS. CPU/CUDA are configurable.
 
 ---
 
-## Beyond the split — the decentralization seeds
+## What's shipped vs. still the vision
 
-The hard core (a correct, bitwise-verified heterogeneous split) is done. On top of it, the pieces a *decentralized* network needs now have working v1 seeds:
+The hard core — a correct, **bitwise-verified** heterogeneous split — is done. The decentralization layer on top is **implemented and gated**, not a diagram:
 
-| capability | what it does | try it |
+| capability | shipped | milestone |
 |---|---|---|
-| **Run a model too big for one machine** | each node downloads and loads **only the shards holding its own layers** — its slice on disk *and* in VRAM | split across enough nodes |
-| **Join from anywhere** | `drift node --tunnel` exposes a node behind NAT / on Colab / on a VM at a public `bore.pub:PORT` — no account, no token | `drift node --tunnel` |
-| **Tolerate a dropped node** | a mid-run drop is detected and retried once, else surfaced as a clean `NodeUnavailable` — not a raw traceback | kill a node mid-decode |
-| **Trust a node you don't own** | the head challenges a node with a fixed input and flags any output outside the M4-measured honest envelope (honest → bitwise; tampered → caught) | `python -m drift.verify --nodes …` |
+| Run a model too big for one machine (per-shard load) | ✅ | v0.10–0.16 |
+| Peer-to-peer data plane (no head hub) | ✅ | M7 |
+| Encrypted + authenticated wire | ✅ | M8 |
+| Bitwise failover on a dropped node | ✅ | M9 |
+| Weightless head | ✅ | M10 |
+| Self-verifying — signed receipts on live traffic | ✅ | M11 |
+| Gossip membership + join-from-anywhere | ✅ | M12 |
+| Contribution ledger | ✅ | M13 |
+| Half-size int8 wire | ✅ | M14 |
 
-Seeds, not the finished economy: verification is a spot-check (not consensus/crypto), the tunnel is a relay (not a DHT), kill-node detects but does not replicate. But *run-what-no-machine-can · reach-any-node · tolerate-drops · trust-a-stranger* is no longer only a diagram.
-
----
-
-## Roadmap
-
-- **M4 — cross-machine (done).** Measured on a Mac (Apple MPS) + a Colab NVIDIA T4 (CUDA): the split reproduced the single machine **exactly** (130/130 tokens, 3 prompts) at ~2.7 tok/s over a public tunnel, and the version / byte-order check flagged the torch skew. Reproduce with `scripts/colab_node.py --bore` + `python -m drift.bench_m4`.
-- **M5 — booth display.** Each node shows its live layer range + device; the orchestrator streams tokens as *"front half thought by Apple GPU, back half by NVIDIA."*
-- **M6 — graceful kill-node (done).** A dropped node mid-decode is detected, retried once, and surfaced as a clean `NodeUnavailable` naming the node — no seamless failover yet (that needs replication).
-- **v2 — engine swap.** An `engine_mlx.py` behind the same `ShardEngine` interface — the wire stays frozen; only the node internals change. This is where the framework-neutral thesis pays off: an MLX shard and a CUDA shard, one model.
+**Still the vision** (honestly): leaderless **consensus** (an orchestrator still starts each run), **Sybil resistance** (gossip entries are self-asserted; no admission control), a **token economy** with pricing / payout / on-chain settlement (the ledger is the input, not the settlement), **seamless failover** (replication, so no replay), **speculative decoding** (needs per-shard KV rollback), and **N-of-M redundant execution** (to catch a consistently-miscomputing node, which live receipts alone can't). These are the roadmap — the difference between *"a P2P, encrypted, self-verifying, fault-tolerant heterogeneous inference network, every step provably identical to one machine"* (true today) and *"a finished decentralized token economy"* (not yet).
 
 ---
 
@@ -439,4 +428,4 @@ Seeds, not the finished economy: verification is a spot-check (not consensus/cry
   <a href="mailto:ptw151125@kaist.ac.kr"><img src="https://img.shields.io/badge/-Email-D14836?style=for-the-badge&logo=gmail&logoColor=white&cacheSeconds=3600" alt="Email"></a>
 </p>
 
-<p align="center"><sub>No datacenter. No torch.distributed. Your machine and someone else's, running one mind — and it adds up, bit for bit.</sub></p>
+<p align="center"><sub>No datacenter. No torch.distributed. Your machine and someone else's, running one mind — peer-to-peer, encrypted, and signed for, bit for bit.</sub></p>

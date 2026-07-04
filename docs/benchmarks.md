@@ -165,6 +165,25 @@ competitor installed on the same box).
 
 ---
 
+## Topology & wire (v1.0)
+
+The v1 decentralization layer changes the *shape* of the traffic, not the fidelity. Measured on
+Qwen2.5-1.5B (`hidden = 1536`), per token per hop:
+
+| Axis | Star (default) | Chain (`--chain`) |
+|---|---:|---:|
+| tensor crossings / token | `2N` | `N + 1` |
+| head data-plane bandwidth | `O(N)` | `O(1)` |
+| fp16 bytes / hop | 3 072 | 3 072 |
+| **int8** bytes / hop (`--int8`) | — | **1 560 (51 %)** |
+
+int8 is lossy (group-wise, 128-dim blocks): measured token match-rate vs the fp16 reference was
+~67 % across two prompts (one 100 %, one drifting at token 11) — it runs under the *relaxed* gate,
+never the bitwise one. The fp16 chain and thin-head paths remain **bitwise == the single machine**.
+Reproduce the topology/wire gates with `python -m drift.itest --nodes N [--chain|--thin|--int8]`.
+
+---
+
 ## Reproduce
 
 ```bash
@@ -172,6 +191,10 @@ python -m drift.bench                 # full run (fidelity, footprint, wire, ove
 python -m drift.bench --quick         # drop the n=180 fidelity case
 python -m drift.bench --no-socket     # skip the TCP overhead (no server spawn) on low RAM
 python -m drift.bench --json out.json # also dump raw results
+
+python -m drift.itest --nodes 2 --chain          # real-node bitwise gate (peer-to-peer)
+python -m drift.itest --nodes 2 --int8           # measured int8 wire savings + fidelity
+python -m drift.itest --nodes 2 --kill 1 --chain # bitwise failover after a mid-run kill
 ```
 
 Footprint, wire, and fidelity are deterministic and machine-independent. Overhead / TPOT depend

@@ -27,6 +27,7 @@ For benchmark methodology and numbers, see [`benchmarks.md`](benchmarks.md).
 11. [The wire & sessions](#11--the-wire--sessions)
 12. [Memory](#12--memory)
 13. [Troubleshooting](#13--troubleshooting)
+14. [Decentralization — chain, encryption, failover, gossip, ledger, int8](#14--decentralization-v10)
 
 ---
 
@@ -272,18 +273,24 @@ Every command takes `--config` (default `config.yaml`).
 | `drift up N` | localhost: spawn N nodes, auto-split, chat (or `--prompt` for one-shot) |
 | `drift node` | run THIS machine as a worker: auto device, `--port`, LAN-announced, waits for the head |
 | `drift run` | the head: discover nodes (or `--nodes host:port,…`), auto-split, configure, stream/chat |
+| `drift keygen` | create/print the network key + node identity (§14) |
+| `drift ledger` | per-node contribution from a receipt journal — `--verify` · `--csv` (§14) |
 
-`up`, `node`, `run` take `--max-new-tokens`; `run` also takes `--model`, `--nodes`,
-`--no-discover`. Omit `--prompt` on `run`/`up` for an interactive chat.
+`up`, `node`, `run` take `--max-new-tokens`; `run`/`up` also take `--chain`, `--thin`,
+`--int8` (§14); `run` also takes `--model`, `--nodes`, `--no-discover`, `--expand`;
+`node` takes `--tunnel`, `--join`, `--no-advertise`. Omit `--prompt` for a chat.
 
 ### Lower-level modules
 
 | Module | Key flags |
 |---|---|
-| `python -m drift.shard_server` | `--name --start --end --device --host --port --preload` (+ `DRIFT_PORT`) |
+| `python -m drift.shard_server` | `--name --start --end --device --host --port --preload --tamper` (+ `DRIFT_PORT`) |
 | `python -m drift.orchestrator` | `--ping` · `--prompt` · `--max-new-tokens` · `--ports` |
 | `python -m drift.reference` | `--device --out` — single-machine oracle |
-| `python -m drift.parity_test` | `--mode inprocess\|socket` · `--ports` · `--selftest` |
+| `python -m drift.parity_test` | `--mode inprocess\|socket` · `--ports` · `--selftest` · `--prefix-match K` |
+| `python -m drift.itest` | real-node gate: `--nodes N` · `--chain --secure --thin --int8` · `--kill K --tamper K --expand N --ledger` |
+| `python -m drift.verify` | trustless recompute spot-check: `--nodes host:port,… --tol` |
+| `python -m drift.ledger` | `<journal.jsonl> --verify --csv` |
 | `python -m drift.bench` | `--quick --no-socket --json` (see [`benchmarks.md`](benchmarks.md)) |
 
 ---
@@ -291,11 +298,13 @@ Every command takes `--config` (default `config.yaml`).
 ## 11 · The wire & sessions
 
 - **Contract (`drift/protocol.py`, frozen):** every message is a 4-byte big-endian length
-  prefix + a msgpack dict. Any runtime that implements this framing can be a node — no PyTorch
-  on the wire. Message types: `ping` / `configure` / `prefill` / `decode` / `reset`.
-- **What crosses:** only `hidden_states` (fp16) + `position_ids` + `input_ids`. The **KV cache
-  never crosses** — each node keeps its own. Per-token traffic is `hidden_size × 2` bytes plus a
-  few ints (a couple of KB), independent of parameter count.
+  prefix + a msgpack dict (one ChaCha20-Poly1305 frame when a key is set). Any runtime that
+  implements this framing can be a node — no PyTorch on the wire. Message types: `ping` /
+  `configure` / `prefill` / `decode` / `reset` / `peers_get` / `peer_announce`.
+- **What crosses:** only `hidden_states` (fp16, or int8 with `--int8`) + `position_ids` +
+  `input_ids`. In chain mode two optional fields (`route`, `collect`) carry the downstream path;
+  each hop attaches a signed `receipt`. The **KV cache never crosses** — each node keeps its own.
+  Per-token traffic is `hidden_size × 2` bytes (fp16) or ≈`hidden_size × 1` (int8) plus a few ints.
 - **Fungible nodes.** A `drift node` starts unassigned; the head sends a `configure` (model +
   layer range) so you never hand-write ranges. Pre-assigned servers (§9) skip it.
 - **Sessions.** A generation is a `session_id`; each node holds a per-session KV cache and the
@@ -326,8 +335,83 @@ node, or split across **more** nodes to shrink each node's active share.
 | Output drifts only in **late** tokens (MPS↔CUDA) | Expected vendor fp16 rounding (§3, §7). Not a bug. |
 | Parity **FAIL at token 1–2** | A real bug (mask/KV/RoPE), not float noise. |
 | Out of memory on load | Each process loads the full checkpoint (§12). Use a smaller model, more nodes, or `--no-socket` for the bench. |
-| `unsupported wire dtype` | `dtype` must be `float16` or `float32` (§7). |
+| `unsupported wire dtype` | compute `dtype` must be `float16` or `float32` (§7); `int8` is a *wire* option (`--int8`, §14), not a compute dtype. |
+| `refusing --tunnel without a network key` | a public endpoint would be open compute — run `drift keygen` and `export DRIFT_NETWORK_KEY` first (§14). |
+| A node flagged SUSPECT | the receipt verifier caught a mismatch (§14) — check that node's version/health; a genuine tamper is real. |
 | Rare MPS op error on Mac | Ensure `export PYTORCH_ENABLE_MPS_FALLBACK=1` in the shell that launched the process. |
+
+---
+
+## 14 · Decentralization (v1.0)
+
+The split core is unchanged; these are opt-in layers on top. Every one is gated
+bitwise (or, for int8, under the relaxed gate) — see `python -m drift.itest`.
+
+### Peer-to-peer chain — `--chain`
+By default every hop round-trips through the head (star). `--chain` streams the
+hidden state node→node→…→tail→head instead: tensor crossings/token drop from `2N`
+to `N+1`, and the head's bandwidth becomes O(1) in the node count.
+```bash
+drift up 3 --chain
+drift run --chain --nodes a:52600,b:52601,c:52602 --prompt "…"
+```
+
+### Weightless head — `--thin` (implies `--chain`)
+`embed_tokens` moves to the first node, `norm`+`lm_head`+`argmax` to the last. The
+head holds only the tokenizer and exchanges token ids, no tensor.
+```bash
+drift up 2 --thin
+```
+
+### Encrypted + authenticated wire — `drift keygen`
+A network shares one pre-shared key. Every connection then runs X25519 ECDH →
+HKDF(mix PSK) → ChaCha20-Poly1305; a dialer without the key is dropped.
+```bash
+drift keygen                       # writes ~/.config/drift/network.key + identity; prints the key
+export DRIFT_NETWORK_KEY=<hex>     # on EVERY machine (head + nodes) — now encrypted
+drift keygen --print               # re-print the key to share
+```
+Unkeyed = plaintext (fine for a LAN you own). `drift node --tunnel` **refuses** to
+run without a key (a public endpoint must not be open compute).
+
+### Join from anywhere — `drift node --join` / `drift run --expand`
+A node gossip-joins a network via one seed; the head discovers the whole
+membership and splits across it.
+```bash
+drift node --join seed-host:52600            # learn the members
+drift run --expand --nodes seed-host:52600   # split across all discovered members
+```
+
+### Failover
+If a node dies mid-generation, the head re-splits over the survivors (+ any
+spare), replays the sequence-so-far, and continues — bitwise-identical to an
+uninterrupted run. Nothing to configure; it just recovers (or surfaces a clean
+`NodeUnavailable` if nothing survives).
+
+### Verification & the contribution ledger
+Every hop signs an Ed25519 receipt; the head verifies them on live traffic. Set a
+journal to record them, then tally:
+```bash
+export DRIFT_JOURNAL=~/drift.jsonl && drift run --chain --prompt "…"
+drift ledger ~/drift.jsonl --verify --csv out.csv
+```
+`drift verify --nodes host:port,…` is the recompute spot-check (a node you don't own).
+
+### Half-size wire — `--int8`
+Send the hidden state as group-wise int8 (≈0.51× the bytes). Lossy — runs under
+the relaxed gate, never bitwise. Measure with `drift itest --int8`.
+```bash
+drift run --chain --int8 --prompt "…"
+```
+
+### Env vars
+| Var | Effect |
+|---|---|
+| `DRIFT_NETWORK_KEY` | hex/base64 PSK — encrypts + authenticates the wire |
+| `DRIFT_NETWORK_KEY_FILE` | path to a key file (default `~/.config/drift/network.key`) |
+| `DRIFT_IDENTITY_FILE` | this node's Ed25519 identity (default `~/.config/drift/identity.key`) |
+| `DRIFT_ADVERTISE_HOST` | address peers use to reach this node (default: LAN ip) |
+| `DRIFT_JOURNAL` | path to append verified receipts for `drift ledger` |
 
 ---
 
