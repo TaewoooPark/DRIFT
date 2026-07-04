@@ -101,3 +101,56 @@ def bytes_to_tensor(b: bytes, shape, dtype: str, device: str):
     arr = np.frombuffer(b, dtype=np_dtype).reshape(tuple(shape)).copy()
     torch_dtype = {"float16": torch.float16, "float32": torch.float32}[dtype]
     return torch.from_numpy(arr).to(device=device, dtype=torch_dtype)
+
+
+# ------------------------------------------------ int8 wire quantization (M14)
+# Halve the wire bytes on a network-bound link: send the hidden state as int8.
+# A SINGLE per-tensor scale is fatal here — the residual stream has a few outlier
+# channels whose magnitude dominates the scale and crushes every other dim to
+# ~0 (this is exactly why LLM activation quantization is hard). So we quantize
+# GROUP-WISE: an independent int8 scale per block of `_INT8_GROUP` hidden dims,
+# so an outlier only rescales its own block. Bytes: H int8 + (H/group) fp16
+# scales ≈ 0.51× fp16. Still lossy → the relaxed gate, never the bitwise one.
+_INT8_GROUP = 128
+
+
+def tensor_to_wire(t, wire_dtype: str):
+    """Serialize a tensor for the wire. Returns (bytes, scale). scale is None for
+    fp16/fp32; for int8 it is the fp16 bytes of the per-group scales."""
+    if wire_dtype != "int8":
+        return tensor_to_bytes(t, wire_dtype), None
+    import torch
+
+    x = t.detach().to("cpu", torch.float32).numpy()
+    H = x.shape[-1]
+    G = _INT8_GROUP
+    pad = (-H) % G
+    flat = x.reshape(-1, H)
+    if pad:
+        flat = np.pad(flat, ((0, 0), (0, pad)))
+    ng = flat.shape[1] // G
+    blocks = flat.reshape(-1, ng, G)
+    scale = np.abs(blocks).max(axis=2, keepdims=True)
+    scale[scale == 0.0] = 1.0
+    q = np.round(blocks / scale * 127.0).clip(-127, 127).astype(np.int8)
+    scale_bytes = scale.reshape(-1, ng).astype(np.float16).tobytes()
+    return q.tobytes(), scale_bytes
+
+
+def wire_to_tensor(b: bytes, shape, dtype: str, device: str, scale=None):
+    """Reconstruct a tensor from the wire (fp16/fp32 raw, or group-wise int8)."""
+    if dtype != "int8":
+        return bytes_to_tensor(b, shape, dtype, device)
+    import torch
+
+    shape = tuple(shape)
+    H = shape[-1]
+    G = _INT8_GROUP
+    ng = (H + G - 1) // G
+    N = 1
+    for d in shape[:-1]:
+        N *= d
+    q = np.frombuffer(b, dtype=np.int8).reshape(N, ng, G).astype(np.float32)
+    sc = np.frombuffer(scale, dtype=np.float16).reshape(N, ng, 1).astype(np.float32)
+    x = (q * sc / 127.0).reshape(N, ng * G)[:, :H].reshape(shape)
+    return torch.from_numpy(x.copy()).to(device=device, dtype=torch.float16)

@@ -117,6 +117,7 @@ class Node:
             self._close_session_downsocks(msg["session_id"])  # tear down chain relays too
             return {"ok": True}
         if mtype in ("prefill", "decode"):
+            wire_dtype = msg.get("dtype") or self.engine.dtype  # M14: int8 or fp16 on the wire
             with self._lock:  # serialize the forward; the relay below runs unlocked
                 if msg.get("embed"):
                     # Thin-head entry: this node embeds the token ids itself, so the
@@ -125,8 +126,8 @@ class Node:
                     in_hash = receipts.hash_ints(msg["input_ids"])
                 else:
                     tb_in = msg["tensor"]
-                    hidden = protocol.bytes_to_tensor(
-                        tb_in, msg["shape"], msg["dtype"], self.engine.device
+                    hidden = protocol.wire_to_tensor(
+                        tb_in, msg["shape"], wire_dtype, self.engine.device, msg.get("scale")
                     )
                     in_hash = receipts.hash_bytes(tb_in)
                 out = self.engine.forward(
@@ -141,8 +142,9 @@ class Node:
                     payload = {"token": token}
                     out_hash = receipts.hash_ints([token])
                 else:
-                    tb_out = protocol.tensor_to_bytes(out, self.engine.dtype)
-                    payload = {"shape": list(out.shape), "dtype": self.engine.dtype, "tensor": tb_out}
+                    tb_out, scale_out = protocol.tensor_to_wire(out, wire_dtype)
+                    payload = {"shape": list(out.shape), "dtype": wire_dtype,
+                               "scale": scale_out, "tensor": tb_out}
                     out_hash = receipts.hash_bytes(tb_out)
                 # Sign a receipt over the HONEST input/output (M11). The tamper hook
                 # then corrupts only the wire payload — so the honest out_hash no

@@ -119,6 +119,7 @@ class SocketTransport:
         self.shards = {s["name"]: s for s in shards}
         self.dtype = dtype
         self.device = device
+        self.wire_dtype = dtype   # M14: "int8" halves wire bytes (lossy); else = compute dtype
         self.socks: dict = {}
         self.seq = 0
         # M11: per-token receipts + head anchors, read by the orchestrator's verifier.
@@ -157,22 +158,25 @@ class SocketTransport:
 
     def forward(self, name, session_id, hidden, position_ids, input_ids, mode):
         self.seq += 1
+        tb, scale = protocol.tensor_to_wire(hidden, self.wire_dtype)
         msg = {
             "type": mode,
             "session_id": session_id,
             "seq_id": self.seq,
             "shape": list(hidden.shape),
-            "dtype": self.dtype,
+            "dtype": self.wire_dtype,
+            "scale": scale,
             "position_ids": list(position_ids),
             "input_ids": list(input_ids),
-            "tensor": protocol.tensor_to_bytes(hidden, self.dtype),
+            "tensor": tb,
         }
         reply = self._roundtrip(name, msg)
         if not reply.get("ok"):
             raise RuntimeError(f"shard {name} error: {reply.get('error')}")
         self._last_receipt = reply.get("receipt")
         self._last_recv_hash = receipts.hash_bytes(reply["tensor"]) if "tensor" in reply else None
-        return protocol.bytes_to_tensor(reply["tensor"], reply["shape"], reply["dtype"], self.device)
+        return protocol.wire_to_tensor(reply["tensor"], reply["shape"], reply["dtype"],
+                                       self.device, reply.get("scale"))
 
     def route(self, names, session_id, hidden, position_ids, input_ids, mode):
         """Star routing: every hop round-trips through the head (2N crossings/token)."""
@@ -297,11 +301,12 @@ class ChainTransport(SocketTransport):
         self.seq += 1
         first = names[0]
         downstream = [[self.shards[n]["host"], self.shards[n]["port"]] for n in names[1:]]
+        tb, scale = protocol.tensor_to_wire(hidden, self.wire_dtype)
         msg = {
             "type": mode, "session_id": session_id, "seq_id": self.seq,
-            "shape": list(hidden.shape), "dtype": self.dtype,
+            "shape": list(hidden.shape), "dtype": self.wire_dtype, "scale": scale,
             "position_ids": list(position_ids), "input_ids": list(input_ids),
-            "tensor": protocol.tensor_to_bytes(hidden, self.dtype),
+            "tensor": tb,
             "route": downstream,
             "collect": [self.collect_host, self.collect_port],
         }
@@ -317,7 +322,8 @@ class ChainTransport(SocketTransport):
                 "chain tail never reached the collect sink — a node dropped mid-chain") from e
         self.last_receipts = reply.get("receipts", [])
         self.last_anchor_out = receipts.hash_bytes(reply["tensor"])
-        return protocol.bytes_to_tensor(reply["tensor"], reply["shape"], reply["dtype"], self.device)
+        return protocol.wire_to_tensor(reply["tensor"], reply["shape"], reply["dtype"],
+                                       self.device, reply.get("scale"))
 
     def route_token(self, names, session_id, input_ids, position_ids, mode) -> int:
         """Thin-head chain (M10): the head sends only token ids in and gets a token
@@ -331,6 +337,7 @@ class ChainTransport(SocketTransport):
             "type": mode, "session_id": session_id, "seq_id": self.seq,
             "position_ids": list(position_ids), "input_ids": list(input_ids),
             "embed": True,  # the entry node embeds these ids (no tensor sent)
+            "dtype": self.wire_dtype,  # inter-node tensors use this wire dtype
             "route": downstream,
             "collect": [self.collect_host, self.collect_port],
         }

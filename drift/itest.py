@@ -69,6 +69,52 @@ def _teardown(procs: list[subprocess.Popen]) -> None:
             pr.kill()
 
 
+def _int8_test(cfg, model_id, dtype, dev, args) -> int:
+    """M14: int8 wire halves the bytes per hop (lossy → relaxed gate). Measure the
+    match-rate vs the fp16 reference and the byte savings; never claims bitwise."""
+    from transformers import AutoConfig
+
+    hidden = getattr(AutoConfig.from_pretrained(model_id), "hidden_size", None) or \
+        AutoConfig.from_pretrained(model_id).text_config.hidden_size
+    print(f"[itest:int8] building in-process reference (fp16) …", flush=True)
+    ref = build_inprocess(cfg)
+
+    ports, procs = spawn_nodes(args.nodes)
+    try:
+        endpoints = [{"name": f"n{i}", "host": "127.0.0.1", "port": p}
+                     for i, p in enumerate(ports)]
+        orch, plan = build_over_nodes(model_id, dtype, dev, endpoints, chain=True, int8=True)
+        rates, divs = [], []
+        for prompt, n in _CASES[:2]:
+            r = ref.generate(prompt, n, stop_on_eos=False, session_id=f"ref-{n}")["token_ids"]
+            g = orch.generate(prompt, n, stop_on_eos=False, session_id=f"int8-{n}")["token_ids"]
+            matches = sum(1 for a, b in zip(r, g) if a == b)
+            rate = matches / max(len(r), 1)
+            div = next((i for i in range(min(len(r), len(g))) if r[i] != g[i]), None)
+            rates.append(rate); divs.append(div)
+            print(f"[itest:int8] n={n:>3} match_rate={rate:.1%} first_div={div}", flush=True)
+    finally:
+        _teardown(procs)
+
+    from .protocol import _INT8_GROUP
+    ng = (hidden + _INT8_GROUP - 1) // _INT8_GROUP
+    fp16_bytes = hidden * 2
+    int8_bytes = hidden + ng * 2  # H int8 payload + per-group fp16 scales
+    ratio = int8_bytes / fp16_bytes
+    mean_rate = sum(rates) / len(rates)
+    suspects = orch.verifier.suspects() if orch.verifier else []
+    print(f"[itest:int8] wire/token/hop: int8={int8_bytes} B vs fp16={fp16_bytes} B "
+          f"({ratio:.0%}) · mean match {mean_rate:.1%} · receipts clean={not suspects}", flush=True)
+    # PASS: the int8 path materially cuts the wire, stays self-verifying, and keeps
+    # a usable match-rate. The rate is the *measured* relaxed-gate fidelity, never
+    # claimed bitwise.
+    good = (ratio < 0.75) and (mean_rate >= 0.5) and (not suspects)
+    print("[itest:int8]",
+          f"PASS — int8 wire {ratio:.0%} of fp16; measured fidelity {mean_rate:.1%} (relaxed gate)"
+          if good else f"FAIL — ratio={ratio:.0%} fidelity={mean_rate:.1%}", flush=True)
+    return 0 if good else 1
+
+
 def _ledger_test(cfg, model_id, dtype, dev, args) -> int:
     """M13: run a generation with a receipt journal, then assert the ledger tally
     reconciles with the run and a forged line fails --verify."""
@@ -319,6 +365,8 @@ def main(argv=None) -> int:
                     help="M12: N nodes gossip-join a seed; assert the head discovers + splits all")
     ap.add_argument("--ledger", action="store_true",
                     help="M13: journal receipts during a run, then check the contribution tally")
+    ap.add_argument("--int8", action="store_true",
+                    help="M14: int8 wire — measure the byte savings + relaxed match-rate")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -330,6 +378,8 @@ def main(argv=None) -> int:
         # environment. Proves the AEAD channel is bitwise-transparent to parity.
         os.environ["DRIFT_NETWORK_KEY"] = binascii.hexlify(os.urandom(32)).decode()
 
+    if args.int8:
+        return _int8_test(cfg, model_id, dtype, dev, args)
     if args.ledger:
         return _ledger_test(cfg, model_id, dtype, dev, args)
     if args.expand is not None:

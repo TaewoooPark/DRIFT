@@ -68,16 +68,22 @@ def _check_env(transport: SocketTransport, names: list[str]) -> None:
                       f"internals can differ across versions and break bitwise parity", flush=True)
 
 
-def _make_transport(shards: list[dict], dtype: str, head_device: str, chain: bool):
-    """A star or chain transport over `shards` (chain picks a reachable collect host)."""
+def _make_transport(shards: list[dict], dtype: str, head_device: str, chain: bool,
+                    int8: bool = False):
+    """A star or chain transport over `shards` (chain picks a reachable collect host).
+    `int8` sends the hidden state as int8 on the wire (half the bytes, lossy)."""
     if not chain:
-        return SocketTransport(shards, dtype, head_device)
-    # The tail dials the head's collect sink. For an all-localhost run use loopback
-    # (avoids routing self-traffic over the LAN interface, where a firewall can
-    # silently drop it); otherwise the head's LAN address.
-    all_local = all(s["host"] in _LOCAL_HOSTS for s in shards)
-    collect_host = "127.0.0.1" if all_local else lan_ip()
-    return ChainTransport(shards, dtype, head_device, collect_host=collect_host)
+        t = SocketTransport(shards, dtype, head_device)
+    else:
+        # The tail dials the head's collect sink. For an all-localhost run use
+        # loopback (avoids routing self-traffic over the LAN interface, where a
+        # firewall can silently drop it); otherwise the head's LAN address.
+        all_local = all(s["host"] in _LOCAL_HOSTS for s in shards)
+        collect_host = "127.0.0.1" if all_local else lan_ip()
+        t = ChainTransport(shards, dtype, head_device, collect_host=collect_host)
+    if int8:
+        t.wire_dtype = "int8"
+    return t
 
 
 class _Cluster:
@@ -89,13 +95,14 @@ class _Cluster:
     orchestrator then re-prefills the sequence-so-far — bitwise-identical resume.
     """
 
-    def __init__(self, model_id, dtype, head_device, pool, chain, thin=False):
+    def __init__(self, model_id, dtype, head_device, pool, chain, thin=False, int8=False):
         self.model_id = model_id
         self.dtype = dtype
         self.head_device = head_device
         self.pool = [dict(e) for e in pool]
         self.chain = chain
         self.thin = thin
+        self.int8 = int8
         self.n_layers = model_num_layers(model_id)
 
     def _alive(self) -> list[dict]:
@@ -119,7 +126,7 @@ class _Cluster:
         ranges = split_layers(self.n_layers, len(alive))
         shards = [dict(e) for e in alive]
         names = [s["name"] for s in shards]
-        transport = _make_transport(shards, self.dtype, self.head_device, self.chain)
+        transport = _make_transport(shards, self.dtype, self.head_device, self.chain, self.int8)
         if not _wait_ready(transport, names):
             raise NodeUnavailable("survivors not reachable while rebuilding")
         _check_env(transport, names)
@@ -133,7 +140,8 @@ class _Cluster:
 
 def build_over_nodes(model_id: str, dtype: str, head_device: str,
                      endpoints: list[dict], chain: bool = False,
-                     spares: list[dict] | None = None, thin: bool = False
+                     spares: list[dict] | None = None, thin: bool = False,
+                     int8: bool = False
                      ) -> tuple[Orchestrator, list[dict]]:
     """Endpoints [{name,host,port,device?}] → auto-split, configure, return
     (orchestrator, plan). `plan` is per-node {name,host,port,start,end,device}.
@@ -151,7 +159,7 @@ def build_over_nodes(model_id: str, dtype: str, head_device: str,
     ranges = split_layers(n_layers, len(endpoints))
     shards = [dict(e) for e in endpoints]
     names = [s["name"] for s in shards]
-    transport = _make_transport(shards, dtype, head_device, chain)
+    transport = _make_transport(shards, dtype, head_device, chain, int8)
     if not _wait_ready(transport, names):
         raise RuntimeError("nodes not reachable — try `drift doctor --nodes <host:port,…>`")
     _check_env(transport, names)
@@ -165,7 +173,7 @@ def build_over_nodes(model_id: str, dtype: str, head_device: str,
     head = HeadModel(model_id, head_device, dtype, sliced=not thin, thin=thin)
     orch = Orchestrator(head, transport, names, head_device)
     orch.cluster = _Cluster(model_id, dtype, head_device,
-                            [*endpoints, *(spares or [])], chain, thin=thin)
+                            [*endpoints, *(spares or [])], chain, thin=thin, int8=int8)
     # M11: verify each token's signed receipts against the head's anchors.
     from .receipts import ReceiptVerifier
     orch.verify = True
@@ -331,6 +339,8 @@ def main(argv=None) -> int:
                     help="peer-to-peer chain: nodes stream to each other, not through the head")
     ap.add_argument("--thin", action="store_true",
                     help="zero-weight head: embed+lm_head move to the edge nodes (implies --chain)")
+    ap.add_argument("--int8", action="store_true",
+                    help="send the hidden state as int8 (half the wire bytes; lossy, relaxed gate)")
     ap.add_argument("--expand", action="store_true",
                     help="treat --nodes as seeds: gossip-discover the whole membership and split across all of it")
     args = ap.parse_args(argv)
@@ -347,7 +357,7 @@ def main(argv=None) -> int:
 
     print(f"[run] {len(endpoints)} node(s); splitting {model_id} …", flush=True)
     orch, plan = build_over_nodes(model_id, dtype, head_device, endpoints,
-                                  chain=args.chain, thin=args.thin)
+                                  chain=args.chain, thin=args.thin, int8=args.int8)
     _status_bar(model_id, plan, head_device, chain=args.chain or args.thin, thin=args.thin)
     if args.prompt:
         _stream(orch, args.prompt, n_new)
