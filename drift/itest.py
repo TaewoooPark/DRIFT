@@ -28,7 +28,7 @@ import time
 
 from .common import free_port, load_config, pick_device
 from .orchestrator import build_inprocess
-from .run import build_over_nodes
+from .run import _expand_members, build_over_nodes
 
 _CASES = [
     ("Give me a short introduction to large language models.", 32),
@@ -67,6 +67,77 @@ def _teardown(procs: list[subprocess.Popen]) -> None:
             pr.wait(timeout=10)
         except Exception:
             pr.kill()
+
+
+def _wait_port(port: int, timeout: float = 30.0) -> bool:
+    import socket
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        try:
+            socket.create_connection(("127.0.0.1", port), timeout=1).close()
+            return True
+        except OSError:
+            time.sleep(0.3)
+    return False
+
+
+def _expand_test(cfg, model_id, dtype, dev, args) -> int:
+    """M12: a seed + joiners that gossip-join it; assert the seed learns the whole
+    membership and the head, expanding from just the seed, splits across all of it
+    with bitwise parity."""
+    from .membership import PeerTable, fetch_peers
+
+    N = args.expand
+    print(f"[itest:expand] building in-process reference …", flush=True)
+    ref = build_inprocess(cfg)
+
+    def _spawn(port, extra):
+        env = dict(os.environ)
+        env["DRIFT_IDENTITY_FILE"] = f"/tmp/drift_id_{port}.key"
+        env["DRIFT_ADVERTISE_HOST"] = "127.0.0.1"  # all-localhost: advertise loopback
+        return subprocess.Popen(
+            [sys.executable, "-m", "drift.node", "--port", str(port), "--host", "127.0.0.1",
+             "--quiet", "--no-advertise", *extra],
+            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    seed_port = free_port()
+    print(f"[itest:expand] seed on {seed_port}; {N - 1} joiner(s) gossip-join it …", flush=True)
+    procs = [_spawn(seed_port, [])]
+    _wait_port(seed_port)
+    for _ in range(N - 1):
+        p = free_port()
+        procs.append(_spawn(p, ["--join", f"127.0.0.1:{seed_port}"]))
+    try:
+        # Wait until the seed's peer table has converged to all N members.
+        members, t0 = [], time.time()
+        while time.time() - t0 < 60:
+            try:
+                tbl = PeerTable(); tbl.merge(fetch_peers("127.0.0.1", seed_port))
+                members = tbl.endpoints()
+                if len(members) >= N:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.5)
+        print(f"[itest:expand] seed learned {len(members)}/{N} members via gossip", flush=True)
+
+        endpoints = _expand_members([{"name": "seed", "host": "127.0.0.1", "port": seed_port}])
+        orch, plan = build_over_nodes(model_id, dtype, dev, endpoints, chain=True)
+        print(f"[itest:expand] split across {len(plan)} discovered node(s)", flush=True)
+
+        ok_all = True
+        for prompt, n in _CASES[:2]:
+            r = ref.generate(prompt, n, stop_on_eos=False, session_id=f"ref-{n}")["token_ids"]
+            g = orch.generate(prompt, n, stop_on_eos=False, session_id=f"exp-{n}")["token_ids"]
+            ok = (r == g); ok_all &= ok
+            print(f"[itest:expand] {'PASS' if ok else 'FAIL'} n={n:>3} "
+                  f"discovered={len(endpoints)}", flush=True)
+        good = ok_all and len(members) >= N
+        print("[itest:expand]",
+              "PASS — gossip-discovered all members, split bitwise" if good else "FAIL", flush=True)
+        return 0 if good else 1
+    finally:
+        _teardown(procs)
 
 
 def _tamper_test(cfg, model_id, dtype, dev, args) -> int:
@@ -191,6 +262,8 @@ def main(argv=None) -> int:
                     help="M9: kill node index K mid-generation; assert bitwise-identical recovery")
     ap.add_argument("--tamper", type=int, default=None, metavar="K",
                     help="M11: node K corrupts its output; assert the receipt verifier flags it")
+    ap.add_argument("--expand", type=int, default=None, metavar="N",
+                    help="M12: N nodes gossip-join a seed; assert the head discovers + splits all")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -202,6 +275,8 @@ def main(argv=None) -> int:
         # environment. Proves the AEAD channel is bitwise-transparent to parity.
         os.environ["DRIFT_NETWORK_KEY"] = binascii.hexlify(os.urandom(32)).decode()
 
+    if args.expand is not None:
+        return _expand_test(cfg, model_id, dtype, dev, args)
     if args.tamper is not None:
         return _tamper_test(cfg, model_id, dtype, dev, args)
     if args.kill is not None:

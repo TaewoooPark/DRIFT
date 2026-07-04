@@ -22,7 +22,7 @@ import threading
 
 import yaml
 
-from . import crypto, protocol, receipts
+from . import crypto, membership, protocol, receipts
 from .engine_torch import TorchShardEngine
 
 def load_config(path: str = "config.yaml") -> dict:
@@ -52,12 +52,21 @@ class Node:
         self._down_lock = threading.Lock()     # guards the _down cache
         self._sk = None                        # Ed25519 identity (lazy)
         self._pub = None
+        self.peer_table = membership.PeerTable()   # M12 gossip membership
 
     def _identity(self):
         if self._sk is None:
             self._sk = crypto.load_identity()
             self._pub = crypto.identity_pubkey_hex(self._sk)
         return self._sk, self._pub
+
+    def set_self(self, host: str, port: int) -> dict:
+        """Register this node's own signed peer entry (called once we know our
+        reachable address), so a peer that gossips with us learns about us."""
+        sk, pub = self._identity()
+        e = membership.self_entry(sk, pub, host, port, self.device)
+        self.peer_table.add(e)
+        return e
 
     def configure(self, start: int, end: int, model_id: str | None = None,
                   dtype: str | None = None, device: str | None = None,
@@ -89,6 +98,11 @@ class Node:
                         **self.engine.ping_info(), **env_info()}
             return {"ok": True, "assigned": False, "name": self.name, "pubkey": pub,
                     "device": self.device, "loaded": False, **env_info()}
+        if mtype == "peers_get":  # M12: hand back what we know (no engine needed)
+            return {"ok": True, "peers": self.peer_table.list()}
+        if mtype == "peer_announce":  # M12: merge their list, reply with ours (anti-entropy)
+            self.peer_table.merge(msg.get("peers", []))
+            return {"ok": True, "peers": self.peer_table.list()}
         if mtype == "configure":
             return self.configure(
                 start=msg["start_layer"], end=msg["end_layer"],

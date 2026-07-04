@@ -225,6 +225,27 @@ def _parse_nodes(spec: str) -> list[dict]:
     return out
 
 
+def _expand_members(seeds: list[dict]) -> list[dict]:
+    """Gossip-discover the full membership from seed nodes and return every member
+    as an endpoint (M12). Falls back to the seeds if discovery turns up nothing."""
+    from . import membership
+
+    table = membership.PeerTable()
+    for s in seeds:
+        try:
+            got = membership.fetch_peers(s["host"], s["port"])
+            n = table.merge(got)
+            print(f"[expand] {s['host']}:{s['port']} → {len(got)} peer(s) ({n} new)", flush=True)
+        except Exception as e:
+            print(f"[expand] {s['host']}:{s['port']} unreachable: {e}", flush=True)
+    members = table.endpoints()
+    if not members:
+        print("[expand] no members discovered — using the seeds as given", flush=True)
+        return seeds
+    print(f"[expand] membership = {len(members)} node(s)", flush=True)
+    return members
+
+
 def _select_endpoints(args, cfg: dict) -> list[dict]:
     """Pick worker endpoints: explicit --nodes → LAN discovery → config shards."""
     if args.nodes:
@@ -308,6 +329,8 @@ def main(argv=None) -> int:
                     help="peer-to-peer chain: nodes stream to each other, not through the head")
     ap.add_argument("--thin", action="store_true",
                     help="zero-weight head: embed+lm_head move to the edge nodes (implies --chain)")
+    ap.add_argument("--expand", action="store_true",
+                    help="treat --nodes as seeds: gossip-discover the whole membership and split across all of it")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -317,6 +340,8 @@ def main(argv=None) -> int:
     n_new = args.max_new_tokens or cfg["generation"]["max_new_tokens"]
 
     endpoints = _select_endpoints(args, cfg)
+    if args.expand:
+        endpoints = _expand_members(endpoints)
 
     print(f"[run] {len(endpoints)} node(s); splitting {model_id} …", flush=True)
     orch, plan = build_over_nodes(model_id, dtype, head_device, endpoints,

@@ -10,10 +10,32 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import threading
+import time
 
-from . import discovery
+from . import discovery, membership
 from .common import free_port, lan_ip, load_config, pick_device
 from .shard_server import Node, serve
+
+
+def _gossip_loop(node: Node, seeds: list[tuple], interval: float = 5.0) -> None:
+    """Bootstrap from the seeds, then anti-entropy gossip with known peers so
+    membership converges across the network (M12)."""
+    for host, port in seeds:
+        try:
+            node.peer_table.merge(membership.gossip_once(host, port, node.peer_table.list()))
+        except Exception:
+            pass
+    while True:
+        time.sleep(interval)
+        for e in node.peer_table.list():
+            if e.get("pubkey") == node._pub:
+                continue
+            try:
+                node.peer_table.merge(
+                    membership.gossip_once(e["host"], e["port"], node.peer_table.list()))
+            except Exception:
+                pass
 
 
 def main(argv=None) -> int:
@@ -32,6 +54,8 @@ def main(argv=None) -> int:
                          "no account needed; the head connects with `drift run --nodes <printed>`")
     ap.add_argument("--tamper", action="store_true",
                     help="TEST ONLY: corrupt this node's output so the head's receipt verifier flags it")
+    ap.add_argument("--join", metavar="host:port,…",
+                    help="gossip-join a network via one or more seed nodes (learn the members)")
     args = ap.parse_args(argv)
 
     cfg = {}
@@ -57,6 +81,20 @@ def main(argv=None) -> int:
                 dtype=cfg.get("dtype", "float16"), device=device)
     node.tamper = args.tamper
     ip = lan_ip()
+    # The address peers use to reach us. Defaults to the LAN ip; override with
+    # DRIFT_ADVERTISE_HOST (e.g. 127.0.0.1 for an all-localhost run, where a node
+    # can't reach its own machine's LAN ip through the firewall).
+    adv_host = os.environ.get("DRIFT_ADVERTISE_HOST") or ip
+    node.set_self(adv_host, port)  # register our own signed peer entry (M12 gossip)
+
+    # Gossip-join a network via seed nodes (learn the full membership).
+    if args.join:
+        seeds = []
+        for tok in args.join.split(","):
+            h, _, p = tok.strip().rpartition(":")
+            if p:
+                seeds.append((h or "127.0.0.1", int(p)))
+        threading.Thread(target=_gossip_loop, args=(node, seeds), daemon=True).start()
 
     # Public tunnel (for a node behind NAT / on Colab / on a cloud VM).
     tunnel_addr, tunnel_proc = None, None
