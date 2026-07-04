@@ -22,7 +22,7 @@ import threading
 
 import yaml
 
-from . import protocol
+from . import crypto, protocol
 from .engine_torch import TorchShardEngine
 
 def load_config(path: str = "config.yaml") -> dict:
@@ -108,32 +108,29 @@ class Node:
         return {"ok": False, "error": f"unknown message type: {mtype}"}
 
     # ------------------------------------------------------------- chain relay
-    def _downsock(self, target: tuple, session_id: str) -> socket.socket:
-        """A cached client socket to a downstream node / the collect sink.
+    def _downsock(self, target: tuple, session_id: str):
+        """A cached client channel to a downstream node / the collect sink
+        (encrypted when a network key is set).
 
         Keyed by (host, port, session) so concurrent sessions never interleave on
-        one socket; a single session sends one message at a time, so no per-socket
+        one channel; a single session sends one message at a time, so no per-socket
         lock is needed — only the cache dict is guarded.
         """
         key = (target[0], int(target[1]), session_id)
         with self._down_lock:
-            sk = self._down.get(key)
-        if sk is None:
-            sk = socket.create_connection((target[0], int(target[1])))
-            sk.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            ch = self._down.get(key)
+        if ch is None:
+            ch = crypto.dial(target[0], int(target[1]))  # client handshake happens here
             with self._down_lock:
-                self._down[key] = sk
-        return sk
+                self._down[key] = ch
+        return ch
 
     def _drop_downsock(self, target: tuple, session_id: str) -> None:
         key = (target[0], int(target[1]), session_id)
         with self._down_lock:
-            sk = self._down.pop(key, None)
-        if sk is not None:
-            try:
-                sk.close()
-            except Exception:
-                pass
+            ch = self._down.pop(key, None)
+        if ch is not None:
+            ch.close()
 
     def _relay(self, msg: dict, out) -> dict:
         """Forward the computed hidden state to the next node, or — if this is the
@@ -150,10 +147,10 @@ class Node:
         }
         tgt = (target[0], int(target[1]))
         try:
-            sk = self._downsock(tgt, msg["session_id"])
-            protocol.send_msg(sk, down)
-            ack = protocol.recv_msg(sk)
-        except (ConnectionError, OSError) as e:
+            ch = self._downsock(tgt, msg["session_id"])
+            ch.send(down)
+            ack = ch.recv()
+        except (ConnectionError, OSError, ValueError) as e:
             self._drop_downsock(tgt, msg["session_id"])
             return {"ok": False, "error": f"relay to {tgt[0]}:{tgt[1]} failed: {e}"}
         if not ack.get("ok"):
@@ -164,12 +161,9 @@ class Node:
         with self._down_lock:
             keys = [k for k in self._down if k[2] == session_id]
             for k in keys:
-                sk = self._down.pop(k, None)
-                if sk is not None:
-                    try:
-                        sk.close()
-                    except Exception:
-                        pass
+                ch = self._down.pop(k, None)
+                if ch is not None:
+                    ch.close()
 
 
 def serve(node: Node, host: str, port: int, banner: str | None = None) -> None:
@@ -190,24 +184,33 @@ def serve(node: Node, host: str, port: int, banner: str | None = None) -> None:
 
 
 def _serve_conn(node: Node, conn: socket.socket) -> None:
-    """Handle one client connection (one session) until it closes."""
-    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    """Handle one client connection (one session) until it closes.
+
+    Completes the server handshake first — encrypted when a network key is set,
+    plaintext otherwise. A dialer that doesn't hold the key can't finish it, so
+    the connection is dropped before any DRIFT message is processed.
+    """
+    try:
+        ch = crypto.accept_wrap(conn)
+    except (ConnectionError, OSError, ValueError):
+        conn.close()
+        return
     try:
         while True:
             try:
-                msg = protocol.recv_msg(conn)
-            except ConnectionError:
+                msg = ch.recv()
+            except (ConnectionError, OSError, ValueError):
                 break
             try:
                 reply = node.handle(msg)  # locks the compute internally; relay runs unlocked
             except Exception as e:  # surface engine errors to the caller
                 reply = {"ok": False, "error": f"{type(e).__name__}: {e}"}
             try:
-                protocol.send_msg(conn, reply)
+                ch.send(reply)
             except (ConnectionError, OSError):
                 break
     finally:
-        conn.close()
+        ch.close()
 
 
 def main(argv=None) -> int:

@@ -38,6 +38,17 @@ def main(argv=None) -> int:
     except Exception:
         pass  # a node needs no config; the head sends model + range via configure
 
+    # A public tunnel with no network key is an open compute endpoint — anyone who
+    # scans the bore.pub port could drive this node's GPU. Require a key for it.
+    if args.tunnel:
+        from .crypto import network_key
+        if network_key() is None:
+            print("[node] refusing --tunnel without a network key: a public endpoint would be "
+                  "open compute for anyone who finds the port.\n"
+                  "       run `drift keygen`, then `export DRIFT_NETWORK_KEY=<the printed hex>` "
+                  "on this machine and the head.", flush=True)
+            return 2
+
     device = pick_device(args.device)
     port = args.port or int(os.environ.get("DRIFT_PORT") or free_port())
     node = Node(name=f"node-{port}", model_id=cfg.get("model_id", "(assigned by head)"),

@@ -45,6 +45,11 @@ import numpy as np
 # numpy dtype names used on the wire, keyed by the string in the message.
 _NP_DTYPE = {"float16": np.float16, "float32": np.float32, "bfloat16": None}
 
+# Bound the 4-byte length prefix (which by itself would admit a 4 GB body): a
+# hostile or corrupt peer must not be able to make us pre-allocate gigabytes.
+# 256 MB is generous headroom for a long-prompt prefill hidden state.
+MAX_MSG_BYTES = 256 * 1024 * 1024
+
 
 def send_msg(sock, obj: dict) -> None:
     """Frame and send one message: 4-byte BE length prefix + msgpack body."""
@@ -53,8 +58,10 @@ def send_msg(sock, obj: dict) -> None:
 
 
 def recv_msg(sock) -> dict:
-    """Receive exactly one framed message."""
+    """Receive exactly one framed message (length-capped against alloc-DoS)."""
     (n,) = struct.unpack(">I", _recvn(sock, 4))
+    if n > MAX_MSG_BYTES:
+        raise ValueError(f"message length {n} exceeds cap {MAX_MSG_BYTES} — refusing to allocate")
     return msgpack.unpackb(_recvn(sock, n), raw=False)
 
 

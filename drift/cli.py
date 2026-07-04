@@ -16,6 +16,7 @@ _COMMANDS: dict[str, tuple[str, str, list[str]]] = {
     "up":        ("drift.run", "up_main", []),
     "run":       ("drift.run", "main", []),
     "node":      ("drift.node", "main", []),
+    "keygen":    ("drift.crypto", "main", []),
     "reference": ("drift.reference", "main", []),
     "parity":    ("drift.parity_test", "main", []),
     "itest":     ("drift.itest", "main", []),
@@ -33,6 +34,7 @@ getting started:
   node          run THIS machine as a worker (auto device/port, LAN-reachable)
   run           head: assign layers to running nodes and chat/generate
                   (--nodes host:port,… ; omit --prompt for an interactive chat)
+  keygen        create/print the network key + node identity (encrypt the wire)
 
 commands:
   reference     single-machine reference generation (the oracle)

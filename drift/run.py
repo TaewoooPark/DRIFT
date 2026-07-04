@@ -16,10 +16,12 @@ import subprocess
 import sys
 import time
 
-from .common import (free_port, load_config, model_num_layers, pick_device,
-                     split_layers)
+from .common import (free_port, lan_ip, load_config, model_num_layers,
+                     pick_device, split_layers)
 from .orchestrator import (ChainTransport, HeadModel, Orchestrator,
                            SocketTransport)
+
+_LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 
 # ------------------------------------------------------------------- assembly
@@ -78,8 +80,15 @@ def build_over_nodes(model_id: str, dtype: str, head_device: str,
     ranges = split_layers(n_layers, len(endpoints))
     shards = [dict(e) for e in endpoints]
     names = [s["name"] for s in shards]
-    Transport = ChainTransport if chain else SocketTransport
-    transport = Transport(shards, dtype, head_device)
+    if chain:
+        # The tail dials the head's collect sink. For an all-localhost run use
+        # loopback (avoids routing self-traffic over the LAN interface, where a
+        # firewall can silently drop it); otherwise the head's LAN address.
+        all_local = all(s["host"] in _LOCAL_HOSTS for s in shards)
+        collect_host = "127.0.0.1" if all_local else lan_ip()
+        transport = ChainTransport(shards, dtype, head_device, collect_host=collect_host)
+    else:
+        transport = SocketTransport(shards, dtype, head_device)
     if not _wait_ready(transport, names):
         raise RuntimeError("nodes not reachable — try `drift doctor --nodes <host:port,…>`")
     _check_env(transport, names)

@@ -15,7 +15,7 @@ import threading
 
 import torch
 
-from . import protocol
+from . import crypto, protocol
 from .common import build_input_ids, lan_ip, load_config
 from .engine_torch import TorchShardEngine
 
@@ -105,30 +105,26 @@ class SocketTransport:
         self.seq = 0
 
     def _sock(self, name):
+        """A cached channel to a node (encrypted when a network key is set)."""
         if name not in self.socks:
             s = self.shards[name]
-            sk = socket.create_connection((s["host"], s["port"]))
-            sk.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            self.socks[name] = sk
+            self.socks[name] = crypto.dial(s["host"], s["port"])
         return self.socks[name]
 
     def _drop(self, name):
-        """Forget a node's socket so the next call reconnects."""
-        sk = self.socks.pop(name, None)
-        if sk is not None:
-            try:
-                sk.close()
-            except Exception:
-                pass
+        """Forget a node's channel so the next call reconnects (+ re-handshakes)."""
+        ch = self.socks.pop(name, None)
+        if ch is not None:
+            ch.close()
 
     def _roundtrip(self, name, msg):
         """Send + receive one message, with a single reconnect for a transient
         drop. Raises NodeUnavailable if the node is truly gone (M6)."""
         for attempt in (1, 2):
             try:
-                sk = self._sock(name)
-                protocol.send_msg(sk, msg)
-                return protocol.recv_msg(sk)
+                ch = self._sock(name)
+                ch.send(msg)
+                return ch.recv()
             except (ConnectionError, OSError) as e:
                 self._drop(name)
                 if attempt == 2:
@@ -162,28 +158,28 @@ class SocketTransport:
     def reset(self, name, session_id):
         # Cleanup path — a dropped node needs no reset, so never raise here.
         try:
-            sk = self._sock(name)
-            protocol.send_msg(sk, {"type": "reset", "session_id": session_id})
-            protocol.recv_msg(sk)
+            ch = self._sock(name)
+            ch.send({"type": "reset", "session_id": session_id})
+            ch.recv()
         except (ConnectionError, OSError):
             self._drop(name)
 
     def configure(self, name, start_layer, end_layer, model_id, dtype, device=None):
         """Push a layer range to an unassigned (fungible) node."""
-        sk = self._sock(name)
-        protocol.send_msg(sk, {
+        ch = self._sock(name)
+        ch.send({
             "type": "configure", "model_id": model_id, "dtype": dtype,
             "start_layer": start_layer, "end_layer": end_layer, "device": device,
         })
-        reply = protocol.recv_msg(sk)
+        reply = ch.recv()
         if not reply.get("ok"):
             raise RuntimeError(f"configure {name} failed: {reply.get('error')}")
         return reply
 
     def ping(self, name):
-        sk = self._sock(name)
-        protocol.send_msg(sk, {"type": "ping"})
-        return protocol.recv_msg(sk)
+        ch = self._sock(name)
+        ch.send({"type": "ping"})
+        return ch.recv()
 
 
 class ChainTransport(SocketTransport):
@@ -234,21 +230,27 @@ class ChainTransport(SocketTransport):
 
     def _collect_reader(self, conn: socket.socket) -> None:
         """Read final hidden states the tail streams here; hand each to its
-        session's queue. One persistent connection carries a whole generation."""
-        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        session's queue. One persistent connection carries a whole generation.
+        The tail dials in as a client, so we complete the server handshake first
+        (encrypted when a network key is set)."""
+        try:
+            ch = crypto.accept_wrap(conn)  # server side of the secure handshake
+        except (ConnectionError, OSError, ValueError):
+            conn.close()
+            return
         try:
             while True:
                 try:
-                    msg = protocol.recv_msg(conn)
-                except (ConnectionError, OSError):
+                    msg = ch.recv()
+                except (ConnectionError, OSError, ValueError):
                     break
                 self._q(msg.get("session_id", "s0")).put(msg)
                 try:
-                    protocol.send_msg(conn, {"ok": True})  # ack so the tail's send returns
+                    ch.send({"ok": True})  # ack so the tail's send returns
                 except (ConnectionError, OSError):
                     break
         finally:
-            conn.close()
+            ch.close()
 
     def route(self, names, session_id, hidden, position_ids, input_ids, mode):
         self.seq += 1

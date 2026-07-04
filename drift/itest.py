@@ -19,9 +19,10 @@ noise.
 from __future__ import annotations
 
 import argparse
+import binascii
+import os
 import subprocess
 import sys
-import time
 
 from .common import free_port, load_config, pick_device
 from .orchestrator import build_inprocess
@@ -63,12 +64,20 @@ def main(argv=None) -> int:
     ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--nodes", type=int, default=2, help="number of local worker nodes")
     ap.add_argument("--chain", action="store_true", help="peer-to-peer chain transport (M7)")
+    ap.add_argument("--secure", action="store_true",
+                    help="encrypt the wire with a throwaway network key (M8)")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
     model_id, dtype = cfg["model_id"], cfg.get("dtype", "float16")
     dev = pick_device(cfg.get("device"))
     topo = "chain" if args.chain else "star"
+
+    if args.secure:
+        # A throwaway network key, shared with the spawned nodes via the inherited
+        # environment. Proves the AEAD channel is bitwise-transparent to parity.
+        os.environ["DRIFT_NETWORK_KEY"] = binascii.hexlify(os.urandom(32)).decode()
+        topo += "+secure"
 
     print(f"[itest:{topo}] building in-process reference …", flush=True)
     ref = build_inprocess(cfg)
