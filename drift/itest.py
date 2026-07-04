@@ -134,6 +134,8 @@ def main(argv=None) -> int:
     ap.add_argument("--chain", action="store_true", help="peer-to-peer chain transport (M7)")
     ap.add_argument("--secure", action="store_true",
                     help="encrypt the wire with a throwaway network key (M8)")
+    ap.add_argument("--thin", action="store_true",
+                    help="zero-weight head; embed+head move to the edge nodes (M10, implies chain)")
     ap.add_argument("--kill", type=int, default=None, metavar="K",
                     help="M9: kill node index K mid-generation; assert bitwise-identical recovery")
     args = ap.parse_args(argv)
@@ -150,7 +152,8 @@ def main(argv=None) -> int:
     if args.kill is not None:
         return _kill_test(cfg, model_id, dtype, dev, args)
 
-    topo = ("chain" if args.chain else "star") + ("+secure" if args.secure else "")
+    topo = ("chain" if (args.chain or args.thin) else "star") + \
+           ("+secure" if args.secure else "") + ("+thin" if args.thin else "")
 
     print(f"[itest:{topo}] building in-process reference …", flush=True)
     ref = build_inprocess(cfg)
@@ -160,7 +163,8 @@ def main(argv=None) -> int:
     try:
         endpoints = [{"name": f"n{i}", "host": "127.0.0.1", "port": p}
                      for i, p in enumerate(ports)]
-        orch, plan = build_over_nodes(model_id, dtype, dev, endpoints, chain=args.chain)
+        orch, plan = build_over_nodes(model_id, dtype, dev, endpoints,
+                                      chain=args.chain, thin=args.thin)
         print(f"[itest:{topo}] split: " +
               " · ".join(f"{p['name']}[{p['start']}:{p['end']})" for p in plan), flush=True)
 

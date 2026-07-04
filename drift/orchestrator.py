@@ -32,10 +32,24 @@ class HeadModel:
     Gemma's scaled embedding) is applied automatically — nothing hardcoded.
     """
 
-    def __init__(self, model_id: str, device: str, dtype: str, sliced: bool = False):
+    def __init__(self, model_id: str, device: str, dtype: str, sliced: bool = False,
+                 thin: bool = False):
         import transformers
 
         self.device = device
+        self.thin = thin
+        if thin:
+            # M10 thin head: hold ONLY the tokenizer — zero model weights. embed
+            # moves to the first node, norm+lm_head+argmax to the last. The head
+            # sends token ids in and gets a token id out.
+            self.lm = None
+            self.inner = None
+            self.tokenizer = transformers.AutoTokenizer.from_pretrained(model_id)
+            try:
+                self.gen_cfg = transformers.GenerationConfig.from_pretrained(model_id)
+            except Exception:
+                self.gen_cfg = None
+            return
         if sliced:
             # Real head (socket): materialize ONLY embed_tokens + norm (+ lm_head
             # if untied), never the decoder layers — the head holds ~15%, not 100%.
@@ -167,12 +181,14 @@ class SocketTransport:
         except (ConnectionError, OSError):
             self._drop(name)
 
-    def configure(self, name, start_layer, end_layer, model_id, dtype, device=None):
-        """Push a layer range to an unassigned (fungible) node."""
+    def configure(self, name, start_layer, end_layer, model_id, dtype, device=None,
+                  embed_duty=False, head_duty=False):
+        """Push a layer range (and thin-head edge duties) to an unassigned node."""
         ch = self._sock(name)
         ch.send({
             "type": "configure", "model_id": model_id, "dtype": dtype,
             "start_layer": start_layer, "end_layer": end_layer, "device": device,
+            "embed_duty": embed_duty, "head_duty": head_duty,
         })
         reply = ch.recv()
         if not reply.get("ok"):
@@ -286,6 +302,32 @@ class ChainTransport(SocketTransport):
                 "chain tail never reached the collect sink — a node dropped mid-chain") from e
         return protocol.bytes_to_tensor(reply["tensor"], reply["shape"], reply["dtype"], self.device)
 
+    def route_token(self, names, session_id, input_ids, position_ids, mode) -> int:
+        """Thin-head chain (M10): the head sends only token ids in and gets a token
+        id back. The first node embeds, the tail norms+heads+argmaxes — the head
+        does no tensor math and holds no model weights. No tensor crosses its
+        boundary, just ints."""
+        self.seq += 1
+        first = names[0]
+        downstream = [[self.shards[n]["host"], self.shards[n]["port"]] for n in names[1:]]
+        msg = {
+            "type": mode, "session_id": session_id, "seq_id": self.seq,
+            "position_ids": list(position_ids), "input_ids": list(input_ids),
+            "embed": True,  # the entry node embeds these ids (no tensor sent)
+            "route": downstream,
+            "collect": [self.collect_host, self.collect_port],
+        }
+        q = self._q(session_id)
+        ack = self._roundtrip(first, msg)
+        if not ack.get("ok"):
+            raise NodeUnavailable(f"chain entry {first} error: {ack.get('error')}")
+        try:
+            reply = q.get(timeout=120)
+        except queue.Empty as e:
+            raise NodeUnavailable(
+                "chain tail never reached the collect sink — a node dropped mid-chain") from e
+        return int(reply["token"])
+
     def close(self):
         try:
             self._collect_srv.close()  # unblocks the accept loop (OSError → returns)
@@ -301,6 +343,7 @@ class Orchestrator:
         self.transport = transport
         self.order = order  # shard names, in routing order
         self.device = device
+        self.thin = getattr(head, "thin", False)  # M10: head holds no model weights
         # M9 failover: a cluster that can re-split over survivors, or None (no recovery).
         self.cluster = None
         self.recoveries = 0   # how many times a mid-run drop was recovered
@@ -314,12 +357,37 @@ class Orchestrator:
         tok = self.head.tokenizer
         if tok.eos_token_id is not None:
             eos.add(int(tok.eos_token_id))
-        gen_eos = getattr(getattr(self.head.lm, "generation_config", None), "eos_token_id", None)
+        # In thin mode the head has no lm; fall back to its GenerationConfig.
+        gcfg = getattr(self.head.lm, "generation_config", None) or getattr(self.head, "gen_cfg", None)
+        gen_eos = getattr(gcfg, "eos_token_id", None)
         if isinstance(gen_eos, int):
             eos.add(gen_eos)
         elif isinstance(gen_eos, (list, tuple)):
             eos.update(int(x) for x in gen_eos)
         return eos
+
+    def _prefill(self, session_id, seq_ids):
+        """Feed the whole sequence; return (next_id, first_logits_or_None). In thin
+        mode the pipeline embeds + heads, so the head just exchanges token ids."""
+        if self.thin:
+            nid = self.transport.route_token(self.order, session_id, seq_ids,
+                                             list(range(len(seq_ids))), "prefill")
+            return nid, None
+        hidden = self.head.embed(torch.tensor([seq_ids], device=self.device))
+        hidden = self.transport.route(self.order, session_id, hidden,
+                                      list(range(len(seq_ids))), seq_ids, "prefill").to(self.device)
+        logits = self.head.head(self.head.norm(hidden[:, -1:, :]))[:, -1, :]
+        return int(torch.argmax(logits, dim=-1)), logits[0].detach().float().cpu().numpy()
+
+    def _decode(self, session_id, tok_id, pos):
+        """Feed one token at absolute position `pos`; return the next token id."""
+        if self.thin:
+            return self.transport.route_token(self.order, session_id, [tok_id], [pos], "decode")
+        hidden = self.head.embed(torch.tensor([[tok_id]], device=self.device))
+        hidden = self.transport.route(self.order, session_id, hidden, [pos], [tok_id],
+                                      "decode").to(self.device)
+        logits = self.head.head(self.head.norm(hidden[:, -1:, :]))[:, -1, :]
+        return int(torch.argmax(logits, dim=-1))
 
     def _recover(self, session_id: str) -> None:
         """A node dropped mid-run: re-split over the survivors (+ spares), so the
@@ -358,24 +426,16 @@ class Orchestrator:
                 # the prefill's argmax is exactly the next token an uninterrupted run would
                 # emit — the recovered continuation is bitwise-identical.
                 seq = prompt_ids + generated
-                hidden = self.head.embed(torch.tensor([seq], device=self.device))
-                hidden = self.transport.route(self.order, session_id, hidden,
-                                              list(range(len(seq))), seq, "prefill").to(self.device)
-                logits = self.head.head(self.head.norm(hidden[:, -1:, :]))[:, -1, :]
+                next_id, logits0 = self._prefill(session_id, seq)
                 if first_logits is None:
-                    first_logits = logits[0].detach().float().cpu().numpy()
-                next_id = int(torch.argmax(logits, dim=-1))
+                    first_logits = logits0
                 p = len(seq)
                 while len(generated) < max_new_tokens:
                     generated.append(next_id)
                     self.progress = len(generated)
                     if (stop_on_eos and next_id in eos) or len(generated) >= max_new_tokens:
                         break
-                    hidden = self.head.embed(torch.tensor([[next_id]], device=self.device))
-                    hidden = self.transport.route(self.order, session_id, hidden,
-                                                  [p], [next_id], "decode").to(self.device)
-                    logits = self.head.head(self.head.norm(hidden[:, -1:, :]))[:, -1, :]
-                    next_id = int(torch.argmax(logits, dim=-1))
+                    next_id = self._decode(session_id, next_id, p)
                     p += 1
                 break  # finished with no unrecovered drop
             except NodeUnavailable:

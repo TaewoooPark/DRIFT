@@ -52,8 +52,12 @@ class Node:
         self._down_lock = threading.Lock()     # guards the _down cache
 
     def configure(self, start: int, end: int, model_id: str | None = None,
-                  dtype: str | None = None, device: str | None = None) -> dict:
-        """Build + load the engine for a layer range (idempotent per range)."""
+                  dtype: str | None = None, device: str | None = None,
+                  embed_duty: bool = False, head_duty: bool = False) -> dict:
+        """Build + load the engine for a layer range (idempotent per range).
+
+        embed_duty / head_duty give this node the thin-head edge modules
+        (embed_tokens on the first node, norm + lm_head on the last)."""
         self.model_id = model_id or self.model_id
         self.dtype = dtype or self.dtype
         self.device = device or self.device
@@ -61,6 +65,7 @@ class Node:
             self.engine = TorchShardEngine(
                 model_id=self.model_id, start_layer=start, end_layer=end,
                 device=self.device, dtype=self.dtype, name=self.name,
+                embed_duty=embed_duty, head_duty=head_duty,
             )
             self.engine.load()
         return {"ok": True, **self.engine.ping_info()}
@@ -79,6 +84,7 @@ class Node:
                 start=msg["start_layer"], end=msg["end_layer"],
                 model_id=msg.get("model_id"), dtype=msg.get("dtype"),
                 device=msg.get("device"),
+                embed_duty=bool(msg.get("embed_duty")), head_duty=bool(msg.get("head_duty")),
             )
         if self.engine is None:
             return {"ok": False, "error": "node not configured — send a 'configure' message first"}
@@ -87,24 +93,32 @@ class Node:
             self._close_session_downsocks(msg["session_id"])  # tear down chain relays too
             return {"ok": True}
         if mtype in ("prefill", "decode"):
-            hidden = protocol.bytes_to_tensor(
-                msg["tensor"], msg["shape"], msg["dtype"], self.engine.device
-            )
             with self._lock:  # serialize the forward; the relay below runs unlocked
+                if msg.get("embed"):
+                    # Thin-head entry: this node embeds the token ids itself, so the
+                    # head sent no tensor — only ints crossed its boundary.
+                    hidden = self.engine.embed(msg["input_ids"])
+                else:
+                    hidden = protocol.bytes_to_tensor(
+                        msg["tensor"], msg["shape"], msg["dtype"], self.engine.device
+                    )
                 out = self.engine.forward(
                     session_id=msg["session_id"], hidden=hidden,
                     position_ids=msg.get("position_ids"), input_ids=msg.get("input_ids"),
                     mode=mtype,
                 )
-            if self.tamper:  # test hook: corrupt the output so drift.verify flags it
-                out = out * 1.2 + 0.1
-            # Chain mode (M7): relay the hidden state straight to the next hop /
-            # collect sink instead of returning it to the caller. The route/collect
-            # fields are optional — absent → classic star (return the tensor).
+                if self.tamper:  # test hook: corrupt the output so drift.verify flags it
+                    out = out * 1.2 + 0.1
+                # Thin-head exit: the last node norms + heads + argmaxes, so only a
+                # token id crosses back — the head does no tensor math.
+                payload = ({"token": self.engine.head_argmax(out)} if self.engine.head_duty
+                           else {"shape": list(out.shape), "dtype": self.engine.dtype,
+                                 "tensor": protocol.tensor_to_bytes(out, self.engine.dtype)})
+            # Chain mode (M7): relay straight to the next hop / collect sink instead
+            # of returning. route/collect are optional — absent → classic star.
             if msg.get("route") is not None:
-                return self._relay(msg, out)
-            return {"ok": True, "shape": list(out.shape), "dtype": self.engine.dtype,
-                    "tensor": protocol.tensor_to_bytes(out, self.engine.dtype), "error": None}
+                return self._relay(msg, payload)
+            return {"ok": True, "error": None, **payload}
         return {"ok": False, "error": f"unknown message type: {mtype}"}
 
     # ------------------------------------------------------------- chain relay
@@ -132,18 +146,18 @@ class Node:
         if ch is not None:
             ch.close()
 
-    def _relay(self, msg: dict, out) -> dict:
-        """Forward the computed hidden state to the next node, or — if this is the
-        tail (empty route) — to the head's collect sink. Returns a tiny ack to the
-        caller so a dropped downstream propagates back up the chain as an error."""
+    def _relay(self, msg: dict, payload: dict) -> dict:
+        """Forward the result to the next node, or — if this is the tail (empty
+        route) — to the head's collect sink. `payload` is a hidden-state tensor
+        (normal / middle node) or a `{token}` (thin-head last node). Returns a tiny
+        ack so a dropped downstream propagates back up the chain as an error."""
         route = msg["route"]
         target = route[0] if route else msg["collect"]
         down = {
             "type": msg["type"], "session_id": msg["session_id"], "seq_id": msg.get("seq_id"),
-            "shape": list(out.shape), "dtype": self.engine.dtype,
             "position_ids": msg.get("position_ids"), "input_ids": msg.get("input_ids"),
-            "tensor": protocol.tensor_to_bytes(out, self.engine.dtype),
             "route": route[1:], "collect": msg["collect"],
+            **payload,
         }
         tgt = (target[0], int(target[1]))
         try:

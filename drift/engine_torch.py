@@ -42,6 +42,8 @@ class TorchShardEngine(ShardEngine):
         dtype: str = "float16",
         name: str | None = None,
         model=None,
+        embed_duty: bool = False,
+        head_duty: bool = False,
     ):
         self.model_id = model_id
         self.start_layer = start_layer
@@ -51,6 +53,9 @@ class TorchShardEngine(ShardEngine):
         self.torch_dtype = _TORCH_DTYPE[dtype]
         self.name = name or f"layers[{start_layer}:{end_layer})"
         self._shared_model = model  # optional pre-loaded model to share (in-process)
+        # M10 thin head: the first node also embeds; the last also norms+heads.
+        self.embed_duty = embed_duty
+        self.head_duty = head_duty
 
         self.lm = None
         self.inner = None
@@ -59,6 +64,9 @@ class TorchShardEngine(ShardEngine):
         self.layers = None
         self.layer_types = None
         self.has_sliding = False
+        self.embed_tokens = None
+        self.norm_mod = None
+        self.lm_head = None
         self.caches: dict[str, DynamicCache] = {}
 
     # ------------------------------------------------------------------ load
@@ -72,12 +80,25 @@ class TorchShardEngine(ShardEngine):
         else:
             # Real node (socket): materialize ONLY this shard's layer slice, so
             # the node never holds the whole model in memory (drift/loader.py).
+            # A thin-head edge node also keeps embed_tokens (first node) and/or
+            # norm + lm_head (last node) — still only its slice + a tiny edge.
+            from transformers import AutoConfig
+
             from .loader import build_sliced
 
+            tie = bool(getattr(AutoConfig.from_pretrained(self.model_id),
+                               "tie_word_embeddings", False))
             keep = [f"model.layers.{i}." for i in range(self.start_layer, self.end_layer)]
+            if self.embed_duty:
+                keep.append("model.embed_tokens.")
+            if self.head_duty:
+                keep.append("model.norm.")
+                # lm_head weight == embed_tokens when tied; otherwise its own tensor.
+                keep.append("model.embed_tokens." if tie else "lm_head.")
             self.lm, _ = build_sliced(
                 self.model_id, self.dtype, self.device,
-                keep_prefixes=keep, need_rotary=True, tie=False,
+                keep_prefixes=keep, need_rotary=True,
+                tie=(None if self.head_duty else False),
             )
 
         self.inner = self.lm.model  # the text transformer (Qwen2Model / Gemma4TextModel)
@@ -118,6 +139,30 @@ class TorchShardEngine(ShardEngine):
             self._cache_config.num_hidden_layers = len(self.layers)
         except Exception:
             self._cache_config = self.config
+
+        # Thin-head edge modules (uses the model's OWN modules, so Gemma's scaled
+        # embedding etc. apply automatically — nothing hardcoded).
+        if self.embed_duty:
+            self.embed_tokens = self.inner.embed_tokens
+        if self.head_duty:
+            self.norm_mod = self.inner.norm
+            self.lm_head = self.lm.lm_head
+
+    # ------------------------------------------------------- thin-head duties
+    @torch.no_grad()
+    def embed(self, input_ids):
+        """Token ids → hidden (first node's duty in thin-head mode)."""
+        if not torch.is_tensor(input_ids):
+            input_ids = torch.tensor([input_ids])
+        if input_ids.dim() == 1:
+            input_ids = input_ids.unsqueeze(0)
+        return self.embed_tokens(input_ids.to(self.device))
+
+    @torch.no_grad()
+    def head_argmax(self, hidden) -> int:
+        """Hidden → norm → lm_head → greedy next-token id (last node's duty)."""
+        logits = self.lm_head(self.norm_mod(hidden[:, -1:, :]))[:, -1, :]
+        return int(torch.argmax(logits, dim=-1))
 
     # --------------------------------------------------------------- forward
     @torch.no_grad()

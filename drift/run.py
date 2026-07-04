@@ -88,12 +88,13 @@ class _Cluster:
     orchestrator then re-prefills the sequence-so-far — bitwise-identical resume.
     """
 
-    def __init__(self, model_id, dtype, head_device, pool, chain):
+    def __init__(self, model_id, dtype, head_device, pool, chain, thin=False):
         self.model_id = model_id
         self.dtype = dtype
         self.head_device = head_device
         self.pool = [dict(e) for e in pool]
         self.chain = chain
+        self.thin = thin
         self.n_layers = model_num_layers(model_id)
 
     def _alive(self) -> list[dict]:
@@ -121,14 +122,17 @@ class _Cluster:
         if not _wait_ready(transport, names):
             raise NodeUnavailable("survivors not reachable while rebuilding")
         _check_env(transport, names)
-        for s, (a, b) in zip(shards, ranges):
-            transport.configure(s["name"], a, b, self.model_id, self.dtype, s.get("device"))
+        last = len(shards) - 1
+        for i, (s, (a, b)) in enumerate(zip(shards, ranges)):
+            transport.configure(s["name"], a, b, self.model_id, self.dtype, s.get("device"),
+                                embed_duty=(self.thin and i == 0),
+                                head_duty=(self.thin and i == last))
         return transport, names
 
 
 def build_over_nodes(model_id: str, dtype: str, head_device: str,
                      endpoints: list[dict], chain: bool = False,
-                     spares: list[dict] | None = None
+                     spares: list[dict] | None = None, thin: bool = False
                      ) -> tuple[Orchestrator, list[dict]]:
     """Endpoints [{name,host,port,device?}] → auto-split, configure, return
     (orchestrator, plan). `plan` is per-node {name,host,port,start,end,device}.
@@ -136,8 +140,12 @@ def build_over_nodes(model_id: str, dtype: str, head_device: str,
     `chain=True` uses the peer-to-peer ChainTransport (node→node→…→collect); the
     default star SocketTransport round-trips every hop through the head. `spares`
     are extra ready nodes held in reserve — on a mid-run drop the orchestrator
-    re-splits over the survivors plus these (M9 failover).
+    re-splits over the survivors plus these (M9 failover). `thin=True` (implies
+    chain) moves embed to the first node and norm+lm_head to the last, so the head
+    holds zero model weights and exchanges only token ids (M10).
     """
+    if thin:
+        chain = True  # thin mode is chain-only (the head exchanges token ids, no tensor)
     n_layers = model_num_layers(model_id)
     ranges = split_layers(n_layers, len(endpoints))
     shards = [dict(e) for e in endpoints]
@@ -147,21 +155,25 @@ def build_over_nodes(model_id: str, dtype: str, head_device: str,
         raise RuntimeError("nodes not reachable — try `drift doctor --nodes <host:port,…>`")
     _check_env(transport, names)
     plan = []
-    for s, (a, b) in zip(shards, ranges):
-        info = transport.configure(s["name"], a, b, model_id, dtype, s.get("device"))
+    last = len(shards) - 1
+    for i, (s, (a, b)) in enumerate(zip(shards, ranges)):
+        info = transport.configure(s["name"], a, b, model_id, dtype, s.get("device"),
+                                   embed_duty=(thin and i == 0), head_duty=(thin and i == last))
         plan.append({**s, "start": a, "end": b, "device": info.get("device")})
-    head = HeadModel(model_id, head_device, dtype, sliced=True)
+    head = HeadModel(model_id, head_device, dtype, sliced=not thin, thin=thin)
     orch = Orchestrator(head, transport, names, head_device)
     orch.cluster = _Cluster(model_id, dtype, head_device,
-                            [*endpoints, *(spares or [])], chain)
+                            [*endpoints, *(spares or [])], chain, thin=thin)
     return orch, plan
 
 
-def _status_bar(model_id: str, plan: list[dict], head_device: str, chain: bool = False) -> None:
+def _status_bar(model_id: str, plan: list[dict], head_device: str,
+                chain: bool = False, thin: bool = False) -> None:
     topo = "chain (node→node→…→head)" if chain else "star (every hop through head)"
+    head_holds = "tokenizer only (zero weights)" if thin else "embed + norm + lm_head"
     print(f"\n  model : {model_id}")
     print(f"  route : {topo}")
-    print(f"  head  : embed + norm + lm_head  · device={head_device}")
+    print(f"  head  : {head_holds}  · device={head_device}")
     for s in plan:
         print(f"  node  : {s['host']}:{s['port']}  layers [{s['start']}:{s['end']})"
               f"  · device={s['device']}")
@@ -240,6 +252,8 @@ def up_main(argv=None) -> int:
     ap.add_argument("--max-new-tokens", type=int)
     ap.add_argument("--chain", action="store_true",
                     help="peer-to-peer chain: nodes stream to each other, not through the head")
+    ap.add_argument("--thin", action="store_true",
+                    help="zero-weight head: embed+lm_head move to the edge nodes (implies --chain)")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -255,8 +269,9 @@ def up_main(argv=None) -> int:
     try:
         endpoints = [{"name": f"n{i}", "host": "127.0.0.1", "port": p}
                      for i, p in enumerate(ports)]
-        orch, plan = build_over_nodes(model_id, dtype, head_device, endpoints, chain=args.chain)
-        _status_bar(model_id, plan, head_device, chain=args.chain)
+        orch, plan = build_over_nodes(model_id, dtype, head_device, endpoints,
+                                      chain=args.chain, thin=args.thin)
+        _status_bar(model_id, plan, head_device, chain=args.chain or args.thin, thin=args.thin)
         if args.prompt:
             _stream(orch, args.prompt, n_new)
         else:
@@ -285,6 +300,8 @@ def main(argv=None) -> int:
     ap.add_argument("--max-new-tokens", type=int)
     ap.add_argument("--chain", action="store_true",
                     help="peer-to-peer chain: nodes stream to each other, not through the head")
+    ap.add_argument("--thin", action="store_true",
+                    help="zero-weight head: embed+lm_head move to the edge nodes (implies --chain)")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -296,8 +313,9 @@ def main(argv=None) -> int:
     endpoints = _select_endpoints(args, cfg)
 
     print(f"[run] {len(endpoints)} node(s); splitting {model_id} …", flush=True)
-    orch, plan = build_over_nodes(model_id, dtype, head_device, endpoints, chain=args.chain)
-    _status_bar(model_id, plan, head_device, chain=args.chain)
+    orch, plan = build_over_nodes(model_id, dtype, head_device, endpoints,
+                                  chain=args.chain, thin=args.thin)
+    _status_bar(model_id, plan, head_device, chain=args.chain or args.thin, thin=args.thin)
     if args.prompt:
         _stream(orch, args.prompt, n_new)
     else:
