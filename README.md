@@ -92,7 +92,7 @@ The name is the system:
 
 | letter | meaning |
 |---|---|
-| **D** — Decentralized | no single controller, no single point of failure; heterogeneous devices join as equal P2P nodes |
+| **D** — Decentralized | no datacenter — heterogeneous personal devices, not a hyperscaler, run the model together. *Honest status: today an orchestrator still coordinates the route and holds embed/head, so it is a single point of failure. A peer-to-peer data plane (nodes stream to each other, not through the head) and a de-privileged head are the active roadmap below — being built, not yet shipped.* |
 | **R** — Routed | an orchestrator *routes* hidden state through the nodes to carry inference forward |
 | **I** — Inference | the workload is LLM inference (extensible to training) |
 | **For T** — For Tokens | the double meaning of "token": the **inference** token (the atom of machine thought) **and** the **value** token (earned by contributing, spent on inference) — DRIFT's vision is to make the unit of thought and the unit of value one |
@@ -392,7 +392,7 @@ docs/               # public docs — benchmarks.md · manual.md
 
 **Is this just pipeline parallelism?** The *idea* is, but the contribution is the **boundary**: PP in vLLM/Megatron is welded to `torch.distributed`+NCCL and can't bridge MPS↔CUDA. DRIFT's boundary is neutral bytes, so heterogeneous vendors join — and it's proven bitwise-exact.
 
-**Does the network see my tokens?** Only integer `input_ids` and float `hidden_states` cross the wire — no text, no KV. And you don't have to trust a node you don't own: `python -m drift.verify` challenges a node with a fixed input and flags any output outside the honest envelope — an honest node matches bitwise, a tampered one is caught.
+**Does the network see my tokens?** Be clear-eyed: `input_ids` are integer token ids, but that is a *reversible* encoding — anyone with the (public) tokenizer turns them straight back into your text, and a downstream shard genuinely needs them for Per-Layer-Embedding models. So **a node operator can read your prompt today.** No KV and no raw strings cross the wire, but "the network can't see my text" would be false. Wire encryption (only nodes you share a key with can read the stream) is on the roadmap below. What you *can* already do is check a node isn't lying about its compute: `python -m drift.verify` challenges a node with a fixed input and flags any output outside the honest envelope — an honest node matches bitwise, a tampered one is caught.
 
 **Can I add a third node?** Yes — the split is a list of layer ranges in `config.yaml`; add a shard entry and the orchestrator routes through it in order. The wire contract doesn't change.
 
