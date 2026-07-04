@@ -93,6 +93,9 @@ class InProcessTransport:
     def ping(self, name):
         return {"ok": True, **self.engines[name].ping_info()}
 
+    def close(self):
+        pass
+
 
 class SocketTransport:
     """M3+: speak the §6 protocol over TCP."""
@@ -180,6 +183,14 @@ class SocketTransport:
         ch = self._sock(name)
         ch.send({"type": "ping"})
         return ch.recv()
+
+    def close(self):
+        for ch in list(self.socks.values()):
+            try:
+                ch.close()
+            except Exception:
+                pass
+        self.socks.clear()
 
 
 class ChainTransport(SocketTransport):
@@ -275,6 +286,13 @@ class ChainTransport(SocketTransport):
                 "chain tail never reached the collect sink — a node dropped mid-chain") from e
         return protocol.bytes_to_tensor(reply["tensor"], reply["shape"], reply["dtype"], self.device)
 
+    def close(self):
+        try:
+            self._collect_srv.close()  # unblocks the accept loop (OSError → returns)
+        except Exception:
+            pass
+        super().close()
+
 
 # ---------------------------------------------------------------- orchestrator
 class Orchestrator:
@@ -283,44 +301,85 @@ class Orchestrator:
         self.transport = transport
         self.order = order  # shard names, in routing order
         self.device = device
+        # M9 failover: a cluster that can re-split over survivors, or None (no recovery).
+        self.cluster = None
+        self.recoveries = 0   # how many times a mid-run drop was recovered
+        self.progress = 0     # tokens produced so far (lets a watcher time a kill)
+
+    def _eos_set(self, stop_on_eos: bool) -> set[int]:
+        """The narrow EOS id set (not all special ids, which stop on benign tokens)."""
+        eos: set[int] = set()
+        if not stop_on_eos:
+            return eos
+        tok = self.head.tokenizer
+        if tok.eos_token_id is not None:
+            eos.add(int(tok.eos_token_id))
+        gen_eos = getattr(getattr(self.head.lm, "generation_config", None), "eos_token_id", None)
+        if isinstance(gen_eos, int):
+            eos.add(gen_eos)
+        elif isinstance(gen_eos, (list, tuple)):
+            eos.update(int(x) for x in gen_eos)
+        return eos
+
+    def _recover(self, session_id: str) -> None:
+        """A node dropped mid-run: re-split over the survivors (+ spares), so the
+        caller can re-prefill the sequence-so-far and continue. Raises if no
+        cluster is attached or nothing survives."""
+        if self.cluster is None:
+            raise NodeUnavailable("a node dropped and no cluster is attached for recovery")
+        old = self.transport
+        self.transport, self.order = self.cluster.rebuild()
+        self.recoveries += 1
+        try:
+            old.close()
+        except Exception:
+            pass
+        for name in self.order:  # clear any stale KV; a fresh re-prefill follows
+            try:
+                self.transport.reset(name, session_id)
+            except Exception:
+                pass
 
     @torch.no_grad()
     def generate(self, prompt: str, max_new_tokens: int, stop_on_eos: bool = False,
                  session_id: str = "s0") -> dict:
         tok = self.head.tokenizer
         input_ids = build_input_ids(tok, prompt).to(self.device)
-        S = input_ids.shape[1]
-        # Narrow EOS set (not all special ids, which would stop on benign tokens).
-        eos: set[int] = set()
-        if stop_on_eos:
-            if tok.eos_token_id is not None:
-                eos.add(int(tok.eos_token_id))
-            gen_eos = getattr(getattr(self.head.lm, "generation_config", None), "eos_token_id", None)
-            if isinstance(gen_eos, int):
-                eos.add(gen_eos)
-            elif isinstance(gen_eos, (list, tuple)):
-                eos.update(int(x) for x in gen_eos)
+        prompt_ids = input_ids[0].tolist()
+        eos = self._eos_set(stop_on_eos)
 
-        hidden = self.head.embed(input_ids)
-        pos = list(range(S))
-        ids_list = input_ids[0].tolist()
-        hidden = self.transport.route(self.order, session_id, hidden, pos, ids_list, "prefill").to(self.device)
-
-        logits = self.head.head(self.head.norm(hidden[:, -1:, :]))[:, -1, :]
-        first_logits = logits[0].detach().float().cpu().numpy()
-        next_id = int(torch.argmax(logits, dim=-1))
-        generated = [next_id]
-        p = S
-        for _ in range(max_new_tokens - 1):
-            if stop_on_eos and next_id in eos:
-                break
-            cur = torch.tensor([[next_id]], device=self.device)
-            hidden = self.head.embed(cur)
-            hidden = self.transport.route(self.order, session_id, hidden, [p], [next_id], "decode").to(self.device)
-            logits = self.head.head(self.head.norm(hidden[:, -1:, :]))[:, -1, :]
-            next_id = int(torch.argmax(logits, dim=-1))
-            generated.append(next_id)
-            p += 1
+        generated: list[int] = []
+        first_logits = None
+        while True:  # (re)start on a mid-run node drop (M9)
+            try:
+                # (Re)prefill the whole sequence so far. Fresh start → seq = prompt;
+                # after a drop → prompt + tokens-generated-so-far, which rebuilds every
+                # survivor's KV. Greedy decoding is deterministic over a fixed prefix, so
+                # the prefill's argmax is exactly the next token an uninterrupted run would
+                # emit — the recovered continuation is bitwise-identical.
+                seq = prompt_ids + generated
+                hidden = self.head.embed(torch.tensor([seq], device=self.device))
+                hidden = self.transport.route(self.order, session_id, hidden,
+                                              list(range(len(seq))), seq, "prefill").to(self.device)
+                logits = self.head.head(self.head.norm(hidden[:, -1:, :]))[:, -1, :]
+                if first_logits is None:
+                    first_logits = logits[0].detach().float().cpu().numpy()
+                next_id = int(torch.argmax(logits, dim=-1))
+                p = len(seq)
+                while len(generated) < max_new_tokens:
+                    generated.append(next_id)
+                    self.progress = len(generated)
+                    if (stop_on_eos and next_id in eos) or len(generated) >= max_new_tokens:
+                        break
+                    hidden = self.head.embed(torch.tensor([[next_id]], device=self.device))
+                    hidden = self.transport.route(self.order, session_id, hidden,
+                                                  [p], [next_id], "decode").to(self.device)
+                    logits = self.head.head(self.head.norm(hidden[:, -1:, :]))[:, -1, :]
+                    next_id = int(torch.argmax(logits, dim=-1))
+                    p += 1
+                break  # finished with no unrecovered drop
+            except NodeUnavailable:
+                self._recover(session_id)  # re-split over survivors, then the loop re-prefills
 
         for name in self.order:
             self.transport.reset(name, session_id)

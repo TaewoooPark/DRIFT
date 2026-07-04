@@ -23,6 +23,8 @@ import binascii
 import os
 import subprocess
 import sys
+import threading
+import time
 
 from .common import free_port, load_config, pick_device
 from .orchestrator import build_inprocess
@@ -59,6 +61,72 @@ def _teardown(procs: list[subprocess.Popen]) -> None:
             pr.kill()
 
 
+def _kill_test(cfg, model_id, dtype, dev, args) -> int:
+    """M9: start `nodes` active + 1 spare, kill node K mid-generation, and assert
+    the recovered sequence is bitwise-identical to an uninterrupted reference."""
+    tag = "kill" + ("+secure" if args.secure else "") + ("+chain" if args.chain else "")
+    prompt, n = "Count from one to forty in words.", 48
+
+    print(f"[itest:{tag}] building in-process reference …", flush=True)
+    ref = build_inprocess(cfg)
+    ref_ids = ref.generate(prompt, n, stop_on_eos=False, session_id="ref")["token_ids"]
+
+    print(f"[itest:{tag}] spawning {args.nodes} active + 1 spare node(s) …", flush=True)
+    ports, procs = spawn_nodes(args.nodes + 1)
+    try:
+        active = [{"name": f"n{i}", "host": "127.0.0.1", "port": p}
+                  for i, p in enumerate(ports[:args.nodes])]
+        spare = [{"name": "spare", "host": "127.0.0.1", "port": ports[-1]}]
+        orch, plan = build_over_nodes(model_id, dtype, dev, active, chain=args.chain, spares=spare)
+        print(f"[itest:{tag}] split: " +
+              " · ".join(f"{p['name']}[{p['start']}:{p['end']})" for p in plan) +
+              "  (+1 spare held in reserve)", flush=True)
+
+        result, err = {}, {}
+
+        def run():
+            try:
+                result["ids"] = orch.generate(prompt, n, stop_on_eos=False,
+                                              session_id="kill")["token_ids"]
+            except Exception as e:  # noqa: BLE001 — surfaced below
+                err["e"] = e
+
+        th = threading.Thread(target=run)
+        th.start()
+        # Let a few tokens land (KV is built), then kill node K mid-decode.
+        t0 = time.time()
+        while orch.progress < 4 and th.is_alive() and time.time() - t0 < 120:
+            time.sleep(0.02)
+        print(f"[itest:{tag}] killing node index {args.kill} at progress={orch.progress} tokens …",
+              flush=True)
+        victim = procs[args.kill]
+        victim.terminate()
+        try:
+            victim.wait(timeout=10)
+        except Exception:
+            victim.kill()
+        th.join(timeout=300)
+
+        if err:
+            print(f"[itest:{tag}] FAIL — generation raised: {type(err['e']).__name__}: {err['e']}",
+                  flush=True)
+            return 1
+        got = result.get("ids", [])
+        div = next((i for i in range(min(len(got), len(ref_ids))) if got[i] != ref_ids[i]), None)
+        exact = got == ref_ids
+        recovered = orch.recoveries >= 1
+        print(f"[itest:{tag}] recoveries={orch.recoveries}  tokens={len(got)}  "
+              f"bitwise=={exact}  first_div={div}", flush=True)
+        good = exact and recovered
+        print(f"[itest:{tag}]",
+              "PASS — bitwise-identical resume after a mid-run node kill" if good
+              else "FAIL — " + ("no recovery was triggered" if exact and not recovered
+                                else "recovered sequence diverged"), flush=True)
+        return 0 if good else 1
+    finally:
+        _teardown(procs)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="DRIFT integration parity gate (real nodes over TCP)")
     ap.add_argument("--config", default="config.yaml")
@@ -66,18 +134,23 @@ def main(argv=None) -> int:
     ap.add_argument("--chain", action="store_true", help="peer-to-peer chain transport (M7)")
     ap.add_argument("--secure", action="store_true",
                     help="encrypt the wire with a throwaway network key (M8)")
+    ap.add_argument("--kill", type=int, default=None, metavar="K",
+                    help="M9: kill node index K mid-generation; assert bitwise-identical recovery")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
     model_id, dtype = cfg["model_id"], cfg.get("dtype", "float16")
     dev = pick_device(cfg.get("device"))
-    topo = "chain" if args.chain else "star"
 
     if args.secure:
         # A throwaway network key, shared with the spawned nodes via the inherited
         # environment. Proves the AEAD channel is bitwise-transparent to parity.
         os.environ["DRIFT_NETWORK_KEY"] = binascii.hexlify(os.urandom(32)).decode()
-        topo += "+secure"
+
+    if args.kill is not None:
+        return _kill_test(cfg, model_id, dtype, dev, args)
+
+    topo = ("chain" if args.chain else "star") + ("+secure" if args.secure else "")
 
     print(f"[itest:{topo}] building in-process reference …", flush=True)
     ref = build_inprocess(cfg)

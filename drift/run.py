@@ -67,28 +67,82 @@ def _check_env(transport: SocketTransport, names: list[str]) -> None:
                       f"internals can differ across versions and break bitwise parity", flush=True)
 
 
+def _make_transport(shards: list[dict], dtype: str, head_device: str, chain: bool):
+    """A star or chain transport over `shards` (chain picks a reachable collect host)."""
+    if not chain:
+        return SocketTransport(shards, dtype, head_device)
+    # The tail dials the head's collect sink. For an all-localhost run use loopback
+    # (avoids routing self-traffic over the LAN interface, where a firewall can
+    # silently drop it); otherwise the head's LAN address.
+    all_local = all(s["host"] in _LOCAL_HOSTS for s in shards)
+    collect_host = "127.0.0.1" if all_local else lan_ip()
+    return ChainTransport(shards, dtype, head_device, collect_host=collect_host)
+
+
+class _Cluster:
+    """Re-splits a model over whichever pool nodes are still alive (M9 failover).
+
+    The pool is the initial nodes plus any spares. On a mid-run drop the
+    orchestrator calls `rebuild()`, which pings the pool, splits the layers across
+    the survivors, configures them, and returns a fresh (transport, order). The
+    orchestrator then re-prefills the sequence-so-far — bitwise-identical resume.
+    """
+
+    def __init__(self, model_id, dtype, head_device, pool, chain):
+        self.model_id = model_id
+        self.dtype = dtype
+        self.head_device = head_device
+        self.pool = [dict(e) for e in pool]
+        self.chain = chain
+        self.n_layers = model_num_layers(model_id)
+
+    def _alive(self) -> list[dict]:
+        alive = []
+        for e in self.pool:
+            t = SocketTransport([e], self.dtype, self.head_device)
+            try:
+                if t.ping(e["name"]).get("ok"):
+                    alive.append(e)
+            except Exception:
+                pass
+            finally:
+                t.close()
+        return alive
+
+    def rebuild(self):
+        from .orchestrator import NodeUnavailable
+        alive = self._alive()
+        if not alive:
+            raise NodeUnavailable("no surviving nodes to rebuild the pipeline over")
+        ranges = split_layers(self.n_layers, len(alive))
+        shards = [dict(e) for e in alive]
+        names = [s["name"] for s in shards]
+        transport = _make_transport(shards, self.dtype, self.head_device, self.chain)
+        if not _wait_ready(transport, names):
+            raise NodeUnavailable("survivors not reachable while rebuilding")
+        _check_env(transport, names)
+        for s, (a, b) in zip(shards, ranges):
+            transport.configure(s["name"], a, b, self.model_id, self.dtype, s.get("device"))
+        return transport, names
+
+
 def build_over_nodes(model_id: str, dtype: str, head_device: str,
-                     endpoints: list[dict], chain: bool = False
+                     endpoints: list[dict], chain: bool = False,
+                     spares: list[dict] | None = None
                      ) -> tuple[Orchestrator, list[dict]]:
     """Endpoints [{name,host,port,device?}] → auto-split, configure, return
     (orchestrator, plan). `plan` is per-node {name,host,port,start,end,device}.
 
     `chain=True` uses the peer-to-peer ChainTransport (node→node→…→collect); the
-    default star SocketTransport round-trips every hop through the head.
+    default star SocketTransport round-trips every hop through the head. `spares`
+    are extra ready nodes held in reserve — on a mid-run drop the orchestrator
+    re-splits over the survivors plus these (M9 failover).
     """
     n_layers = model_num_layers(model_id)
     ranges = split_layers(n_layers, len(endpoints))
     shards = [dict(e) for e in endpoints]
     names = [s["name"] for s in shards]
-    if chain:
-        # The tail dials the head's collect sink. For an all-localhost run use
-        # loopback (avoids routing self-traffic over the LAN interface, where a
-        # firewall can silently drop it); otherwise the head's LAN address.
-        all_local = all(s["host"] in _LOCAL_HOSTS for s in shards)
-        collect_host = "127.0.0.1" if all_local else lan_ip()
-        transport = ChainTransport(shards, dtype, head_device, collect_host=collect_host)
-    else:
-        transport = SocketTransport(shards, dtype, head_device)
+    transport = _make_transport(shards, dtype, head_device, chain)
     if not _wait_ready(transport, names):
         raise RuntimeError("nodes not reachable — try `drift doctor --nodes <host:port,…>`")
     _check_env(transport, names)
@@ -97,7 +151,10 @@ def build_over_nodes(model_id: str, dtype: str, head_device: str,
         info = transport.configure(s["name"], a, b, model_id, dtype, s.get("device"))
         plan.append({**s, "start": a, "end": b, "device": info.get("device")})
     head = HeadModel(model_id, head_device, dtype, sliced=True)
-    return Orchestrator(head, transport, names, head_device), plan
+    orch = Orchestrator(head, transport, names, head_device)
+    orch.cluster = _Cluster(model_id, dtype, head_device,
+                            [*endpoints, *(spares or [])], chain)
+    return orch, plan
 
 
 def _status_bar(model_id: str, plan: list[dict], head_device: str, chain: bool = False) -> None:
