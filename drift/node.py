@@ -30,6 +30,8 @@ def main(argv=None) -> int:
     ap.add_argument("--tunnel", action="store_true",
                     help="expose this node over a public bore.pub tunnel (for NAT/Colab/cloud) — "
                          "no account needed; the head connects with `drift run --nodes <printed>`")
+    ap.add_argument("--tamper", action="store_true",
+                    help="TEST ONLY: corrupt this node's output so the head's receipt verifier flags it")
     args = ap.parse_args(argv)
 
     cfg = {}
@@ -53,6 +55,7 @@ def main(argv=None) -> int:
     port = args.port or int(os.environ.get("DRIFT_PORT") or free_port())
     node = Node(name=f"node-{port}", model_id=cfg.get("model_id", "(assigned by head)"),
                 dtype=cfg.get("dtype", "float16"), device=device)
+    node.tamper = args.tamper
     ip = lan_ip()
 
     # Public tunnel (for a node behind NAT / on Colab / on a cloud VM).

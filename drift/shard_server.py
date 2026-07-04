@@ -22,7 +22,7 @@ import threading
 
 import yaml
 
-from . import crypto, protocol
+from . import crypto, protocol, receipts
 from .engine_torch import TorchShardEngine
 
 def load_config(path: str = "config.yaml") -> dict:
@@ -50,6 +50,14 @@ class Node:
         self._lock = threading.Lock()          # serializes engine compute
         self._down: dict = {}                  # (host,port,session) -> socket to the next hop
         self._down_lock = threading.Lock()     # guards the _down cache
+        self._sk = None                        # Ed25519 identity (lazy)
+        self._pub = None
+
+    def _identity(self):
+        if self._sk is None:
+            self._sk = crypto.load_identity()
+            self._pub = crypto.identity_pubkey_hex(self._sk)
+        return self._sk, self._pub
 
     def configure(self, start: int, end: int, model_id: str | None = None,
                   dtype: str | None = None, device: str | None = None,
@@ -68,16 +76,18 @@ class Node:
                 embed_duty=embed_duty, head_duty=head_duty,
             )
             self.engine.load()
-        return {"ok": True, **self.engine.ping_info()}
+        return {"ok": True, "pubkey": self._identity()[1], **self.engine.ping_info()}
 
     def handle(self, msg: dict) -> dict:
         mtype = msg.get("type")
         if mtype == "ping":
             from .common import env_info
 
+            _, pub = self._identity()
             if self.engine is not None:
-                return {"ok": True, "assigned": True, **self.engine.ping_info(), **env_info()}
-            return {"ok": True, "assigned": False, "name": self.name,
+                return {"ok": True, "assigned": True, "pubkey": pub,
+                        **self.engine.ping_info(), **env_info()}
+            return {"ok": True, "assigned": False, "name": self.name, "pubkey": pub,
                     "device": self.device, "loaded": False, **env_info()}
         if mtype == "configure":
             return self.configure(
@@ -98,22 +108,44 @@ class Node:
                     # Thin-head entry: this node embeds the token ids itself, so the
                     # head sent no tensor — only ints crossed its boundary.
                     hidden = self.engine.embed(msg["input_ids"])
+                    in_hash = receipts.hash_ints(msg["input_ids"])
                 else:
+                    tb_in = msg["tensor"]
                     hidden = protocol.bytes_to_tensor(
-                        msg["tensor"], msg["shape"], msg["dtype"], self.engine.device
+                        tb_in, msg["shape"], msg["dtype"], self.engine.device
                     )
+                    in_hash = receipts.hash_bytes(tb_in)
                 out = self.engine.forward(
                     session_id=msg["session_id"], hidden=hidden,
                     position_ids=msg.get("position_ids"), input_ids=msg.get("input_ids"),
                     mode=mtype,
                 )
-                if self.tamper:  # test hook: corrupt the output so drift.verify flags it
-                    out = out * 1.2 + 0.1
                 # Thin-head exit: the last node norms + heads + argmaxes, so only a
                 # token id crosses back — the head does no tensor math.
-                payload = ({"token": self.engine.head_argmax(out)} if self.engine.head_duty
-                           else {"shape": list(out.shape), "dtype": self.engine.dtype,
-                                 "tensor": protocol.tensor_to_bytes(out, self.engine.dtype)})
+                if self.engine.head_duty:
+                    token = self.engine.head_argmax(out)
+                    payload = {"token": token}
+                    out_hash = receipts.hash_ints([token])
+                else:
+                    tb_out = protocol.tensor_to_bytes(out, self.engine.dtype)
+                    payload = {"shape": list(out.shape), "dtype": self.engine.dtype, "tensor": tb_out}
+                    out_hash = receipts.hash_bytes(tb_out)
+                # Sign a receipt over the HONEST input/output (M11). The tamper hook
+                # then corrupts only the wire payload — so the honest out_hash no
+                # longer matches what's sent, and the head's adjacency/anchor check
+                # catches it on live traffic.
+                sk, pub = self._identity()
+                receipt = receipts.make_receipt(
+                    sk, pub, msg["session_id"], msg.get("seq_id") or 0, mtype,
+                    self.engine.start_layer, self.engine.end_layer, in_hash, out_hash)
+                if self.tamper:
+                    if "token" in payload:
+                        payload = {"token": int(payload["token"]) ^ 1}
+                    else:
+                        bad = out * 1.2 + 0.1
+                        payload = {"shape": list(bad.shape), "dtype": self.engine.dtype,
+                                   "tensor": protocol.tensor_to_bytes(bad, self.engine.dtype)}
+                payload["receipt"] = receipt
             # Chain mode (M7): relay straight to the next hop / collect sink instead
             # of returning. route/collect are optional — absent → classic star.
             if msg.get("route") is not None:
@@ -153,10 +185,16 @@ class Node:
         ack so a dropped downstream propagates back up the chain as an error."""
         route = msg["route"]
         target = route[0] if route else msg["collect"]
+        # Accumulate this hop's receipt so the tail delivers the whole chain to the
+        # head's collect sink (the head verifies signatures + adjacency per token).
+        receipt = payload.pop("receipt", None)
+        chain_receipts = list(msg.get("receipts", []))
+        if receipt is not None:
+            chain_receipts.append(receipt)
         down = {
             "type": msg["type"], "session_id": msg["session_id"], "seq_id": msg.get("seq_id"),
             "position_ids": msg.get("position_ids"), "input_ids": msg.get("input_ids"),
-            "route": route[1:], "collect": msg["collect"],
+            "route": route[1:], "collect": msg["collect"], "receipts": chain_receipts,
             **payload,
         }
         tgt = (target[0], int(target[1]))

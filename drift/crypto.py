@@ -116,6 +116,24 @@ def identity_pubkey_hex(sk=None) -> str:
     return binascii.hexlify(pub).decode()
 
 
+def sign(sk, data: bytes) -> bytes:
+    """Ed25519 signature over `data` (used for the per-hop receipts, M11)."""
+    return sk.sign(data)
+
+
+def verify_sig(pub_hex: str, sig: bytes, data: bytes) -> bool:
+    """True iff `sig` is a valid Ed25519 signature over `data` by `pub_hex`."""
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    try:
+        pub = Ed25519PublicKey.from_public_bytes(binascii.unhexlify(pub_hex))
+        pub.verify(sig, data)
+        return True
+    except (InvalidSignature, ValueError, binascii.Error):
+        return False
+
+
 # ------------------------------------------------------------------- channels
 class PlainChannel:
     """Unkeyed transport: msgpack frames, no encryption (local dev)."""

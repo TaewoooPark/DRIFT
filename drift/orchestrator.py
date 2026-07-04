@@ -15,9 +15,10 @@ import threading
 
 import torch
 
-from . import crypto, protocol
+from . import crypto, protocol, receipts
 from .common import build_input_ids, lan_ip, load_config
 from .engine_torch import TorchShardEngine
+from .receipts import ReceiptVerifier
 
 
 class NodeUnavailable(RuntimeError):
@@ -120,6 +121,12 @@ class SocketTransport:
         self.device = device
         self.socks: dict = {}
         self.seq = 0
+        # M11: per-token receipts + head anchors, read by the orchestrator's verifier.
+        self.last_receipts: list = []
+        self.last_anchor_in = None
+        self.last_anchor_out = None
+        self._last_receipt = None
+        self._last_recv_hash = None
 
     def _sock(self, name):
         """A cached channel to a node (encrypted when a network key is set)."""
@@ -163,13 +170,20 @@ class SocketTransport:
         reply = self._roundtrip(name, msg)
         if not reply.get("ok"):
             raise RuntimeError(f"shard {name} error: {reply.get('error')}")
+        self._last_receipt = reply.get("receipt")
+        self._last_recv_hash = receipts.hash_bytes(reply["tensor"]) if "tensor" in reply else None
         return protocol.bytes_to_tensor(reply["tensor"], reply["shape"], reply["dtype"], self.device)
 
     def route(self, names, session_id, hidden, position_ids, input_ids, mode):
         """Star routing: every hop round-trips through the head (2N crossings/token)."""
+        self.last_receipts = []
+        self.last_anchor_in = receipts.hash_bytes(protocol.tensor_to_bytes(hidden, self.dtype))
         for name in names:
             hidden = self.forward(name, session_id, hidden, position_ids, input_ids, mode)
             hidden = hidden.to(self.device)
+            if self._last_receipt is not None:
+                self.last_receipts.append(self._last_receipt)
+        self.last_anchor_out = self._last_recv_hash
         return hidden
 
     def reset(self, name, session_id):
@@ -291,6 +305,7 @@ class ChainTransport(SocketTransport):
             "route": downstream,
             "collect": [self.collect_host, self.collect_port],
         }
+        self.last_anchor_in = receipts.hash_bytes(msg["tensor"])
         q = self._q(session_id)
         ack = self._roundtrip(first, msg)  # first node relays down the chain
         if not ack.get("ok"):
@@ -300,6 +315,8 @@ class ChainTransport(SocketTransport):
         except queue.Empty as e:
             raise NodeUnavailable(
                 "chain tail never reached the collect sink — a node dropped mid-chain") from e
+        self.last_receipts = reply.get("receipts", [])
+        self.last_anchor_out = receipts.hash_bytes(reply["tensor"])
         return protocol.bytes_to_tensor(reply["tensor"], reply["shape"], reply["dtype"], self.device)
 
     def route_token(self, names, session_id, input_ids, position_ids, mode) -> int:
@@ -317,6 +334,7 @@ class ChainTransport(SocketTransport):
             "route": downstream,
             "collect": [self.collect_host, self.collect_port],
         }
+        self.last_anchor_in = receipts.hash_ints(input_ids)
         q = self._q(session_id)
         ack = self._roundtrip(first, msg)
         if not ack.get("ok"):
@@ -326,6 +344,8 @@ class ChainTransport(SocketTransport):
         except queue.Empty as e:
             raise NodeUnavailable(
                 "chain tail never reached the collect sink — a node dropped mid-chain") from e
+        self.last_receipts = reply.get("receipts", [])
+        self.last_anchor_out = receipts.hash_ints([int(reply["token"])])
         return int(reply["token"])
 
     def close(self):
@@ -348,6 +368,19 @@ class Orchestrator:
         self.cluster = None
         self.recoveries = 0   # how many times a mid-run drop was recovered
         self.progress = 0     # tokens produced so far (lets a watcher time a kill)
+        # M11: verify each token's signed receipts against the head's anchors.
+        self.verify = False
+        self.verifier: ReceiptVerifier | None = None
+        self.n_layers = None
+
+    def _check_receipts(self) -> None:
+        if not self.verify or self.verifier is None:
+            return
+        t = self.transport
+        r = getattr(t, "last_receipts", None)
+        if r:
+            self.verifier.check(r, getattr(t, "last_anchor_in", None),
+                                getattr(t, "last_anchor_out", None), self.n_layers)
 
     def _eos_set(self, stop_on_eos: bool) -> set[int]:
         """The narrow EOS id set (not all special ids, which stop on benign tokens)."""
@@ -372,20 +405,25 @@ class Orchestrator:
         if self.thin:
             nid = self.transport.route_token(self.order, session_id, seq_ids,
                                              list(range(len(seq_ids))), "prefill")
+            self._check_receipts()
             return nid, None
         hidden = self.head.embed(torch.tensor([seq_ids], device=self.device))
         hidden = self.transport.route(self.order, session_id, hidden,
                                       list(range(len(seq_ids))), seq_ids, "prefill").to(self.device)
+        self._check_receipts()
         logits = self.head.head(self.head.norm(hidden[:, -1:, :]))[:, -1, :]
         return int(torch.argmax(logits, dim=-1)), logits[0].detach().float().cpu().numpy()
 
     def _decode(self, session_id, tok_id, pos):
         """Feed one token at absolute position `pos`; return the next token id."""
         if self.thin:
-            return self.transport.route_token(self.order, session_id, [tok_id], [pos], "decode")
+            nid = self.transport.route_token(self.order, session_id, [tok_id], [pos], "decode")
+            self._check_receipts()
+            return nid
         hidden = self.head.embed(torch.tensor([[tok_id]], device=self.device))
         hidden = self.transport.route(self.order, session_id, hidden, [pos], [tok_id],
                                       "decode").to(self.device)
+        self._check_receipts()
         logits = self.head.head(self.head.norm(hidden[:, -1:, :]))[:, -1, :]
         return int(torch.argmax(logits, dim=-1))
 

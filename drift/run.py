@@ -159,11 +159,17 @@ def build_over_nodes(model_id: str, dtype: str, head_device: str,
     for i, (s, (a, b)) in enumerate(zip(shards, ranges)):
         info = transport.configure(s["name"], a, b, model_id, dtype, s.get("device"),
                                    embed_duty=(thin and i == 0), head_duty=(thin and i == last))
-        plan.append({**s, "start": a, "end": b, "device": info.get("device")})
+        plan.append({**s, "start": a, "end": b, "device": info.get("device"),
+                     "pubkey": info.get("pubkey")})
     head = HeadModel(model_id, head_device, dtype, sliced=not thin, thin=thin)
     orch = Orchestrator(head, transport, names, head_device)
     orch.cluster = _Cluster(model_id, dtype, head_device,
                             [*endpoints, *(spares or [])], chain, thin=thin)
+    # M11: verify each token's signed receipts against the head's anchors.
+    from .receipts import ReceiptVerifier
+    orch.verify = True
+    orch.verifier = ReceiptVerifier()
+    orch.n_layers = n_layers
     return orch, plan
 
 

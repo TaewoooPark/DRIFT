@@ -37,17 +37,25 @@ _CASES = [
 ]
 
 
-def spawn_nodes(n: int, extra: list[str] | None = None) -> tuple[list[int], list[subprocess.Popen]]:
-    """Launch n unassigned local `drift node` workers; return (ports, procs)."""
+def spawn_nodes(n: int, extra: list[str] | None = None,
+                tamper_idx: int | None = None) -> tuple[list[int], list[subprocess.Popen]]:
+    """Launch n unassigned local `drift node` workers; return (ports, procs).
+
+    Each node gets its OWN identity file (distinct Ed25519 keypair) so it models a
+    distinct machine — the M11 receipts/reputation key by node pubkey. `tamper_idx`
+    makes that one node corrupt its output so the head's verifier flags it.
+    """
     ports = [free_port() for _ in range(n)]
-    procs = [
-        subprocess.Popen(
-            [sys.executable, "-m", "drift.node", "--port", str(p), "--host", "127.0.0.1",
-             "--quiet", "--no-advertise", *(extra or [])],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        for p in ports
-    ]
+    procs = []
+    for i, p in enumerate(ports):
+        env = dict(os.environ)
+        env["DRIFT_IDENTITY_FILE"] = f"/tmp/drift_id_{p}.key"
+        args = [sys.executable, "-m", "drift.node", "--port", str(p), "--host", "127.0.0.1",
+                "--quiet", "--no-advertise", *(extra or [])]
+        if i == tamper_idx:
+            args.append("--tamper")
+        procs.append(subprocess.Popen(args, env=env,
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
     return ports, procs
 
 
@@ -59,6 +67,49 @@ def _teardown(procs: list[subprocess.Popen]) -> None:
             pr.wait(timeout=10)
         except Exception:
             pr.kill()
+
+
+def _tamper_test(cfg, model_id, dtype, dev, args) -> int:
+    """M11: run an ordinary generation with node K corrupting its output, and
+    assert the head's live receipt verifier flags K as SUSPECT (no separate
+    challenge). Then confirm an honest run of the same shape flags nobody."""
+    tag = "tamper" + ("+thin" if args.thin else "")
+    prompt, n = "Give me a short introduction to large language models.", 16
+
+    print(f"[itest:{tag}] spawning {args.nodes} node(s); node {args.tamper} tampers …", flush=True)
+    ports, procs = spawn_nodes(args.nodes, tamper_idx=args.tamper)
+    try:
+        endpoints = [{"name": f"n{i}", "host": "127.0.0.1", "port": p}
+                     for i, p in enumerate(ports)]
+        orch, plan = build_over_nodes(model_id, dtype, dev, endpoints, chain=True, thin=args.thin)
+        victim = plan[args.tamper].get("pubkey")
+        orch.generate(prompt, n, stop_on_eos=False, session_id="tamper")
+        suspects = set(orch.verifier.suspects())
+        caught = victim in suspects
+        print(f"[itest:{tag}] verifier checked {orch.verifier.checked} tokens; "
+              f"tampering node {args.tamper} (pub {victim[:12]}…) → "
+              f"{'CAUGHT' if caught else 'MISSED'}; {len(suspects)} suspect(s)", flush=True)
+    finally:
+        _teardown(procs)
+
+    # Honest baseline: same shape, no tamper → the verifier must flag NObody.
+    print(f"[itest:{tag}] honest baseline (no tamper) …", flush=True)
+    ports2, procs2 = spawn_nodes(args.nodes)
+    try:
+        endpoints = [{"name": f"n{i}", "host": "127.0.0.1", "port": p}
+                     for i, p in enumerate(ports2)]
+        orch2, _ = build_over_nodes(model_id, dtype, dev, endpoints, chain=True, thin=args.thin)
+        orch2.generate(prompt, n, stop_on_eos=False, session_id="honest")
+        clean = orch2.verifier.suspects()
+        print(f"[itest:{tag}] honest run: {len(clean)} suspect(s) "
+              f"over {orch2.verifier.checked} tokens", flush=True)
+    finally:
+        _teardown(procs2)
+
+    good = caught and not clean
+    print(f"[itest:{tag}]",
+          "PASS — tamper caught on live traffic, honest run clean" if good else "FAIL", flush=True)
+    return 0 if good else 1
 
 
 def _kill_test(cfg, model_id, dtype, dev, args) -> int:
@@ -138,6 +189,8 @@ def main(argv=None) -> int:
                     help="zero-weight head; embed+head move to the edge nodes (M10, implies chain)")
     ap.add_argument("--kill", type=int, default=None, metavar="K",
                     help="M9: kill node index K mid-generation; assert bitwise-identical recovery")
+    ap.add_argument("--tamper", type=int, default=None, metavar="K",
+                    help="M11: node K corrupts its output; assert the receipt verifier flags it")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -149,6 +202,8 @@ def main(argv=None) -> int:
         # environment. Proves the AEAD channel is bitwise-transparent to parity.
         os.environ["DRIFT_NETWORK_KEY"] = binascii.hexlify(os.urandom(32)).decode()
 
+    if args.tamper is not None:
+        return _tamper_test(cfg, model_id, dtype, dev, args)
     if args.kill is not None:
         return _kill_test(cfg, model_id, dtype, dev, args)
 
@@ -177,8 +232,15 @@ def main(argv=None) -> int:
             all_ok &= ok
             print(f"[itest:{topo}] {'PASS' if ok else 'FAIL'} n={n:>3} "
                   f"first_div={div} prompt={prompt[:32]!r}", flush=True)
+        # M11: honest traffic must leave the receipt verifier with zero suspects.
+        suspects = orch.verifier.suspects() if orch.verifier else []
+        clean = not suspects
+        print(f"[itest:{topo}] receipts verified over {orch.verifier.checked if orch.verifier else 0} "
+              f"tokens · suspects={len(suspects)}", flush=True)
+        all_ok = all_ok and clean
         print(f"[itest:{topo}]",
-              "ALL PASS — bitwise == in-process reference" if all_ok else "FAIL", flush=True)
+              "ALL PASS — bitwise == in-process reference, receipts clean" if all_ok else "FAIL",
+              flush=True)
         return 0 if all_ok else 1
     finally:
         _teardown(procs)
