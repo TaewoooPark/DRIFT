@@ -29,7 +29,9 @@ against the same committed receipts. Redundant N-of-M execution is future work.
 
 from __future__ import annotations
 
+import binascii
 import hashlib
+import json
 
 import msgpack
 
@@ -65,6 +67,43 @@ def verify_receipt(r: dict) -> bool:
         return crypto.verify_sig(r["node"], r["sig"], _canon(r))
     except (KeyError, TypeError):
         return False
+
+
+# ------------------------------------------------- journal (M13 ledger source)
+_BYTES_FIELDS = ("in_hash", "out_hash", "sig")
+
+
+def to_json(r: dict) -> dict:
+    """A receipt with its byte fields hex-encoded, for one jsonl line."""
+    d = dict(r)
+    for k in _BYTES_FIELDS:
+        d[k] = binascii.hexlify(r[k]).decode()
+    return d
+
+
+def from_json(d: dict) -> dict:
+    """Inverse of to_json — restores the byte fields so the sig can be verified."""
+    r = dict(d)
+    for k in _BYTES_FIELDS:
+        r[k] = binascii.unhexlify(d[k])
+    return r
+
+
+def append_journal(path: str, receipt_list: list) -> None:
+    """Append receipts to a jsonl journal (the contribution ledger's source)."""
+    with open(path, "a") as f:
+        for r in receipt_list:
+            f.write(json.dumps(to_json(r)) + "\n")
+
+
+def read_journal(path: str) -> list[dict]:
+    rows = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
 
 
 class ReceiptVerifier:

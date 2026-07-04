@@ -20,6 +20,7 @@ _COMMANDS: dict[str, tuple[str, str, list[str]]] = {
     "reference": ("drift.reference", "main", []),
     "parity":    ("drift.parity_test", "main", []),
     "itest":     ("drift.itest", "main", []),
+    "ledger":    ("drift.ledger", "main", []),
     "bench":     ("drift.bench", "main", []),
     "ping":      ("drift.orchestrator", "main", ["--ping"]),
 }
@@ -40,6 +41,7 @@ commands:
   reference     single-machine reference generation (the oracle)
   parity        bitwise parity gate   (--mode inprocess|socket, --selftest)
   itest         integration gate over real nodes (--nodes N [--chain])
+  ledger        per-node contribution from a receipt journal (--verify, --csv)
   bench         benchmarks            (fidelity / footprint / wire / overhead)
   ping          health-check configured shards
 

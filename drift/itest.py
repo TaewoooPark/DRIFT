@@ -69,6 +69,59 @@ def _teardown(procs: list[subprocess.Popen]) -> None:
             pr.kill()
 
 
+def _ledger_test(cfg, model_id, dtype, dev, args) -> int:
+    """M13: run a generation with a receipt journal, then assert the ledger tally
+    reconciles with the run and a forged line fails --verify."""
+    import json
+
+    from . import ledger
+    from .receipts import read_journal, verify_receipt, from_json
+
+    journal = f"/tmp/drift_journal_{os.getpid()}.jsonl"
+    if os.path.exists(journal):
+        os.remove(journal)
+    os.environ["DRIFT_JOURNAL"] = journal
+    prompt, n = "Give me a short introduction to large language models.", 20
+
+    print(f"[itest:ledger] generating (journal → {journal}) …", flush=True)
+    ports, procs = spawn_nodes(args.nodes)
+    try:
+        endpoints = [{"name": f"n{i}", "host": "127.0.0.1", "port": p}
+                     for i, p in enumerate(ports)]
+        orch, plan = build_over_nodes(model_id, dtype, dev, endpoints, chain=True)
+        orch.generate(prompt, n, stop_on_eos=False, session_id="ledger")
+    finally:
+        _teardown(procs)
+
+    rows = read_journal(journal)
+    agg = ledger.aggregate(rows, verified_only=True)
+    all_valid = all(verify_receipt(from_json(d)) for d in rows)
+    # Each of the `nodes` shards signs one receipt per token → same token count each.
+    tok_counts = sorted(a["tokens"] for a in agg.values())
+    balanced = len(agg) == args.nodes and len(set(tok_counts)) == 1 and tok_counts[0] == n
+
+    # A forged line must fail --verify (append a receipt with a broken signature).
+    forged = dict(rows[0]); forged["sig"] = "00" * 64
+    with open(journal, "a") as f:
+        f.write(json.dumps(forged) + "\n")
+    rc = ledger.main([journal, "--verify"])   # returns 1 when an invalid line is present
+    forged_caught = rc == 1
+
+    print(f"[itest:ledger] nodes={len(agg)} token_counts={tok_counts} "
+          f"all_sigs_valid={all_valid} balanced={balanced} forged_caught={forged_caught}",
+          flush=True)
+    os.environ.pop("DRIFT_JOURNAL", None)
+    try:
+        os.remove(journal)
+    except OSError:
+        pass
+    good = all_valid and balanced and forged_caught
+    print("[itest:ledger]",
+          "PASS — ledger reconciles with the run; forged line rejected" if good else "FAIL",
+          flush=True)
+    return 0 if good else 1
+
+
 def _wait_port(port: int, timeout: float = 30.0) -> bool:
     import socket
     t0 = time.time()
@@ -264,6 +317,8 @@ def main(argv=None) -> int:
                     help="M11: node K corrupts its output; assert the receipt verifier flags it")
     ap.add_argument("--expand", type=int, default=None, metavar="N",
                     help="M12: N nodes gossip-join a seed; assert the head discovers + splits all")
+    ap.add_argument("--ledger", action="store_true",
+                    help="M13: journal receipts during a run, then check the contribution tally")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -275,6 +330,8 @@ def main(argv=None) -> int:
         # environment. Proves the AEAD channel is bitwise-transparent to parity.
         os.environ["DRIFT_NETWORK_KEY"] = binascii.hexlify(os.urandom(32)).decode()
 
+    if args.ledger:
+        return _ledger_test(cfg, model_id, dtype, dev, args)
     if args.expand is not None:
         return _expand_test(cfg, model_id, dtype, dev, args)
     if args.tamper is not None:

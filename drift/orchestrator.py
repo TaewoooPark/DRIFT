@@ -372,6 +372,7 @@ class Orchestrator:
         self.verify = False
         self.verifier: ReceiptVerifier | None = None
         self.n_layers = None
+        self.journal = None   # M13: append verified receipts here for the ledger
 
     def _check_receipts(self) -> None:
         if not self.verify or self.verifier is None:
@@ -381,6 +382,11 @@ class Orchestrator:
         if r:
             self.verifier.check(r, getattr(t, "last_anchor_in", None),
                                 getattr(t, "last_anchor_out", None), self.n_layers)
+            if self.journal:
+                try:
+                    receipts.append_journal(self.journal, r)
+                except OSError:
+                    pass
 
     def _eos_set(self, stop_on_eos: bool) -> set[int]:
         """The narrow EOS id set (not all special ids, which stop on benign tokens)."""

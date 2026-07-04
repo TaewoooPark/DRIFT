@@ -12,6 +12,7 @@ decode loop — streaming tokens as they land.
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import time
@@ -170,6 +171,7 @@ def build_over_nodes(model_id: str, dtype: str, head_device: str,
     orch.verify = True
     orch.verifier = ReceiptVerifier()
     orch.n_layers = n_layers
+    orch.journal = os.environ.get("DRIFT_JOURNAL")  # M13: opt-in contribution ledger
     return orch, plan
 
 
