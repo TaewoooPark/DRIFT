@@ -18,7 +18,8 @@ import time
 
 from .common import (free_port, load_config, model_num_layers, pick_device,
                      split_layers)
-from .orchestrator import HeadModel, Orchestrator, SocketTransport
+from .orchestrator import (ChainTransport, HeadModel, Orchestrator,
+                           SocketTransport)
 
 
 # ------------------------------------------------------------------- assembly
@@ -65,14 +66,20 @@ def _check_env(transport: SocketTransport, names: list[str]) -> None:
 
 
 def build_over_nodes(model_id: str, dtype: str, head_device: str,
-                     endpoints: list[dict]) -> tuple[Orchestrator, list[dict]]:
+                     endpoints: list[dict], chain: bool = False
+                     ) -> tuple[Orchestrator, list[dict]]:
     """Endpoints [{name,host,port,device?}] → auto-split, configure, return
-    (orchestrator, plan). `plan` is per-node {name,host,port,start,end,device}."""
+    (orchestrator, plan). `plan` is per-node {name,host,port,start,end,device}.
+
+    `chain=True` uses the peer-to-peer ChainTransport (node→node→…→collect); the
+    default star SocketTransport round-trips every hop through the head.
+    """
     n_layers = model_num_layers(model_id)
     ranges = split_layers(n_layers, len(endpoints))
     shards = [dict(e) for e in endpoints]
     names = [s["name"] for s in shards]
-    transport = SocketTransport(shards, dtype, head_device)
+    Transport = ChainTransport if chain else SocketTransport
+    transport = Transport(shards, dtype, head_device)
     if not _wait_ready(transport, names):
         raise RuntimeError("nodes not reachable — try `drift doctor --nodes <host:port,…>`")
     _check_env(transport, names)
@@ -84,8 +91,10 @@ def build_over_nodes(model_id: str, dtype: str, head_device: str,
     return Orchestrator(head, transport, names, head_device), plan
 
 
-def _status_bar(model_id: str, plan: list[dict], head_device: str) -> None:
+def _status_bar(model_id: str, plan: list[dict], head_device: str, chain: bool = False) -> None:
+    topo = "chain (node→node→…→head)" if chain else "star (every hop through head)"
     print(f"\n  model : {model_id}")
+    print(f"  route : {topo}")
     print(f"  head  : embed + norm + lm_head  · device={head_device}")
     for s in plan:
         print(f"  node  : {s['host']}:{s['port']}  layers [{s['start']}:{s['end']})"
@@ -163,6 +172,8 @@ def up_main(argv=None) -> int:
     ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--prompt", help="one-shot; omit for an interactive chat")
     ap.add_argument("--max-new-tokens", type=int)
+    ap.add_argument("--chain", action="store_true",
+                    help="peer-to-peer chain: nodes stream to each other, not through the head")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -178,8 +189,8 @@ def up_main(argv=None) -> int:
     try:
         endpoints = [{"name": f"n{i}", "host": "127.0.0.1", "port": p}
                      for i, p in enumerate(ports)]
-        orch, plan = build_over_nodes(model_id, dtype, head_device, endpoints)
-        _status_bar(model_id, plan, head_device)
+        orch, plan = build_over_nodes(model_id, dtype, head_device, endpoints, chain=args.chain)
+        _status_bar(model_id, plan, head_device, chain=args.chain)
         if args.prompt:
             _stream(orch, args.prompt, n_new)
         else:
@@ -206,6 +217,8 @@ def main(argv=None) -> int:
     ap.add_argument("--model", help="override model_id")
     ap.add_argument("--prompt", help="one-shot; omit for an interactive chat")
     ap.add_argument("--max-new-tokens", type=int)
+    ap.add_argument("--chain", action="store_true",
+                    help="peer-to-peer chain: nodes stream to each other, not through the head")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -217,8 +230,8 @@ def main(argv=None) -> int:
     endpoints = _select_endpoints(args, cfg)
 
     print(f"[run] {len(endpoints)} node(s); splitting {model_id} …", flush=True)
-    orch, plan = build_over_nodes(model_id, dtype, head_device, endpoints)
-    _status_bar(model_id, plan, head_device)
+    orch, plan = build_over_nodes(model_id, dtype, head_device, endpoints, chain=args.chain)
+    _status_bar(model_id, plan, head_device, chain=args.chain)
     if args.prompt:
         _stream(orch, args.prompt, n_new)
     else:

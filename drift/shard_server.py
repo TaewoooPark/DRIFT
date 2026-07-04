@@ -25,20 +25,20 @@ import yaml
 from . import protocol
 from .engine_torch import TorchShardEngine
 
-# The engine (model forward + per-session KV) is serialized: concurrent sessions
-# may connect, but only one forward runs at a time (the GPU serializes anyway).
-# What this buys is overlap — while one session's reply travels the network, the
-# next session computes — which is the throughput win on a network-bound link.
-_ENGINE_LOCK = threading.Lock()
-
-
 def load_config(path: str = "config.yaml") -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
 
 
 class Node:
-    """Holds an optional engine and (re)configures it on demand."""
+    """Holds an optional engine and (re)configures it on demand.
+
+    The engine (model forward + per-session KV) is serialized by ``self._lock``:
+    concurrent sessions may connect, but only one forward runs at a time (the GPU
+    serializes anyway). The lock is held around the *compute only* — the chain
+    relay (network I/O to the next node) runs outside it, so one session's
+    downstream hop overlaps the next session's compute.
+    """
 
     def __init__(self, name: str, model_id: str, dtype: str, device: str):
         self.name = name
@@ -47,6 +47,9 @@ class Node:
         self.device = device
         self.engine: TorchShardEngine | None = None
         self.tamper = False  # test hook: a dishonest node (see drift.verify)
+        self._lock = threading.Lock()          # serializes engine compute
+        self._down: dict = {}                  # (host,port,session) -> socket to the next hop
+        self._down_lock = threading.Lock()     # guards the _down cache
 
     def configure(self, start: int, end: int, model_id: str | None = None,
                   dtype: str | None = None, device: str | None = None) -> dict:
@@ -54,11 +57,12 @@ class Node:
         self.model_id = model_id or self.model_id
         self.dtype = dtype or self.dtype
         self.device = device or self.device
-        self.engine = TorchShardEngine(
-            model_id=self.model_id, start_layer=start, end_layer=end,
-            device=self.device, dtype=self.dtype, name=self.name,
-        )
-        self.engine.load()
+        with self._lock:  # loading mutates shared state; don't race a concurrent forward
+            self.engine = TorchShardEngine(
+                model_id=self.model_id, start_layer=start, end_layer=end,
+                device=self.device, dtype=self.dtype, name=self.name,
+            )
+            self.engine.load()
         return {"ok": True, **self.engine.ping_info()}
 
     def handle(self, msg: dict) -> dict:
@@ -80,21 +84,92 @@ class Node:
             return {"ok": False, "error": "node not configured — send a 'configure' message first"}
         if mtype == "reset":
             self.engine.reset(msg["session_id"])
+            self._close_session_downsocks(msg["session_id"])  # tear down chain relays too
             return {"ok": True}
         if mtype in ("prefill", "decode"):
             hidden = protocol.bytes_to_tensor(
                 msg["tensor"], msg["shape"], msg["dtype"], self.engine.device
             )
-            out = self.engine.forward(
-                session_id=msg["session_id"], hidden=hidden,
-                position_ids=msg.get("position_ids"), input_ids=msg.get("input_ids"),
-                mode=mtype,
-            )
+            with self._lock:  # serialize the forward; the relay below runs unlocked
+                out = self.engine.forward(
+                    session_id=msg["session_id"], hidden=hidden,
+                    position_ids=msg.get("position_ids"), input_ids=msg.get("input_ids"),
+                    mode=mtype,
+                )
             if self.tamper:  # test hook: corrupt the output so drift.verify flags it
                 out = out * 1.2 + 0.1
+            # Chain mode (M7): relay the hidden state straight to the next hop /
+            # collect sink instead of returning it to the caller. The route/collect
+            # fields are optional — absent → classic star (return the tensor).
+            if msg.get("route") is not None:
+                return self._relay(msg, out)
             return {"ok": True, "shape": list(out.shape), "dtype": self.engine.dtype,
                     "tensor": protocol.tensor_to_bytes(out, self.engine.dtype), "error": None}
         return {"ok": False, "error": f"unknown message type: {mtype}"}
+
+    # ------------------------------------------------------------- chain relay
+    def _downsock(self, target: tuple, session_id: str) -> socket.socket:
+        """A cached client socket to a downstream node / the collect sink.
+
+        Keyed by (host, port, session) so concurrent sessions never interleave on
+        one socket; a single session sends one message at a time, so no per-socket
+        lock is needed — only the cache dict is guarded.
+        """
+        key = (target[0], int(target[1]), session_id)
+        with self._down_lock:
+            sk = self._down.get(key)
+        if sk is None:
+            sk = socket.create_connection((target[0], int(target[1])))
+            sk.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            with self._down_lock:
+                self._down[key] = sk
+        return sk
+
+    def _drop_downsock(self, target: tuple, session_id: str) -> None:
+        key = (target[0], int(target[1]), session_id)
+        with self._down_lock:
+            sk = self._down.pop(key, None)
+        if sk is not None:
+            try:
+                sk.close()
+            except Exception:
+                pass
+
+    def _relay(self, msg: dict, out) -> dict:
+        """Forward the computed hidden state to the next node, or — if this is the
+        tail (empty route) — to the head's collect sink. Returns a tiny ack to the
+        caller so a dropped downstream propagates back up the chain as an error."""
+        route = msg["route"]
+        target = route[0] if route else msg["collect"]
+        down = {
+            "type": msg["type"], "session_id": msg["session_id"], "seq_id": msg.get("seq_id"),
+            "shape": list(out.shape), "dtype": self.engine.dtype,
+            "position_ids": msg.get("position_ids"), "input_ids": msg.get("input_ids"),
+            "tensor": protocol.tensor_to_bytes(out, self.engine.dtype),
+            "route": route[1:], "collect": msg["collect"],
+        }
+        tgt = (target[0], int(target[1]))
+        try:
+            sk = self._downsock(tgt, msg["session_id"])
+            protocol.send_msg(sk, down)
+            ack = protocol.recv_msg(sk)
+        except (ConnectionError, OSError) as e:
+            self._drop_downsock(tgt, msg["session_id"])
+            return {"ok": False, "error": f"relay to {tgt[0]}:{tgt[1]} failed: {e}"}
+        if not ack.get("ok"):
+            return {"ok": False, "error": f"downstream {tgt[0]}:{tgt[1]}: {ack.get('error')}"}
+        return {"ok": True, "relayed": True, "error": None}
+
+    def _close_session_downsocks(self, session_id: str) -> None:
+        with self._down_lock:
+            keys = [k for k in self._down if k[2] == session_id]
+            for k in keys:
+                sk = self._down.pop(k, None)
+                if sk is not None:
+                    try:
+                        sk.close()
+                    except Exception:
+                        pass
 
 
 def serve(node: Node, host: str, port: int, banner: str | None = None) -> None:
@@ -124,8 +199,7 @@ def _serve_conn(node: Node, conn: socket.socket) -> None:
             except ConnectionError:
                 break
             try:
-                with _ENGINE_LOCK:  # serialize the forward; overlap the network
-                    reply = node.handle(msg)
+                reply = node.handle(msg)  # locks the compute internally; relay runs unlocked
             except Exception as e:  # surface engine errors to the caller
                 reply = {"ok": False, "error": f"{type(e).__name__}: {e}"}
             try:

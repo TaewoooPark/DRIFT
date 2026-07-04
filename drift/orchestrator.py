@@ -8,13 +8,15 @@ the same decode loop runs over an in-process callable (M2) or a socket client
 from __future__ import annotations
 
 import argparse
+import queue
 import socket
 import sys
+import threading
 
 import torch
 
 from . import protocol
-from .common import build_input_ids, load_config
+from .common import build_input_ids, lan_ip, load_config
 from .engine_torch import TorchShardEngine
 
 
@@ -77,6 +79,13 @@ class InProcessTransport:
 
     def forward(self, name, session_id, hidden, position_ids, input_ids, mode):
         return self.engines[name].forward(session_id, hidden, position_ids, input_ids, mode)
+
+    def route(self, names, session_id, hidden, position_ids, input_ids, mode):
+        """Run the whole ordered pipeline; the transport-agnostic entry point the
+        decode loop calls (star loops here, chain streams peer-to-peer)."""
+        for name in names:
+            hidden = self.forward(name, session_id, hidden, position_ids, input_ids, mode)
+        return hidden
 
     def reset(self, name, session_id):
         self.engines[name].reset(session_id)
@@ -143,6 +152,13 @@ class SocketTransport:
             raise RuntimeError(f"shard {name} error: {reply.get('error')}")
         return protocol.bytes_to_tensor(reply["tensor"], reply["shape"], reply["dtype"], self.device)
 
+    def route(self, names, session_id, hidden, position_ids, input_ids, mode):
+        """Star routing: every hop round-trips through the head (2N crossings/token)."""
+        for name in names:
+            hidden = self.forward(name, session_id, hidden, position_ids, input_ids, mode)
+            hidden = hidden.to(self.device)
+        return hidden
+
     def reset(self, name, session_id):
         # Cleanup path — a dropped node needs no reset, so never raise here.
         try:
@@ -168,6 +184,94 @@ class SocketTransport:
         sk = self._sock(name)
         protocol.send_msg(sk, {"type": "ping"})
         return protocol.recv_msg(sk)
+
+
+class ChainTransport(SocketTransport):
+    """M7: peer-to-peer chain. The hidden state flows node→node→…→tail and the
+    tail streams it to the head's `collect` sink — instead of star-routing every
+    hop back through the head.
+
+    Wins: **N+1** tensor crossings/token (vs 2N for the star) and — the point —
+    the head's bandwidth is O(1) in the node count, not O(N). The head sends one
+    tensor to the first node and receives one from the tail; the inner hops are
+    node-to-node, so the head stops being the data-plane hub. `configure` / `ping`
+    / `reset` (control + cleanup, off the hot path) are inherited from the star.
+
+    The extra wire fields are additive and optional: `route` (the downstream
+    [host,port] list) and `collect` (the head's sink [host,port]). A node without
+    them behaves exactly like the star.
+    """
+
+    def __init__(self, shards: list, dtype: str, device: str, collect_host: str | None = None):
+        super().__init__(shards, dtype, device)
+        self._queues: dict[str, queue.Queue] = {}
+        self._qlock = threading.Lock()
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("", 0))
+        srv.listen(16)
+        self._collect_srv = srv
+        # Address the tail dials to deliver the final hidden state. Defaults to
+        # this host's LAN ip (reachable from a localhost node and a LAN node alike).
+        self.collect_host = collect_host or lan_ip()
+        self.collect_port = srv.getsockname()[1]
+        threading.Thread(target=self._collect_accept, daemon=True).start()
+
+    def _q(self, session_id: str) -> queue.Queue:
+        with self._qlock:
+            q = self._queues.get(session_id)
+            if q is None:
+                q = self._queues[session_id] = queue.Queue()
+            return q
+
+    def _collect_accept(self) -> None:
+        while True:
+            try:
+                conn, _ = self._collect_srv.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._collect_reader, args=(conn,), daemon=True).start()
+
+    def _collect_reader(self, conn: socket.socket) -> None:
+        """Read final hidden states the tail streams here; hand each to its
+        session's queue. One persistent connection carries a whole generation."""
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        try:
+            while True:
+                try:
+                    msg = protocol.recv_msg(conn)
+                except (ConnectionError, OSError):
+                    break
+                self._q(msg.get("session_id", "s0")).put(msg)
+                try:
+                    protocol.send_msg(conn, {"ok": True})  # ack so the tail's send returns
+                except (ConnectionError, OSError):
+                    break
+        finally:
+            conn.close()
+
+    def route(self, names, session_id, hidden, position_ids, input_ids, mode):
+        self.seq += 1
+        first = names[0]
+        downstream = [[self.shards[n]["host"], self.shards[n]["port"]] for n in names[1:]]
+        msg = {
+            "type": mode, "session_id": session_id, "seq_id": self.seq,
+            "shape": list(hidden.shape), "dtype": self.dtype,
+            "position_ids": list(position_ids), "input_ids": list(input_ids),
+            "tensor": protocol.tensor_to_bytes(hidden, self.dtype),
+            "route": downstream,
+            "collect": [self.collect_host, self.collect_port],
+        }
+        q = self._q(session_id)
+        ack = self._roundtrip(first, msg)  # first node relays down the chain
+        if not ack.get("ok"):
+            raise NodeUnavailable(f"chain entry {first} error: {ack.get('error')}")
+        try:
+            reply = q.get(timeout=120)
+        except queue.Empty as e:
+            raise NodeUnavailable(
+                "chain tail never reached the collect sink — a node dropped mid-chain") from e
+        return protocol.bytes_to_tensor(reply["tensor"], reply["shape"], reply["dtype"], self.device)
 
 
 # ---------------------------------------------------------------- orchestrator
@@ -198,9 +302,7 @@ class Orchestrator:
         hidden = self.head.embed(input_ids)
         pos = list(range(S))
         ids_list = input_ids[0].tolist()
-        for name in self.order:
-            hidden = self.transport.forward(name, session_id, hidden, pos, ids_list, "prefill")
-            hidden = hidden.to(self.device)
+        hidden = self.transport.route(self.order, session_id, hidden, pos, ids_list, "prefill").to(self.device)
 
         logits = self.head.head(self.head.norm(hidden[:, -1:, :]))[:, -1, :]
         first_logits = logits[0].detach().float().cpu().numpy()
@@ -212,9 +314,7 @@ class Orchestrator:
                 break
             cur = torch.tensor([[next_id]], device=self.device)
             hidden = self.head.embed(cur)
-            for name in self.order:
-                hidden = self.transport.forward(name, session_id, hidden, [p], [next_id], "decode")
-                hidden = hidden.to(self.device)
+            hidden = self.transport.route(self.order, session_id, hidden, [p], [next_id], "decode").to(self.device)
             logits = self.head.head(self.head.norm(hidden[:, -1:, :]))[:, -1, :]
             next_id = int(torch.argmax(logits, dim=-1))
             generated.append(next_id)
@@ -250,8 +350,7 @@ class Orchestrator:
         hidden = self.head.embed(input_ids)
         pos = list(range(S))
         ids_list = input_ids[0].tolist()
-        for name in self.order:
-            hidden = self.transport.forward(name, session_id, hidden, pos, ids_list, "prefill").to(self.device)
+        hidden = self.transport.route(self.order, session_id, hidden, pos, ids_list, "prefill").to(self.device)
         logits = self.head.head(self.head.norm(hidden[:, -1:, :]))[:, -1, :]
         next_id = int(torch.argmax(logits, dim=-1))
 
@@ -268,8 +367,7 @@ class Orchestrator:
                 prev = text
             cur = torch.tensor([[next_id]], device=self.device)
             hidden = self.head.embed(cur)
-            for name in self.order:
-                hidden = self.transport.forward(name, session_id, hidden, [p], [next_id], "decode").to(self.device)
+            hidden = self.transport.route(self.order, session_id, hidden, [p], [next_id], "decode").to(self.device)
             logits = self.head.head(self.head.norm(hidden[:, -1:, :]))[:, -1, :]
             next_id = int(torch.argmax(logits, dim=-1))
             p += 1
