@@ -9,6 +9,7 @@ static binary, downloaded once per platform and cached under ~/.cache/drift.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import os
 import platform
@@ -32,6 +33,17 @@ _ASSETS = {
     ("linux", "arm64"): "aarch64-unknown-linux-musl.tar.gz",
     ("windows", "amd64"): "x86_64-pc-windows-msvc.zip",
     ("windows", "x86_64"): "x86_64-pc-windows-msvc.zip",
+}
+
+# SHA256 of each bore v0.6.0 release asset (computed from the published files).
+# The download is verified against this before the binary is written + executed —
+# a project that verifies its nodes should verify the code it fetches and runs.
+_SHA256 = {
+    "aarch64-apple-darwin.tar.gz":      "65f43a67b90874700538bdb6064c5e92276e64dfba24f5cd72ef24a035eec3bc",
+    "x86_64-apple-darwin.tar.gz":       "206db723a382bbc18d2893fc8472868e0b5f41de35975269aab7891ecc8659cc",
+    "x86_64-unknown-linux-musl.tar.gz": "e484d1e3acba77169b773f31a5bfb34192d4b660f44a094a658a2522cd2270f7",
+    "aarch64-unknown-linux-musl.tar.gz":"ffc4515f3617420b243758cf36ed6a63208d7dba76b2ec3e90d1f476a9742951",
+    "x86_64-pc-windows-msvc.zip":       "01709c64fe2787cdc9a21d7030b0f08ad72dff0c36b7ecb72f4f667a55a34b4f",
 }
 
 
@@ -60,6 +72,13 @@ def ensure_bore() -> str:
            f"{_BORE_VERSION}/bore-{_BORE_VERSION}-{asset}")
     req = urllib.request.Request(url, headers={"User-Agent": "drift-tunnel"})
     blob = urllib.request.urlopen(req, timeout=60).read()  # bounded: never hang
+    expected = _SHA256.get(asset)
+    if expected is not None:
+        got = hashlib.sha256(blob).hexdigest()
+        if got != expected:
+            raise RuntimeError(
+                f"bore {asset} checksum mismatch: expected {expected}, got {got} — "
+                "refusing to run an unverified binary (tampered or corrupt download)")
     if asset.endswith(".zip"):
         with zipfile.ZipFile(io.BytesIO(blob)) as z:
             name = next(n for n in z.namelist() if os.path.basename(n) == exe)
