@@ -265,6 +265,8 @@ The engine never hardcodes a model architecture. At load it **introspects** the 
 
 Every quirk maps cleanly onto a plane and is discovered from `config`/signature at load, so the code that runs Qwen runs Gemma unchanged: *depend on what you can observe, hardcode nothing.*
 
+**And beyond these two:** the table lists the *gated* families — the ones the parity suite has proven bitwise. The same introspection is designed to carry **any decoder-only Hugging Face causal LM** within DRIFT's constraints (an architecture the installed `transformers` supports; fp16 weights that fit across the nodes' combined memory). Point `drift run --model <hf-id>` (or `model_id` in `config.yaml`) at one — the split, the wire size, and the layer plan re-derive themselves — then hold it to the same standard with `python -m drift.parity_test`. Details in the [operations manual §6](docs/manual.md).
+
 ---
 
 ## Design rationale (why-not)
