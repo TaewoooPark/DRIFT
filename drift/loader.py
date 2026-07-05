@@ -21,6 +21,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import sys
 
 import torch
 from accelerate import init_empty_weights
@@ -63,6 +64,10 @@ def _needed_files(model_id: str, keep_prefixes: list[str]) -> list[str]:
         need = sorted({shard for name, shard in weight_map.items() if want(name)})
         if not need:  # nothing matched (unexpected) — don't silently load nothing
             need = sorted(set(weight_map.values()))
+            print(f"[loader] WARNING: no weight matched {keep_prefixes} for "
+                  f"{model_id}; loading ALL {len(need)} shard(s) — this node will "
+                  f"hold the whole model, voiding the per-shard memory guarantee",
+                  file=sys.stderr, flush=True)
         return [hf_hub_download(model_id, shard) for shard in need]
 
     # single-file checkpoint (no index): one shard = the whole model
