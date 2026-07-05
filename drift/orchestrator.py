@@ -499,53 +499,60 @@ class Orchestrator:
     @torch.no_grad()
     def generate_stream(self, prompt: str, max_new_tokens: int, stop_on_eos: bool = True,
                         session_id: str = "s0"):
-        """Same decode loop as generate(), but *yields* decoded text as it lands.
+        """Streaming twin of generate(): the SAME _prefill/_decode machinery —
+        thin-aware, receipt-verifying (M11), journaling (M13), and failover-
+        recovering (M9) — but *yields* decoded text deltas as tokens land.
 
         Yields incremental UTF-8-safe text deltas (decode the full id list each
         step and emit the new suffix, so multibyte tokens never break). EOS is
-        not emitted. The result is identical to generate() — this only changes
-        when the tokens reach the caller.
+        not emitted. The emitted visible text is identical to generate(); this
+        only changes *when* tokens reach the caller.
+
+        Previously this was a second, drifted copy of the decode loop that did no
+        receipt verification, no journaling, no failover, and crashed in thin
+        mode — even though `drift run`/`drift up` use ONLY this path. Routing it
+        through _prefill/_decode (which the gates already prove bitwise) fixes all
+        four at once.
         """
         tok = self.head.tokenizer
         input_ids = build_input_ids(tok, prompt).to(self.device)
-        S = input_ids.shape[1]
-        eos: set[int] = set()
-        if stop_on_eos:
-            if tok.eos_token_id is not None:
-                eos.add(int(tok.eos_token_id))
-            gen_eos = getattr(getattr(self.head.lm, "generation_config", None), "eos_token_id", None)
-            if isinstance(gen_eos, int):
-                eos.add(gen_eos)
-            elif isinstance(gen_eos, (list, tuple)):
-                eos.update(int(x) for x in gen_eos)
-
-        hidden = self.head.embed(input_ids)
-        pos = list(range(S))
-        ids_list = input_ids[0].tolist()
-        hidden = self.transport.route(self.order, session_id, hidden, pos, ids_list, "prefill").to(self.device)
-        logits = self.head.head(self.head.norm(hidden[:, -1:, :]))[:, -1, :]
-        next_id = int(torch.argmax(logits, dim=-1))
+        prompt_ids = input_ids[0].tolist()
+        eos = self._eos_set(stop_on_eos)
 
         generated: list[int] = []
         prev = ""
-        p = S
-        for _ in range(max_new_tokens):
-            if stop_on_eos and next_id in eos:
-                break
-            generated.append(next_id)
-            text = tok.decode(generated)
-            if len(text) > len(prev):
-                yield text[len(prev):]
-                prev = text
-            cur = torch.tensor([[next_id]], device=self.device)
-            hidden = self.head.embed(cur)
-            hidden = self.transport.route(self.order, session_id, hidden, [p], [next_id], "decode").to(self.device)
-            logits = self.head.head(self.head.norm(hidden[:, -1:, :]))[:, -1, :]
-            next_id = int(torch.argmax(logits, dim=-1))
-            p += 1
-
-        for name in self.order:
-            self.transport.reset(name, session_id)
+        try:
+            while True:  # (re)start on a mid-run node drop (M9)
+                try:
+                    # (Re)prefill the whole sequence so far. Fresh start → the
+                    # prompt; after a drop → prompt + tokens-so-far, which rebuilds
+                    # every survivor's KV. Greedy is deterministic over a fixed
+                    # prefix, so the resumed continuation is bitwise-identical.
+                    seq = prompt_ids + generated
+                    next_id, _ = self._prefill(session_id, seq)
+                    p = len(seq)
+                    while len(generated) < max_new_tokens:
+                        if stop_on_eos and next_id in eos:
+                            break
+                        generated.append(next_id)
+                        self.progress = len(generated)
+                        text = tok.decode(generated)
+                        if len(text) > len(prev):
+                            yield text[len(prev):]
+                            prev = text
+                        if len(generated) >= max_new_tokens:
+                            break
+                        next_id = self._decode(session_id, next_id, p)
+                        p += 1
+                    break  # finished with no unrecovered drop
+                except NodeUnavailable:
+                    self._recover(session_id)  # re-split over survivors, then re-prefill
+        finally:
+            for name in self.order:
+                try:
+                    self.transport.reset(name, session_id)
+                except Exception:
+                    pass
 
 
 # ----------------------------------------------------------- builders / CLI
