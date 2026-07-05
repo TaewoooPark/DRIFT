@@ -42,8 +42,11 @@ import struct
 import msgpack
 import numpy as np
 
-# numpy dtype names used on the wire, keyed by the string in the message.
-_NP_DTYPE = {"float16": np.float16, "float32": np.float32, "bfloat16": None}
+# numpy dtype names used on the wire, keyed by the string in the message. numpy
+# has no native bfloat16, so bf16 is handled specially (byte-copied via a uint16
+# reinterpretation) in tensor_to_bytes / bytes_to_tensor, not through this table.
+_NP_DTYPE = {"float16": np.float16, "float32": np.float32}
+_WIRE_DTYPES = ("float16", "float32", "bfloat16", "int8")
 
 # Bound the 4-byte length prefix (which by itself would admit a 4 GB body): a
 # hostile or corrupt peer must not be able to make us pre-allocate gigabytes.
@@ -77,13 +80,18 @@ def _recvn(sock, n: int) -> bytes:
 
 
 def tensor_to_bytes(t, dtype: str = "float16") -> bytes:
-    """Serialize a torch tensor to row-major raw bytes via a CPU fp16 cast.
+    """Serialize a torch tensor to row-major raw bytes via a CPU cast.
 
-    The CPU fp16 round-trip is bit-lossless (spec §6 note), so this does not
-    affect parity.
+    A same-dtype round-trip is a pure byte copy → bit-lossless (spec §6 note), so
+    this does not affect parity. numpy has no bfloat16, so bf16 is byte-copied
+    through a uint16 reinterpretation — still an exact 16-bit copy, so bf16 is a
+    first-class bitwise-safe wire dtype (compute dtype must match).
     """
     import torch
 
+    if dtype == "bfloat16":
+        u = t.detach().to("cpu", torch.bfloat16).contiguous().view(torch.uint16)
+        return u.numpy().tobytes()
     torch_dtype = {"float16": torch.float16, "float32": torch.float32}[dtype]
     return t.detach().to("cpu", torch_dtype).contiguous().numpy().tobytes()
 
@@ -95,6 +103,9 @@ def bytes_to_tensor(b: bytes, shape, dtype: str, device: str):
     """
     import torch
 
+    if dtype == "bfloat16":
+        arr = np.frombuffer(b, dtype=np.uint16).reshape(tuple(shape)).copy()
+        return torch.from_numpy(arr).view(torch.bfloat16).to(device=device)
     np_dtype = _NP_DTYPE.get(dtype)
     if np_dtype is None:
         raise ValueError(f"unsupported wire dtype: {dtype}")
