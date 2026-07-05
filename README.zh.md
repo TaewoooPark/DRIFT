@@ -356,6 +356,8 @@ drift ledger ~/drift.jsonl --verify           # per-node contribution, signature
 
 **定制与微调**——模型、切分点、设备、故障排查——全都在**操作手册 → [docs/manual.zh.md](docs/manual.zh.md)**（[English](docs/manual.md) · [한국어](docs/manual.ko.md) · [日本語](docs/manual.ja.md)）里。
 
+**现场演示** — [**DRIFT-Demo**](https://github.com/TaewoooPark/DRIFT-Demo)：用两块屏幕可视化一次真实运行——跨越网络的 residual stream、逐层 ‖Δh‖、尾节点自己算出的 top-k、签名回执与贡献账本——每一个像素都来自真实流量，且完全不改动 DRIFT 源码。
+
 ---
 
 ## 仓库地图——该看哪里

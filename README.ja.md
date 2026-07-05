@@ -356,6 +356,8 @@ drift ledger ~/drift.jsonl --verify           # per-node contribution, signature
 
 **カスタマイズとチューニング** — モデル、分割点、デバイス、トラブルシューティング — はすべて **運用マニュアル → [docs/manual.ja.md](docs/manual.ja.md)** にあります（[English](docs/manual.md) · [한국어](docs/manual.ko.md) · [中文](docs/manual.zh.md)）。
 
+**ライブで見る** — [**DRIFT-Demo**](https://github.com/TaewoooPark/DRIFT-Demo)：実際の実行を 2 画面で可視化するデモです — ワイヤを渡る residual stream、レイヤーごとの ‖Δh‖、テイルノード自身が計算する top-k、署名レシート、貢献台帳まで、すべてのピクセルがライブトラフィックから描かれ、DRIFT のソースには一切手を加えていません。
+
 ---
 
 ## リポジトリマップ — どこを見るか

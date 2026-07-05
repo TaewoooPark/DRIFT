@@ -356,6 +356,8 @@ drift ledger ~/drift.jsonl --verify           # per-node contribution, signature
 
 **커스터마이즈 & 파인튜닝**, 곧 모델, 분할 지점, 디바이스, 트러블슈팅은 모두 **운영 매뉴얼 → [docs/manual.ko.md](docs/manual.ko.md)** ([English](docs/manual.md) · [中文](docs/manual.zh.md) · [日本語](docs/manual.ja.md))에 있다.
 
+**라이브로 보기** — [**DRIFT-Demo**](https://github.com/TaewoooPark/DRIFT-Demo): 실제 실행을 두 화면으로 보여주는 비주얼 데모다 — 와이어를 건너는 residual stream, 레이어별 ‖Δh‖, tail이 직접 계산하는 top-k, 서명 영수증, 기여 정산까지 모든 픽셀이 라이브 트래픽에서 그려지며, DRIFT 소스는 건드리지 않는다.
+
 ---
 
 ## 저장소 지도: 어디를 봐야 하는가

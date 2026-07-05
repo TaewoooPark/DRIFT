@@ -356,6 +356,8 @@ drift ledger ~/drift.jsonl --verify           # per-node contribution, signature
 
 **Customize & fine-tune** — models, split points, devices, troubleshooting — is all in the **operations manual → [docs/manual.md](docs/manual.md)** ([한국어](docs/manual.ko.md) · [中文](docs/manual.zh.md) · [日本語](docs/manual.ja.md)).
 
+**See it live** — [**DRIFT-Demo**](https://github.com/TaewoooPark/DRIFT-Demo): a two-screen visual demo of a real run — the residual stream crossing the wire, per-layer ‖Δh‖, the tail's own top-k, signed receipts, and the contribution tally — every pixel drawn from live traffic, the DRIFT sources untouched.
+
 ---
 
 ## Repository map — where to look
