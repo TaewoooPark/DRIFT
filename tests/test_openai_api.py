@@ -1,3 +1,5 @@
+import json
+
 from starlette.testclient import TestClient
 
 from drift.openai_api import GenerationResult, create_app
@@ -35,6 +37,15 @@ class FakeBackend:
 def client():
     backend = FakeBackend()
     return backend, TestClient(create_app(backend))
+
+
+def sse_json_events(text: str) -> list[dict]:
+    events = []
+    for line in text.splitlines():
+        if not line.startswith("data: ") or line == "data: [DONE]":
+            continue
+        events.append(json.loads(line.removeprefix("data: ")))
+    return events
 
 
 def test_models_endpoint():
@@ -91,6 +102,10 @@ def test_chat_completion_streaming():
     assert '"content":"hello"' in text
     assert '"usage"' in text
     assert "data: [DONE]" in text
+    events = sse_json_events(text)
+    assert events[-2]["choices"][0]["finish_reason"] == "stop"
+    assert events[-1]["choices"] == []
+    assert events[-1]["usage"]["completion_tokens"] > 0
 
 
 def test_rejects_unknown_model_with_openai_error_shape():
@@ -193,6 +208,10 @@ def test_completion_streaming_single_prompt():
     assert '"text":"hello"' in text
     assert '"usage"' in text
     assert "data: [DONE]" in text
+    events = sse_json_events(text)
+    assert events[-2]["choices"][0]["finish_reason"] == "stop"
+    assert events[-1]["choices"] == []
+    assert events[-1]["usage"]["completion_tokens"] > 0
 
 
 def test_completion_streaming_rejects_prompt_arrays_for_now():

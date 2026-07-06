@@ -473,27 +473,33 @@ def create_app(backend: OpenAIBackend):
 
         def events():
             full_text = ""
-            yield _json_sse({
+            first = {
                 "id": rid,
                 "object": "chat.completion.chunk",
                 "created": created,
                 "model": model,
                 "choices": [{"index": 0, "delta": {"role": "assistant"},
                              "finish_reason": None}],
-            })
+            }
+            if include_usage:
+                first["usage"] = None
+            yield _json_sse(first)
             try:
                 for piece in backend.stream(prompt, max_tokens, session_id):
                     if not piece:
                         continue
                     full_text += piece
-                    yield _json_sse({
+                    chunk = {
                         "id": rid,
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": model,
                         "choices": [{"index": 0, "delta": {"content": piece},
                                      "finish_reason": None}],
-                    })
+                    }
+                    if include_usage:
+                        chunk["usage"] = None
+                    yield _json_sse(chunk)
                 final: dict = {
                     "id": rid,
                     "object": "chat.completion.chunk",
@@ -502,10 +508,21 @@ def create_app(backend: OpenAIBackend):
                     "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
                 }
                 if include_usage:
-                    final["usage"] = _usage(
-                        backend, prompt, GenerationResult(text=full_text, token_ids=None)
-                    )
+                    final["usage"] = None
                 yield _json_sse(final)
+                if include_usage:
+                    yield _json_sse({
+                        "id": rid,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [],
+                        "usage": _usage(
+                            backend, prompt, GenerationResult(text=full_text, token_ids=None)
+                        ),
+                    })
+            except GeneratorExit:
+                raise
             except Exception as e:
                 yield _json_sse({
                     "error": {
@@ -553,27 +570,33 @@ def create_app(backend: OpenAIBackend):
             def events():
                 generated_text = ""
                 if echo and prompt:
-                    yield _json_sse({
+                    chunk = {
                         "id": rid,
                         "object": "text_completion",
                         "created": created,
                         "model": model,
                         "choices": [{"text": prompt, "index": 0, "logprobs": None,
                                      "finish_reason": None}],
-                    })
+                    }
+                    if include_usage:
+                        chunk["usage"] = None
+                    yield _json_sse(chunk)
                 try:
                     for piece in backend.stream(prompt, max_tokens, session_id):
                         if not piece:
                             continue
                         generated_text += piece
-                        yield _json_sse({
+                        chunk = {
                             "id": rid,
                             "object": "text_completion",
                             "created": created,
                             "model": model,
                             "choices": [{"text": piece, "index": 0, "logprobs": None,
                                          "finish_reason": None}],
-                        })
+                        }
+                        if include_usage:
+                            chunk["usage"] = None
+                        yield _json_sse(chunk)
                     final: dict = {
                         "id": rid,
                         "object": "text_completion",
@@ -583,10 +606,22 @@ def create_app(backend: OpenAIBackend):
                                      "finish_reason": "stop"}],
                     }
                     if include_usage:
-                        final["usage"] = _usage(
-                            backend, prompt, GenerationResult(text=generated_text, token_ids=None)
-                        )
+                        final["usage"] = None
                     yield _json_sse(final)
+                    if include_usage:
+                        yield _json_sse({
+                            "id": rid,
+                            "object": "text_completion",
+                            "created": created,
+                            "model": model,
+                            "choices": [],
+                            "usage": _usage(
+                                backend, prompt,
+                                GenerationResult(text=generated_text, token_ids=None),
+                            ),
+                        })
+                except GeneratorExit:
+                    raise
                 except Exception as e:
                     yield _json_sse({
                         "error": {
