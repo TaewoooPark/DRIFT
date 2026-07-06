@@ -13,14 +13,14 @@ import sys
 import threading
 import time
 
-from . import discovery, membership
 from .common import free_port, lan_ip, load_config, pick_device
-from .shard_server import Node, serve
 
 
 def _gossip_loop(node: Node, seeds: list[tuple], interval: float = 5.0) -> None:
     """Bootstrap from the seeds, then anti-entropy gossip with known peers so
     membership converges across the network (M12)."""
+    from . import membership
+
     for host, port in seeds:
         try:
             node.peer_table.merge(membership.gossip_once(host, port, node.peer_table.list()))
@@ -57,6 +57,9 @@ def main(argv=None) -> int:
     ap.add_argument("--join", metavar="host:port,…",
                     help="gossip-join a network via one or more seed nodes (learn the members)")
     args = ap.parse_args(argv)
+
+    from . import discovery
+    from .shard_server import Node, serve
 
     cfg = {}
     try:

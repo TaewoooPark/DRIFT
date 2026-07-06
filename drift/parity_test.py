@@ -20,7 +20,6 @@ import sys
 import numpy as np
 
 from .common import load_config
-from .orchestrator import build_inprocess, build_socket
 
 
 def _first_divergence(a: list, b: list):
@@ -105,6 +104,8 @@ def main(argv=None) -> int:
     ref_first = ref["first_logits"]
     n = len(ref_ids)
     prompt = cfg["generation"]["prompt"]
+
+    from .orchestrator import build_inprocess, build_socket
 
     ports = [int(x) for x in args.ports.split(",")] if args.ports else None
     label = "M2 in-process" if args.mode == "inprocess" else "M3 TCP"

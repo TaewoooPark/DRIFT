@@ -356,6 +356,26 @@ export DRIFT_JOURNAL=~/drift.jsonl && drift run --chain --prompt "…"
 drift ledger ~/drift.jsonl --verify           # per-node contribution, signatures re-checked
 ```
 
+**OpenAI 호환 로컬 백엔드처럼 서빙하기** — 모델은 여전히 DRIFT 노드들에
+분산되어 실행되고, 클라이언트와 맞닿는 표면만 HTTP/SSE가 된다:
+
+```bash
+drift serve --nodes 127.0.0.1:52600,127.0.0.1:52601 --api-key local-dev
+```
+
+지원되는 text-generation 표면은 `/v1/models`, `/v1/chat/completions`,
+`/v1/completions`, `/v1/responses`, `/v1/embeddings`(hidden state를 노출할 수
+있는 모드), tokenizer helper, health/readiness, metrics를 포함한다. 여러 선택지
+(`n`)와 OpenAI 형태의 logprobs를 받으며, logits를 노출할 수 있는 DRIFT 실행은
+선택 토큰/top-k logprob를 실제 logits 기반으로 돌려준다. Tool-call과 JSON
+response-format은 API shape 호환 계층으로 제공되고, Responses streaming은
+semantic SSE event를 내보낸다. DRIFT는 tool을 직접 실행하지 않으며 엄격한
+schema-constrained decoding을 보장하지 않는다. Multimodal/audio와 thin-mode
+sampling/embedding은 명시적인 OpenAI 형태 unsupported error로 응답한다. 자세한
+지원 범위는 [docs/openai-compatibility.md](docs/openai-compatibility.md), 체크리스트
+감사와 Python/JS SDK smoke 및 남은 full-stack gate는
+[docs/openai-compatibility-audit.md](docs/openai-compatibility-audit.md)에 정리되어 있다.
+
 **커스터마이즈 & 파인튜닝**, 곧 모델, 분할 지점, 디바이스, 트러블슈팅은 모두 **운영 매뉴얼 → [docs/manual.ko.md](docs/manual.ko.md)** ([English](docs/manual.md) · [中文](docs/manual.zh.md) · [日本語](docs/manual.ja.md))에 있다.
 
 **라이브로 보기** — [**DRIFT-Demo**](https://github.com/TaewoooPark/DRIFT-Demo): 실제 실행을 두 화면으로 보여주는 비주얼 데모다 — 와이어를 건너는 residual stream, 레이어별 ‖Δh‖, tail이 직접 계산하는 top-k, 서명 영수증, 기여 정산까지 모든 픽셀이 라이브 트래픽에서 그려지며, DRIFT 소스는 건드리지 않는다.

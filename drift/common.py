@@ -10,27 +10,53 @@ from __future__ import annotations
 import yaml
 
 
+def _fallback_chat_prompt(messages: list[dict]) -> str:
+    lines: list[str] = []
+    for msg in messages:
+        role = msg.get("role") or "user"
+        text = msg.get("content") or ""
+        if text:
+            lines.append(f"{role.capitalize()}: {text}")
+    lines.append("Assistant:")
+    return "\n".join(lines)
+
+
 def load_config(path: str = "config.yaml") -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
 
 
-def build_input_ids(tokenizer, prompt: str):
+def build_input_ids(tokenizer, prompt: str | list[dict]):
     """Deterministic input_ids [1, S] via the model's chat template.
 
     Falls back to plain encoding if the tokenizer has no chat template.
     """
+    if isinstance(prompt, list):
+        if getattr(tokenizer, "chat_template", None):
+            try:
+                out = tokenizer.apply_chat_template(
+                    prompt,
+                    add_generation_prompt=True,
+                    return_tensors="pt",
+                    return_dict=True,
+                )
+                return out["input_ids"]
+            except Exception:
+                pass
+        return tokenizer(_fallback_chat_prompt(prompt), return_tensors="pt").input_ids
+
     if getattr(tokenizer, "chat_template", None):
-        out = tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}],
-            add_generation_prompt=True,
-            return_tensors="pt",
-            return_dict=True,
-        )
-        ids = out["input_ids"]
-    else:
-        ids = tokenizer(prompt, return_tensors="pt").input_ids
-    return ids
+        try:
+            out = tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                add_generation_prompt=True,
+                return_tensors="pt",
+                return_dict=True,
+            )
+            return out["input_ids"]
+        except Exception:
+            pass
+    return tokenizer(prompt, return_tensors="pt").input_ids
 
 
 # --------------------------------------------------------------- UX helpers

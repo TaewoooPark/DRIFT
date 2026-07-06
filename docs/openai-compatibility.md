@@ -1,0 +1,103 @@
+# OpenAI Compatibility Matrix
+
+DRIFT's HTTP server is a text-generation OpenAI-compatible surface over the
+existing DRIFT orchestrator. It does not replace the node-to-node TCP+msgpack
+wire protocol. See [openai-compatibility-audit.md](openai-compatibility-audit.md)
+for the checklist-by-checklist evidence and remaining full-stack validation
+items.
+
+## Supported HTTP Surface
+
+| Endpoint | Status | Notes |
+|---|---:|---|
+| `GET /v1/models` | Supported | Includes DRIFT capability metadata. |
+| `POST /v1/chat/completions` | Supported | Non-streaming and SSE streaming. |
+| `POST /v1/completions` | Supported | Legacy prompt API, non-streaming and SSE streaming. |
+| `POST /v1/responses` | Supported | Text responses with semantic SSE streaming, plus minimal function-call and JSON response shapes. |
+| `POST /v1/embeddings` | Supported where possible | Non-thin mode pools final hidden state; thin mode returns capability error. |
+| `POST /v1/chat/completions/input_tokens` | Supported | Token count helper for chat messages. |
+| `POST /tokenize`, `/detokenize` | Supported | llama.cpp-style helpers, with `/v1/` aliases. |
+| `GET /health`, `/ready`, `/metrics` | Supported | Health, readiness/capability metadata, Prometheus-style metrics. |
+
+## Supported Parameters
+
+| Area | Status |
+|---|---|
+| `model`, `messages`, `prompt`, `input` | Supported. |
+| `stream`, `stream_options.include_usage` | Supported. Chat/Completions use data-only SSE with `[DONE]`; Responses uses typed semantic events such as `response.created`, `response.output_text.delta`, and `response.completed`. |
+| `max_tokens`, `max_completion_tokens`, `max_output_tokens` | Supported. |
+| `n` | Supported up to 16 choices per request. |
+| `temperature`, `top_p`, `top_k`, `min_p`, `seed` | Supported in non-thin mode. |
+| `presence_penalty`, `frequency_penalty`, `repetition_penalty` | Supported in non-thin mode. |
+| Chat `logprobs`, `top_logprobs` | OpenAI response shape supported; DRIFT logits-backed runs return exact selected-token logprobs and top-k logprobs. Backends that cannot expose logits fall back to shape-compatible placeholders. |
+| Completion `logprobs` | OpenAI response shape supported; exact when the backend exposes token logprobs, placeholder otherwise. |
+| `stop` strings | Supported for non-streaming and streaming text chunks. |
+| `stop_token_ids` | Supported for non-streaming generation. |
+| `encoding_format=float/base64` for embeddings | Supported. |
+| `tools`, `tool_choice`, legacy `functions`/`function_call` | Compatibility layer supported. Forced tool choice returns OpenAI tool-call shape; auto mode promotes model-emitted tool-call JSON when present. |
+| `response_format={"type":"json_object"}` and Responses `text.format` JSON object | Supported by extracting or wrapping valid JSON. |
+| `response_format={"type":"json_schema", ...}` and Responses `text.format` JSON schema | Supported by extracting JSON and filling simple required object fields without an external validator. |
+| `parallel_tool_calls` | Accepted as a boolean; multiple parsed tool calls can be returned, but DRIFT does not execute tools. |
+
+## Explicitly Unsupported
+
+These requests return OpenAI-shaped errors rather than being silently ignored.
+
+| Feature | Current behavior |
+|---|---|
+| Tool execution | Not performed by DRIFT; the server only emits OpenAI-compatible tool-call requests for the client to execute. |
+| Full JSON-schema constrained decoding | Not guaranteed; JSON output is post-processed/coerced for compatibility. |
+| Multimodal image/audio content | Unsupported error. |
+| Audio transcription/translation APIs | Not exposed. |
+| Embedding `dimensions` truncation/projection | Unsupported error. |
+| Thin-head sampling or embeddings | Capability error; thin mode does not return logits/hidden states to the head. |
+
+## Verification
+
+Local no-model API contract tests:
+
+```bash
+python3 -m pytest \
+  tests/test_openai_api.py \
+  tests/test_openai_compat_payloads.py \
+  tests/test_openai_sdk_smoke.py \
+  tests/test_sampling_controls.py -q
+```
+
+OpenAI Python SDK smoke with an isolated venv:
+
+```bash
+python3 -m venv /tmp/drift-openai-sdk-venv
+/tmp/drift-openai-sdk-venv/bin/python -m pip install openai pytest starlette uvicorn httpx
+PYTHONPATH=$PWD /tmp/drift-openai-sdk-venv/bin/python -m pytest tests/test_openai_sdk_smoke.py -q
+```
+
+OpenAI JS SDK smoke is opt-in because it installs npm packages:
+
+```bash
+DRIFT_RUN_JS_SDK_SMOKE=1 python3 -m pytest tests/test_openai_js_sdk_smoke.py -q
+```
+
+Smoke a running DRIFT server:
+
+```bash
+python scripts/openai_compat_smoke.py \
+  --base-url http://127.0.0.1:8000/v1 \
+  --model Qwen/Qwen2.5-1.5B-Instruct
+```
+
+Existing DRIFT preservation gates should still be run separately on hardware
+that has the required PyTorch/MPS/CUDA stack:
+
+```bash
+python3 -m drift.cli help
+python3 -m drift.cli run --help
+python3 -m drift.cli node --help
+python3 -m drift.cli serve --help
+python3 -m drift.parity_test --mode inprocess
+python3 -m drift.parity_test --mode socket
+python3 -m drift.itest --nodes 2
+python3 -m drift.itest --nodes 2 --chain
+python3 -m drift.itest --nodes 2 --thin
+python3 -m drift.itest --nodes 2 --int8
+```

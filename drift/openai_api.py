@@ -1,0 +1,2169 @@
+"""OpenAI-compatible HTTP surface for DRIFT.
+
+This module is intentionally an adapter: it does not replace DRIFT's node
+transport. The HTTP server accepts OpenAI-shaped requests at the edge, then
+calls the existing orchestrator, which still talks to nodes over the frozen
+TCP+msgpack protocol.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import base64
+import json
+import os
+import struct
+import threading
+import time
+import uuid
+from dataclasses import dataclass
+from typing import Iterable, Protocol
+
+
+Prompt = str | list[dict]
+
+
+@dataclass
+class GenerationResult:
+    text: str
+    token_ids: list[int] | None = None
+    finish_reason: str = "stop"
+    logprobs: list[dict] | None = None
+
+
+class OpenAIBackend(Protocol):
+    model_id: str
+    default_max_tokens: int
+    context_length: int | None
+    supports_embeddings: bool
+
+    def generate(self, prompt: Prompt, max_tokens: int, session_id: str,
+                 options: dict | None = None) -> GenerationResult:
+        ...
+
+    def stream(self, prompt: Prompt, max_tokens: int, session_id: str,
+               options: dict | None = None) -> Iterable[str]:
+        ...
+
+    def count_tokens(self, prompt: Prompt) -> int:
+        ...
+
+    def decode_tokens(self, token_ids: list[int]) -> str:
+        ...
+
+    def encode_tokens(self, prompt: Prompt) -> list[int]:
+        ...
+
+    def embed(self, prompt: Prompt, session_id: str) -> list[float]:
+        ...
+
+
+class DriftBackend:
+    """Long-lived bridge from HTTP requests to one DRIFT orchestrator.
+
+    The lock is deliberately coarse for stage 1. The underlying transport keeps
+    session, socket, receipt, and sequence state, so the first compatibility
+    layer serializes generation rather than letting concurrent requests
+    interleave shared state.
+    """
+
+    def __init__(self, orchestrator, model_id: str, default_max_tokens: int = 128):
+        self.orchestrator = orchestrator
+        self.model_id = model_id
+        self.default_max_tokens = default_max_tokens
+        self.supports_sampling = not getattr(orchestrator, "thin", False)
+        self.supports_embeddings = not getattr(orchestrator, "thin", False)
+        self.context_length = self._context_length()
+        self._lock = threading.Lock()
+
+    def _context_length(self) -> int | None:
+        cfg = getattr(getattr(self.orchestrator.head, "lm", None), "config", None)
+        for name in ("max_position_embeddings", "seq_length", "n_positions"):
+            value = getattr(cfg, name, None)
+            if isinstance(value, int) and value > 0:
+                return value
+        value = getattr(self.orchestrator.head.tokenizer, "model_max_length", None)
+        if isinstance(value, int) and 0 < value < 1_000_000_000:
+            return value
+        return None
+
+    def generate(self, prompt: Prompt, max_tokens: int, session_id: str,
+                 options: dict | None = None) -> GenerationResult:
+        with self._lock:
+            out = self.orchestrator.generate(
+                prompt, max_tokens, stop_on_eos=True, session_id=session_id,
+                generation_options=options,
+            )
+        token_ids = list(out.get("token_ids") or [])
+        finish = "length" if len(token_ids) >= max_tokens else "stop"
+        return GenerationResult(text=out.get("text", ""), token_ids=token_ids,
+                                finish_reason=finish, logprobs=out.get("logprobs"))
+
+    def stream(self, prompt: Prompt, max_tokens: int, session_id: str,
+               options: dict | None = None) -> Iterable[str]:
+        with self._lock:
+            yield from self.orchestrator.generate_stream(
+                prompt, max_tokens, stop_on_eos=True, session_id=session_id,
+                generation_options=options,
+            )
+
+    def count_tokens(self, prompt: Prompt) -> int:
+        from .common import build_input_ids
+
+        tok = self.orchestrator.head.tokenizer
+        try:
+            ids = build_input_ids(tok, prompt)
+        except Exception:
+            return 0
+        try:
+            return int(ids.shape[-1])
+        except Exception:
+            pass
+        if ids and isinstance(ids[0], list):
+            return len(ids[0])
+        return len(ids or [])
+
+    def decode_tokens(self, token_ids: list[int]) -> str:
+        return self.orchestrator.head.tokenizer.decode(token_ids)
+
+    def encode_tokens(self, prompt: Prompt) -> list[int]:
+        from .common import build_input_ids
+
+        ids = build_input_ids(self.orchestrator.head.tokenizer, prompt)
+        try:
+            return [int(x) for x in ids[0].tolist()]
+        except Exception:
+            return [int(x) for x in ids]
+
+    def embed(self, prompt: Prompt, session_id: str) -> list[float]:
+        if not self.supports_embeddings:
+            raise ValueError("embeddings are not available in thin-head mode")
+        from .common import build_input_ids
+
+        import torch
+
+        with self._lock, torch.no_grad():
+            try:
+                input_ids = build_input_ids(self.orchestrator.head.tokenizer, prompt).to(
+                    self.orchestrator.device
+                )
+                prompt_ids = input_ids[0].tolist()
+                hidden = self.orchestrator.head.embed(input_ids)
+                hidden = self.orchestrator.transport.route(
+                    self.orchestrator.order, session_id, hidden,
+                    list(range(len(prompt_ids))), prompt_ids, "prefill"
+                ).to(self.orchestrator.device)
+                pooled = self.orchestrator.head.norm(hidden)[:, -1, :][0]
+                vector = pooled.detach().float().cpu().tolist()
+            finally:
+                for name in self.orchestrator.order:
+                    try:
+                        self.orchestrator.transport.reset(name, session_id)
+                    except Exception:
+                        pass
+            return [float(x) for x in vector]
+
+
+class OpenAIHTTPError(Exception):
+    def __init__(
+        self,
+        status_code: int,
+        message: str,
+        *,
+        type_: str = "invalid_request_error",
+        param: str | None = None,
+        code: str | None = None,
+    ):
+        super().__init__(message)
+        self.status_code = status_code
+        self.message = message
+        self.type = type_
+        self.param = param
+        self.code = code
+
+
+def _require_starlette():
+    try:
+        from starlette.applications import Starlette
+        from starlette.middleware.base import BaseHTTPMiddleware
+        from starlette.middleware.cors import CORSMiddleware
+        from starlette.requests import Request
+        from starlette.responses import JSONResponse, PlainTextResponse, StreamingResponse
+        from starlette.routing import Route
+    except ImportError as e:
+        raise RuntimeError(
+            "drift serve requires the HTTP extras: install starlette and uvicorn"
+        ) from e
+    return (
+        Starlette, BaseHTTPMiddleware, CORSMiddleware, Request,
+        JSONResponse, PlainTextResponse, StreamingResponse, Route,
+    )
+
+
+def _now() -> int:
+    return int(time.time())
+
+
+def _make_id(prefix: str) -> str:
+    return f"{prefix}-{uuid.uuid4().hex}"
+
+
+def _json_sse(obj: dict) -> str:
+    return f"data: {json.dumps(obj, separators=(',', ':'), ensure_ascii=False)}\n\n"
+
+
+def _event_sse(event: str, obj: dict) -> str:
+    data = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+    return f"event: {event}\ndata: {data}\n\n"
+
+
+def _content_to_text(content, param: str) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for i, part in enumerate(content):
+            if not isinstance(part, dict):
+                raise OpenAIHTTPError(400, f"{param}[{i}] must be an object", param=param)
+            ptype = part.get("type")
+            if ptype in ("text", "input_text"):
+                parts.append(str(part.get("text") or ""))
+            elif ptype in ("image_url", "input_image"):
+                raise OpenAIHTTPError(
+                    400,
+                    "multimodal chat content is not supported by this DRIFT endpoint yet",
+                    param=param,
+                    code="unsupported_multimodal_content",
+                )
+            else:
+                raise OpenAIHTTPError(
+                    400, f"unsupported content part type: {ptype!r}", param=param
+                )
+        return "\n".join(p for p in parts if p)
+    raise OpenAIHTTPError(400, f"{param} must be a string or content-part array", param=param)
+
+
+def normalize_chat_messages(messages: list[dict]) -> list[dict]:
+    if not isinstance(messages, list) or not messages:
+        raise OpenAIHTTPError(400, "`messages` must be a non-empty array", param="messages")
+    normalized: list[dict] = []
+    for i, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            raise OpenAIHTTPError(400, f"messages[{i}] must be an object",
+                                  param=f"messages[{i}]")
+        role = msg.get("role")
+        if role not in {"system", "developer", "user", "assistant", "tool"}:
+            raise OpenAIHTTPError(400, f"unsupported message role: {role!r}",
+                                  param=f"messages[{i}].role")
+        text = _content_to_text(msg.get("content"), f"messages[{i}].content")
+        if msg.get("tool_calls"):
+            text = "\n".join(
+                p for p in [
+                    text,
+                    "Tool calls: " + json.dumps(msg["tool_calls"], ensure_ascii=False),
+                ] if p
+            )
+        if role == "developer":
+            role = "system"
+        normalized.append({"role": role, "content": text})
+    return normalized
+
+
+def render_chat_prompt(messages: list[dict]) -> str:
+    lines: list[str] = []
+    for msg in normalize_chat_messages(messages):
+        text = msg.get("content") or ""
+        if text:
+            lines.append(f"{msg['role'].capitalize()}: {text}")
+    lines.append("Assistant:")
+    return "\n".join(lines)
+
+
+def _validate_model(body: dict, backend: OpenAIBackend) -> str:
+    model = body.get("model") or backend.model_id
+    if model != backend.model_id:
+        raise OpenAIHTTPError(
+            404,
+            f"model {model!r} is not served by this DRIFT endpoint",
+            type_="invalid_request_error",
+            param="model",
+            code="model_not_found",
+        )
+    return model
+
+
+def _validate_max_tokens(body: dict, backend: OpenAIBackend) -> int:
+    raw = body.get("max_tokens", body.get("max_completion_tokens", backend.default_max_tokens))
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        raise OpenAIHTTPError(400, "`max_tokens` must be an integer", param="max_tokens")
+    if n < 1:
+        raise OpenAIHTTPError(400, "`max_tokens` must be >= 1", param="max_tokens")
+    return n
+
+
+def _validate_stage1_options(body: dict) -> None:
+    known = {
+        "model", "messages", "max_tokens", "max_completion_tokens", "stream",
+        "stream_options", "temperature", "top_p", "top_k", "min_p", "n", "stop",
+        "stop_token_ids", "parallel_tool_calls",
+        "presence_penalty", "frequency_penalty", "repetition_penalty", "seed", "user", "tools",
+        "tool_choice", "functions", "function_call", "logprobs", "top_logprobs",
+        "response_format", "logit_bias",
+    }
+    unknown = sorted(set(body) - known)
+    if unknown:
+        raise OpenAIHTTPError(
+            400,
+            f"unsupported request field(s): {', '.join(unknown)}",
+            code="unsupported_parameter",
+        )
+    _choice_count(body)
+    if body.get("logit_bias") not in (None, {}):
+        raise OpenAIHTTPError(
+            400, "`logit_bias` is not supported by this endpoint stage yet",
+            param="logit_bias", code="unsupported_parameter"
+        )
+    _response_format(body)
+    _request_tools(body)
+    _tool_choice(body)
+    _chat_logprobs_options(body)
+    if body.get("parallel_tool_calls") not in (None, True, False):
+        raise OpenAIHTTPError(
+            400, "`parallel_tool_calls` must be a boolean",
+            param="parallel_tool_calls",
+        )
+
+
+def _include_stream_usage(body: dict) -> bool:
+    opts = body.get("stream_options") or {}
+    if not isinstance(opts, dict):
+        raise OpenAIHTTPError(400, "`stream_options` must be an object",
+                              param="stream_options")
+    return bool(opts.get("include_usage"))
+
+
+def _choice_count(body: dict) -> int:
+    try:
+        n = int(body.get("n", 1))
+    except (TypeError, ValueError):
+        raise OpenAIHTTPError(400, "`n` must be an integer", param="n")
+    if n < 1 or n > 16:
+        raise OpenAIHTTPError(400, "`n` must be between 1 and 16", param="n")
+    return n
+
+
+def _top_logprobs_count(raw, param: str) -> int:
+    if raw is None:
+        return 0
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        raise OpenAIHTTPError(400, f"`{param}` must be an integer", param=param)
+    if n < 0 or n > 20:
+        raise OpenAIHTTPError(400, f"`{param}` must be between 0 and 20", param=param)
+    return n
+
+
+def _chat_logprobs_options(body: dict) -> tuple[bool, int]:
+    requested = body.get("logprobs", False)
+    top_raw = body.get("top_logprobs")
+    if requested in (None, False):
+        if top_raw not in (None, 0):
+            raise OpenAIHTTPError(
+                400, "`top_logprobs` requires `logprobs=true`",
+                param="top_logprobs",
+            )
+        return False, 0
+    if requested is not True:
+        raise OpenAIHTTPError(400, "`logprobs` must be a boolean", param="logprobs")
+    return True, _top_logprobs_count(top_raw, "top_logprobs")
+
+
+def _completion_logprobs_count(body: dict) -> int | None:
+    if "logprobs" not in body or body.get("logprobs") is None:
+        return None
+    return _top_logprobs_count(body.get("logprobs"), "logprobs")
+
+
+def _response_format(body: dict) -> dict:
+    fmt = body.get("response_format")
+    text_config = body.get("text")
+    if fmt is None and isinstance(text_config, dict) and isinstance(text_config.get("format"), dict):
+        fmt = text_config["format"]
+    fmt = fmt or {"type": "text"}
+    if not isinstance(fmt, dict):
+        raise OpenAIHTTPError(400, "`response_format` must be an object",
+                              param="response_format")
+    fmt = dict(fmt)
+    ftype = fmt.get("type", "text")
+    if ftype not in {"text", "json_object", "json_schema"}:
+        raise OpenAIHTTPError(
+            400,
+            "`response_format.type` must be text, json_object, or json_schema",
+            param="response_format",
+            code="unsupported_parameter",
+        )
+    if ftype == "json_schema":
+        js = fmt.get("json_schema")
+        if js is None and isinstance(fmt.get("schema"), dict):
+            js = {
+                "name": fmt.get("name", "response"),
+                "schema": fmt["schema"],
+            }
+            for key in ("description", "strict"):
+                if key in fmt:
+                    js[key] = fmt[key]
+            fmt["json_schema"] = js
+        if not isinstance(js, dict) or not isinstance(js.get("schema"), dict):
+            raise OpenAIHTTPError(
+                400,
+                "`response_format.json_schema.schema` must be an object",
+                param="response_format",
+            )
+    return fmt
+
+
+def _request_tools(body: dict) -> list[dict]:
+    tools = body.get("tools")
+    if tools in (None, []):
+        tools = []
+    if body.get("functions") not in (None, []):
+        if tools:
+            raise OpenAIHTTPError(
+                400, "use either `tools` or legacy `functions`, not both",
+                param="tools",
+            )
+        funcs = body["functions"]
+        if not isinstance(funcs, list):
+            raise OpenAIHTTPError(400, "`functions` must be an array", param="functions")
+        tools = [{"type": "function", "function": f} for f in funcs]
+    if not isinstance(tools, list):
+        raise OpenAIHTTPError(400, "`tools` must be an array", param="tools")
+    normalized = []
+    for i, tool in enumerate(tools):
+        if not isinstance(tool, dict) or tool.get("type", "function") != "function":
+            raise OpenAIHTTPError(400, "only function tools are supported",
+                                  param=f"tools[{i}]")
+        fn = tool.get("function")
+        if fn is None and isinstance(tool.get("name"), str):
+            fn = {
+                "name": tool["name"],
+            }
+            for key in ("description", "parameters", "strict"):
+                if key in tool:
+                    fn[key] = tool[key]
+        if not isinstance(fn, dict) or not isinstance(fn.get("name"), str) or not fn["name"]:
+            raise OpenAIHTTPError(400, "function tools require `function.name`",
+                                  param=f"tools[{i}].function.name")
+        normalized.append({"type": "function", "function": dict(fn)})
+    return normalized
+
+
+def _tool_choice(body: dict):
+    tools = _request_tools(body)
+    choice = body.get("tool_choice", body.get("function_call"))
+    if choice is None:
+        return "auto" if tools else "none"
+    if choice in ("none", "auto", "required"):
+        if choice == "required" and not tools:
+            raise OpenAIHTTPError(400, "`tool_choice=required` requires `tools`",
+                                  param="tool_choice")
+        return choice
+    if isinstance(choice, dict):
+        if "function" in choice and isinstance(choice["function"], dict):
+            name = choice["function"].get("name")
+        else:
+            name = choice.get("name")
+        if isinstance(name, str) and name:
+            if not tools:
+                raise OpenAIHTTPError(400, "`tool_choice` requires `tools`",
+                                      param="tool_choice")
+            return {"type": "function", "function": {"name": name}}
+    raise OpenAIHTTPError(400, "unsupported `tool_choice`", param="tool_choice")
+
+
+def _schema_default(schema: dict, fallback_text: str = ""):
+    stype = schema.get("type")
+    if isinstance(stype, list):
+        stype = next((t for t in stype if t != "null"), stype[0] if stype else None)
+    if "enum" in schema and isinstance(schema["enum"], list) and schema["enum"]:
+        return schema["enum"][0]
+    if "const" in schema:
+        return schema["const"]
+    if stype == "object" or "properties" in schema:
+        props = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+        required = schema.get("required") if isinstance(schema.get("required"), list) else []
+        out = {}
+        for key in required:
+            if isinstance(key, str):
+                out[key] = _schema_default(props.get(key, {}), fallback_text)
+        return out
+    if stype == "array":
+        return []
+    if stype in ("number", "integer"):
+        return 0
+    if stype == "boolean":
+        return False
+    return fallback_text
+
+
+def _extract_json_value(text: str):
+    decoder = json.JSONDecoder()
+    for i, ch in enumerate(text):
+        if ch not in "[{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text[i:])
+            return value
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def _coerce_json_text(text: str, response_format: dict) -> str:
+    ftype = response_format.get("type", "text")
+    if ftype == "text":
+        return text
+    value = _extract_json_value(text)
+    if ftype == "json_object":
+        if not isinstance(value, (dict, list)):
+            value = {"response": text}
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+    schema = response_format["json_schema"]["schema"]
+    if not isinstance(value, dict):
+        value = {}
+    props = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    required = schema.get("required") if isinstance(schema.get("required"), list) else []
+    out = dict(value)
+    for key in required:
+        if isinstance(key, str) and key not in out:
+            out[key] = _schema_default(props.get(key, {}), text)
+    if schema.get("additionalProperties") is False and props:
+        out = {k: v for k, v in out.items() if k in props}
+    if not out and props:
+        for key, subschema in props.items():
+            out[key] = _schema_default(subschema, text)
+    return json.dumps(out, ensure_ascii=False, separators=(",", ":"))
+
+
+def _tool_arg_defaults(tool: dict) -> dict:
+    params = tool.get("function", {}).get("parameters")
+    return _schema_default(params, "") if isinstance(params, dict) else {}
+
+
+def _parse_tool_calls(text: str, tools: list[dict]) -> list[dict]:
+    if not tools:
+        return []
+    value = _extract_json_value(text)
+    raw_calls = []
+    if isinstance(value, dict):
+        if isinstance(value.get("tool_calls"), list):
+            raw_calls = value["tool_calls"]
+        elif isinstance(value.get("tool_call"), dict):
+            raw_calls = [value["tool_call"]]
+        elif isinstance(value.get("name"), str) or isinstance(value.get("function"), dict):
+            raw_calls = [value]
+    names = {t["function"]["name"] for t in tools}
+    calls = []
+    for call in raw_calls:
+        if not isinstance(call, dict):
+            continue
+        fn = call.get("function") if isinstance(call.get("function"), dict) else call
+        name = fn.get("name")
+        if name not in names:
+            continue
+        args = fn.get("arguments", call.get("arguments", {}))
+        if isinstance(args, str):
+            arguments = args
+        else:
+            arguments = json.dumps(args if isinstance(args, dict) else {},
+                                   ensure_ascii=False, separators=(",", ":"))
+        calls.append({
+            "id": call.get("id") or _make_id("call"),
+            "type": "function",
+            "function": {"name": name, "arguments": arguments},
+        })
+    return calls
+
+
+def _forced_tool_call(tools: list[dict], choice) -> dict | None:
+    if not tools or choice == "none":
+        return None
+    selected = None
+    if choice == "required":
+        selected = tools[0]
+    elif isinstance(choice, dict):
+        name = choice.get("function", {}).get("name")
+        selected = next((t for t in tools if t["function"]["name"] == name), None)
+        if selected is None:
+            raise OpenAIHTTPError(400, f"tool {name!r} is not defined", param="tool_choice")
+    if selected is None:
+        return None
+    return {
+        "id": _make_id("call"),
+        "type": "function",
+        "function": {
+            "name": selected["function"]["name"],
+            "arguments": json.dumps(_tool_arg_defaults(selected),
+                                    ensure_ascii=False, separators=(",", ":")),
+        },
+    }
+
+
+def _finish_chat_result(result: GenerationResult, backend: OpenAIBackend, body: dict) -> dict:
+    response_format = _response_format(body)
+    tools = _request_tools(body)
+    choice = _tool_choice(body)
+    tool_calls = [] if choice == "none" else _parse_tool_calls(result.text, tools)
+    forced = _forced_tool_call(tools, choice)
+    if forced is not None and not tool_calls:
+        tool_calls = [forced]
+    if tool_calls:
+        return {
+            "content": None,
+            "tool_calls": tool_calls,
+            "finish_reason": "tool_calls",
+            "token_ids": result.token_ids,
+            "logprobs": None,
+        }
+    return {
+        "content": _coerce_json_text(result.text, response_format),
+        "tool_calls": None,
+        "finish_reason": result.finish_reason,
+        "token_ids": result.token_ids,
+        "logprobs": result.logprobs,
+    }
+
+
+def _float_param(body: dict, key: str, default: float) -> float:
+    if body.get(key) is None:
+        return default
+    try:
+        return float(body[key])
+    except (TypeError, ValueError):
+        raise OpenAIHTTPError(400, f"`{key}` must be a number", param=key)
+
+
+def _int_param(body: dict, key: str, default: int) -> int:
+    if body.get(key) is None:
+        return default
+    try:
+        return int(body[key])
+    except (TypeError, ValueError):
+        raise OpenAIHTTPError(400, f"`{key}` must be an integer", param=key)
+
+
+def _generation_options(body: dict, backend: OpenAIBackend) -> dict:
+    opts = {
+        "temperature": _float_param(body, "temperature", 0.0),
+        "top_p": _float_param(body, "top_p", 1.0),
+        "top_k": _int_param(body, "top_k", 0),
+        "min_p": _float_param(body, "min_p", 0.0),
+        "presence_penalty": _float_param(body, "presence_penalty", 0.0),
+        "frequency_penalty": _float_param(body, "frequency_penalty", 0.0),
+        "repetition_penalty": _float_param(body, "repetition_penalty", 1.0),
+        "seed": None if body.get("seed") is None else _int_param(body, "seed", 0),
+    }
+    if opts["temperature"] < 0:
+        raise OpenAIHTTPError(400, "`temperature` must be >= 0", param="temperature")
+    if not 0 < opts["top_p"] <= 1:
+        raise OpenAIHTTPError(400, "`top_p` must be > 0 and <= 1", param="top_p")
+    if opts["top_k"] < 0:
+        raise OpenAIHTTPError(400, "`top_k` must be >= 0", param="top_k")
+    if not 0 <= opts["min_p"] <= 1:
+        raise OpenAIHTTPError(400, "`min_p` must be >= 0 and <= 1", param="min_p")
+    for key in ("presence_penalty", "frequency_penalty"):
+        if not -2 <= opts[key] <= 2:
+            raise OpenAIHTTPError(400, f"`{key}` must be between -2 and 2", param=key)
+    if opts["repetition_penalty"] <= 0:
+        raise OpenAIHTTPError(
+            400, "`repetition_penalty` must be > 0", param="repetition_penalty"
+        )
+
+    non_greedy = (
+        opts["temperature"] > 0
+        or opts["top_p"] < 1
+        or opts["top_k"] > 0
+        or opts["min_p"] > 0
+        or opts["presence_penalty"] != 0
+        or opts["frequency_penalty"] != 0
+        or opts["repetition_penalty"] != 1
+    )
+    if non_greedy and not getattr(backend, "supports_sampling", True):
+        raise OpenAIHTTPError(
+            400,
+            "sampling parameters are not available in DRIFT thin-head mode",
+            code="unsupported_sampling",
+        )
+    return opts
+
+
+def _stop_strings(body: dict) -> list[str]:
+    stop = body.get("stop")
+    if stop in (None, ""):
+        return []
+    if isinstance(stop, str):
+        return [stop]
+    if isinstance(stop, list) and all(isinstance(x, str) for x in stop):
+        return [x for x in stop if x]
+    raise OpenAIHTTPError(400, "`stop` must be a string or string array", param="stop")
+
+
+def _stop_token_ids(body: dict) -> list[int]:
+    raw = body.get("stop_token_ids")
+    if raw in (None, []):
+        return []
+    if not isinstance(raw, list) or not all(isinstance(x, int) for x in raw):
+        raise OpenAIHTTPError(
+            400, "`stop_token_ids` must be an integer array", param="stop_token_ids"
+        )
+    return [int(x) for x in raw]
+
+
+def _check_context(backend: OpenAIBackend, prompt: Prompt, max_tokens: int) -> None:
+    limit = getattr(backend, "context_length", None)
+    if not limit:
+        return
+    prompt_tokens = backend.count_tokens(prompt)
+    if prompt_tokens + max_tokens > int(limit):
+        raise OpenAIHTTPError(
+            400,
+            f"requested tokens exceed model context window ({prompt_tokens}+{max_tokens}>{limit})",
+            code="context_length_exceeded",
+        )
+
+
+def _apply_stops(result: GenerationResult, backend: OpenAIBackend,
+                 stop_strings: list[str], stop_token_ids: list[int]) -> GenerationResult:
+    text = result.text
+    token_ids = list(result.token_ids) if result.token_ids is not None else None
+    logprobs = list(result.logprobs) if result.logprobs is not None else None
+    finish = result.finish_reason
+
+    if token_ids is not None and stop_token_ids:
+        stop_set = set(stop_token_ids)
+        for i, tid in enumerate(token_ids):
+            if tid in stop_set:
+                token_ids = token_ids[:i]
+                if logprobs is not None:
+                    logprobs = logprobs[:i]
+                text = backend.decode_tokens(token_ids)
+                finish = "stop"
+                break
+
+    if stop_strings:
+        found = [(text.find(s), s) for s in stop_strings if s and text.find(s) >= 0]
+        if found:
+            idx, _ = min(found, key=lambda x: x[0])
+            text = text[:idx]
+            logprobs = None
+            finish = "stop"
+
+    return GenerationResult(
+        text=text, token_ids=token_ids, finish_reason=finish, logprobs=logprobs
+    )
+
+
+def _split_on_stop(text: str, stop_strings: list[str]) -> tuple[str, bool]:
+    if not stop_strings:
+        return text, False
+    found = [(text.find(s), s) for s in stop_strings if s and text.find(s) >= 0]
+    if not found:
+        return text, False
+    idx, _ = min(found, key=lambda x: x[0])
+    return text[:idx], True
+
+
+def _validate_completion_options(body: dict) -> None:
+    known = {
+        "model", "prompt", "suffix", "max_tokens", "temperature", "top_p",
+        "top_k", "min_p", "n", "stream", "stream_options", "logprobs", "echo",
+        "stop", "stop_token_ids", "presence_penalty", "frequency_penalty", "repetition_penalty",
+        "best_of", "logit_bias", "user", "seed",
+    }
+    unknown = sorted(set(body) - known)
+    if unknown:
+        raise OpenAIHTTPError(
+            400,
+            f"unsupported request field(s): {', '.join(unknown)}",
+            code="unsupported_parameter",
+        )
+    _choice_count(body)
+    _completion_logprobs_count(body)
+    if body.get("logit_bias") not in (None, {}):
+        raise OpenAIHTTPError(
+            400, "`logit_bias` is not supported by this endpoint stage yet",
+            param="logit_bias", code="unsupported_parameter"
+        )
+    if body.get("suffix") not in (None, ""):
+        raise OpenAIHTTPError(
+            400, "`suffix` is not supported by this endpoint stage yet",
+            param="suffix", code="unsupported_parameter"
+        )
+    if body.get("best_of") not in (None, 1):
+        raise OpenAIHTTPError(
+            400, "`best_of` is not supported by this endpoint stage yet",
+            param="best_of", code="unsupported_parameter"
+        )
+
+
+def _decode_token_prompt(backend: OpenAIBackend, item, param: str) -> str:
+    if not isinstance(item, list) or not all(isinstance(x, int) for x in item):
+        raise OpenAIHTTPError(400, f"{param} must be a string or token id array",
+                              param=param)
+    return backend.decode_tokens([int(x) for x in item])
+
+
+def normalize_completion_prompts(body: dict, backend: OpenAIBackend) -> list[str]:
+    if "prompt" not in body:
+        raise OpenAIHTTPError(400, "`prompt` is required", param="prompt")
+    prompt = body.get("prompt")
+    if isinstance(prompt, str):
+        return [prompt]
+    if isinstance(prompt, list):
+        if not prompt:
+            raise OpenAIHTTPError(400, "`prompt` array must not be empty", param="prompt")
+        if all(isinstance(x, str) for x in prompt):
+            return list(prompt)
+        if all(isinstance(x, int) for x in prompt):
+            return [_decode_token_prompt(backend, prompt, "prompt")]
+        out: list[str] = []
+        for i, item in enumerate(prompt):
+            if isinstance(item, str):
+                out.append(item)
+            elif isinstance(item, list):
+                out.append(_decode_token_prompt(backend, item, f"prompt[{i}]"))
+            else:
+                raise OpenAIHTTPError(
+                    400,
+                    "prompt array entries must be strings or token id arrays",
+                    param=f"prompt[{i}]",
+                )
+        return out
+    raise OpenAIHTTPError(400, "`prompt` must be a string or array", param="prompt")
+
+
+def normalize_embedding_inputs(body: dict, backend: OpenAIBackend) -> list[Prompt]:
+    if "input" not in body:
+        raise OpenAIHTTPError(400, "`input` is required", param="input")
+    raw = body.get("input")
+    if isinstance(raw, str):
+        if raw == "":
+            raise OpenAIHTTPError(400, "`input` must not be empty", param="input")
+        return [raw]
+    if isinstance(raw, list):
+        if not raw:
+            raise OpenAIHTTPError(400, "`input` array must not be empty", param="input")
+        if all(isinstance(x, str) for x in raw):
+            if any(x == "" for x in raw):
+                raise OpenAIHTTPError(400, "`input` entries must not be empty",
+                                      param="input")
+            return list(raw)
+        if all(isinstance(x, int) for x in raw):
+            return [backend.decode_tokens([int(x) for x in raw])]
+        out: list[Prompt] = []
+        for i, item in enumerate(raw):
+            if isinstance(item, str):
+                if item == "":
+                    raise OpenAIHTTPError(400, "`input` entries must not be empty",
+                                          param=f"input[{i}]")
+                out.append(item)
+            elif isinstance(item, list) and all(isinstance(x, int) for x in item):
+                out.append(backend.decode_tokens([int(x) for x in item]))
+            else:
+                raise OpenAIHTTPError(
+                    400,
+                    "input array entries must be strings or token id arrays",
+                    param=f"input[{i}]",
+                )
+        return out
+    raise OpenAIHTTPError(400, "`input` must be a string or array", param="input")
+
+
+def _format_embedding(vector: list[float], encoding_format: str):
+    if encoding_format == "float":
+        return vector
+    if encoding_format == "base64":
+        packed = struct.pack(f"<{len(vector)}f", *vector)
+        return base64.b64encode(packed).decode("ascii")
+    raise OpenAIHTTPError(
+        400, "`encoding_format` must be `float` or `base64`",
+        param="encoding_format",
+    )
+
+
+def _usage(backend: OpenAIBackend, prompt: Prompt, result: GenerationResult) -> dict:
+    completion_tokens = (
+        len(result.token_ids) if result.token_ids is not None else backend.count_tokens(result.text)
+    )
+    prompt_tokens = backend.count_tokens(prompt)
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+
+
+def _usage_for_results(
+    backend: OpenAIBackend, prompt: Prompt, results: list[GenerationResult]
+) -> dict:
+    prompt_tokens = backend.count_tokens(prompt)
+    completion_tokens = sum(
+        len(r.token_ids) if r.token_ids is not None else backend.count_tokens(r.text)
+        for r in results
+    )
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+
+
+def _responses_usage(usage: dict | None) -> dict | None:
+    if usage is None:
+        return None
+    return {
+        "input_tokens": usage["prompt_tokens"],
+        "input_tokens_details": {"cached_tokens": 0},
+        "output_tokens": usage["completion_tokens"],
+        "output_tokens_details": {"reasoning_tokens": 0},
+        "total_tokens": usage["total_tokens"],
+    }
+
+
+def _responses_tools(tools: list[dict]) -> list[dict]:
+    out = []
+    for tool in tools:
+        fn = tool["function"]
+        item = {"type": "function", "name": fn["name"]}
+        if "description" in fn:
+            item["description"] = fn["description"]
+        if "parameters" in fn:
+            item["parameters"] = fn["parameters"]
+        if "strict" in fn:
+            item["strict"] = fn["strict"]
+        out.append(item)
+    return out
+
+
+def _responses_tool_choice(choice):
+    if isinstance(choice, str):
+        return choice
+    if isinstance(choice, dict):
+        name = None
+        if isinstance(choice.get("function"), dict):
+            name = choice["function"].get("name")
+        else:
+            name = choice.get("name")
+        if isinstance(name, str) and name:
+            return {"type": "function", "name": name}
+    return "auto"
+
+
+def _responses_text_format(response_format: dict) -> dict:
+    ftype = response_format.get("type", "text")
+    if ftype == "json_schema":
+        js = response_format.get("json_schema", {})
+        out = {
+            "type": "json_schema",
+            "name": js.get("name", "response"),
+            "schema": js.get("schema", {}),
+        }
+        for key in ("description", "strict"):
+            if key in js:
+                out[key] = js[key]
+        return out
+    return {"type": ftype}
+
+
+def _responses_output_from_finished(finished: dict, message_id: str | None = None):
+    if finished["tool_calls"]:
+        return [
+            {
+                "type": "function_call",
+                "id": call["id"],
+                "call_id": call["id"],
+                "name": call["function"]["name"],
+                "arguments": call["function"]["arguments"],
+                "status": "completed",
+            }
+            for call in finished["tool_calls"]
+        ], "", None
+
+    output_text = finished["content"] or ""
+    msg_id = message_id or _make_id("msg")
+    return [{
+        "id": msg_id,
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{
+            "type": "output_text",
+            "text": output_text,
+            "annotations": [],
+        }],
+    }], output_text, msg_id
+
+
+def _responses_payload(
+    rid: str,
+    model: str,
+    body: dict,
+    output: list[dict],
+    output_text: str,
+    usage: dict | None,
+    *,
+    status: str = "completed",
+    created_at: int | None = None,
+) -> dict:
+    tools = _request_tools(body)
+    response_format = _response_format(body)
+    payload = {
+        "id": rid,
+        "object": "response",
+        "created_at": float(created_at if created_at is not None else _now()),
+        "model": model,
+        "status": status,
+        "output": output,
+        "output_text": output_text,
+        "parallel_tool_calls": bool(body.get("parallel_tool_calls", True)),
+        "tool_choice": _responses_tool_choice(_tool_choice(body)),
+        "tools": _responses_tools(tools),
+        "usage": _responses_usage(usage),
+    }
+    if body.get("max_output_tokens") is not None:
+        payload["max_output_tokens"] = body["max_output_tokens"]
+    elif body.get("max_tokens") is not None:
+        payload["max_output_tokens"] = body["max_tokens"]
+    for key in ("temperature", "top_p", "user"):
+        if body.get(key) is not None:
+            payload[key] = body[key]
+    if response_format.get("type", "text") != "text":
+        payload["text"] = {"format": _responses_text_format(response_format)}
+    return payload
+
+
+def _generation_options_for_choice(
+    options: dict,
+    choice_index: int,
+    *,
+    return_logprobs: bool = False,
+    top_logprobs: int = 0,
+) -> dict:
+    if not options:
+        out = {}
+    else:
+        out = dict(options)
+    if return_logprobs:
+        out["_return_logprobs"] = True
+        out["_top_logprobs"] = int(top_logprobs)
+    if choice_index and out.get("seed") is not None:
+        out["seed"] = int(out["seed"]) + choice_index
+    return out
+
+
+def _token_strings(
+    backend: OpenAIBackend, text: str, token_ids: list[int] | None
+) -> list[str]:
+    if token_ids is None:
+        try:
+            token_ids = backend.encode_tokens(text)
+        except Exception:
+            token_ids = None
+    if token_ids:
+        tokens = []
+        for tid in token_ids:
+            try:
+                tokens.append(backend.decode_tokens([int(tid)]))
+            except Exception:
+                tokens.append(str(tid))
+        return tokens
+    return [text] if text else []
+
+
+def _token_bytes(token: str) -> list[int]:
+    return list(token.encode("utf-8"))
+
+
+def _exact_logprob_item(
+    backend: OpenAIBackend, item: dict | None, fallback_token: str, fallback_logprob: float = 0.0
+) -> tuple[str, float]:
+    if not isinstance(item, dict):
+        return fallback_token, fallback_logprob
+    token_id = item.get("token_id")
+    token = fallback_token
+    if token_id is not None:
+        try:
+            token = backend.decode_tokens([int(token_id)])
+        except Exception:
+            token = str(token_id)
+    try:
+        logprob = float(item.get("logprob", fallback_logprob))
+    except (TypeError, ValueError):
+        logprob = fallback_logprob
+    return token, logprob
+
+
+def _exact_top_logprobs(
+    backend: OpenAIBackend,
+    item: dict | None,
+    fallback_token: str,
+    fallback_logprob: float,
+    top_count: int,
+    *,
+    chat: bool,
+):
+    if top_count <= 0:
+        return [] if chat else None
+    raw = item.get("top_logprobs") if isinstance(item, dict) else None
+    if not isinstance(raw, list) or not raw:
+        raw = [{"token_id": item.get("token_id"), "logprob": fallback_logprob}] \
+            if isinstance(item, dict) else [{"logprob": fallback_logprob}]
+    out = [] if chat else {}
+    for top_item in raw[:top_count]:
+        token, logprob = _exact_logprob_item(
+            backend, top_item if isinstance(top_item, dict) else None,
+            fallback_token, fallback_logprob,
+        )
+        if chat:
+            out.append({"token": token, "logprob": logprob, "bytes": _token_bytes(token)})
+        else:
+            out[token] = logprob
+    return out
+
+
+def _completion_logprobs(
+    backend: OpenAIBackend,
+    text: str,
+    token_ids: list[int] | None,
+    top_count: int | None,
+    exact: list[dict] | None = None,
+) -> dict | None:
+    if top_count is None:
+        return None
+    tokens = _token_strings(backend, text, token_ids)
+    offsets: list[int] = []
+    pos = 0
+    for token in tokens:
+        offsets.append(pos)
+        pos += len(token)
+    token_logprobs = []
+    top_logprobs = []
+    for i, token in enumerate(tokens):
+        item = exact[i] if exact is not None and i < len(exact) else None
+        token, logprob = _exact_logprob_item(backend, item, token, 0.0)
+        tokens[i] = token
+        token_logprobs.append(logprob)
+        top_logprobs.append(
+            _exact_top_logprobs(
+                backend, item, token, logprob, top_count, chat=False
+            )
+        )
+    return {
+        "tokens": tokens,
+        "token_logprobs": token_logprobs,
+        "top_logprobs": top_logprobs,
+        "text_offset": offsets,
+    }
+
+
+def _chat_logprobs(
+    backend: OpenAIBackend,
+    text: str,
+    token_ids: list[int] | None,
+    top_count: int,
+    exact: list[dict] | None = None,
+) -> dict:
+    content = []
+    for i, token in enumerate(_token_strings(backend, text, token_ids)):
+        item = exact[i] if exact is not None and i < len(exact) else None
+        token, logprob = _exact_logprob_item(backend, item, token, 0.0)
+        top = _exact_top_logprobs(
+            backend, item, token, logprob, top_count, chat=True
+        )
+        content.append({
+            "token": token,
+            "logprob": logprob,
+            "bytes": _token_bytes(token),
+            "top_logprobs": top,
+        })
+    return {"content": content}
+
+
+def create_app(
+    backend: OpenAIBackend,
+    *,
+    api_keys: list[str] | None = None,
+    cors_origins: list[str] | None = None,
+    max_concurrent_requests: int | None = None,
+):
+    (
+        Starlette, BaseHTTPMiddleware, CORSMiddleware, Request,
+        JSONResponse, PlainTextResponse, StreamingResponse, Route,
+    ) = (
+        _require_starlette()
+    )
+    api_key_set = {k for k in (api_keys or []) if k}
+    protected_paths = (
+        "/v1/models", "/v1/chat/completions", "/v1/completions",
+        "/v1/embeddings", "/tokenize", "/detokenize", "/v1/tokenize",
+        "/v1/detokenize", "/v1/responses", "/v1/chat/completions/input_tokens",
+    )
+
+    class RequestIDMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next):
+            request_id = request.headers.get("x-request-id") or _make_id("req")
+            request.state.request_id = request_id
+            request.app.state.request_count += 1
+            response = await call_next(request)
+            response.headers["x-request-id"] = request_id
+            return response
+
+    class AuthMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next):
+            if api_key_set and request.url.path in protected_paths:
+                auth = request.headers.get("authorization") or ""
+                token = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
+                token = token or request.headers.get("x-api-key", "")
+                if token not in api_key_set:
+                    request_id = request.headers.get("x-request-id") or _make_id("req")
+                    return JSONResponse(
+                        {
+                            "error": {
+                                "message": "missing or invalid API key",
+                                "type": "authentication_error",
+                                "param": None,
+                                "code": "invalid_api_key",
+                            }
+                        },
+                        status_code=401,
+                        headers={"www-authenticate": "Bearer", "x-request-id": request_id},
+                    )
+            return await call_next(request)
+
+    class ConcurrencyLimitMiddleware(BaseHTTPMiddleware):
+        def __init__(self, app, limit: int):
+            super().__init__(app)
+            self._sem = asyncio.Semaphore(limit)
+
+        async def dispatch(self, request: Request, call_next):
+            async with self._sem:
+                return await call_next(request)
+
+    async def openai_error_handler(request: Request, exc: OpenAIHTTPError):
+        request_id = getattr(request.state, "request_id", _make_id("req"))
+        return JSONResponse(
+            {
+                "error": {
+                    "message": exc.message,
+                    "type": exc.type,
+                    "param": exc.param,
+                    "code": exc.code,
+                }
+            },
+            status_code=exc.status_code,
+            headers={"x-request-id": request_id},
+        )
+
+    async def health(request: Request):
+        return JSONResponse({"status": "ok", "model": backend.model_id})
+
+    async def ready(request: Request):
+        return JSONResponse({
+            "status": "ready",
+            "model": backend.model_id,
+            "context_length": getattr(backend, "context_length", None),
+            "capabilities": {
+                "chat": True,
+                "completion": True,
+                "embedding": bool(getattr(backend, "supports_embeddings", False)),
+                "sampling": bool(getattr(backend, "supports_sampling", False)),
+            },
+        })
+
+    async def models(request: Request):
+        return JSONResponse({
+            "object": "list",
+            "data": [{
+                "id": backend.model_id,
+                "object": "model",
+                "created": 0,
+                "owned_by": "drift",
+                "capabilities": {
+                    "chat": True,
+                    "completion": True,
+                    "embedding": bool(getattr(backend, "supports_embeddings", False)),
+                },
+            }],
+        })
+
+    async def chat_completions(request: Request):
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            raise OpenAIHTTPError(400, "request body must be valid JSON")
+        if not isinstance(body, dict):
+            raise OpenAIHTTPError(400, "request body must be a JSON object")
+        model = _validate_model(body, backend)
+        _validate_stage1_options(body)
+        max_tokens = _validate_max_tokens(body, backend)
+        options = _generation_options(body, backend)
+        stop_strings = _stop_strings(body)
+        stop_token_ids = _stop_token_ids(body)
+        prompt = normalize_chat_messages(body.get("messages"))
+        _check_context(backend, prompt, max_tokens)
+        stream = bool(body.get("stream", False))
+        include_usage = _include_stream_usage(body)
+        n_choices = _choice_count(body)
+        want_logprobs, top_logprobs = _chat_logprobs_options(body)
+        created = _now()
+        rid = _make_id("chatcmpl")
+        session_id = _make_id("openai")
+
+        if not stream:
+            results: list[GenerationResult] = []
+            choices = []
+            for i in range(n_choices):
+                result = backend.generate(
+                    prompt,
+                    max_tokens,
+                    f"{session_id}-{i}",
+                    options=_generation_options_for_choice(
+                        options,
+                        i,
+                        return_logprobs=want_logprobs,
+                        top_logprobs=top_logprobs,
+                    ),
+                )
+                result = _apply_stops(result, backend, stop_strings, stop_token_ids)
+                results.append(result)
+                finished = _finish_chat_result(result, backend, body)
+                message = {"role": "assistant", "content": finished["content"]}
+                if finished["tool_calls"]:
+                    message["tool_calls"] = finished["tool_calls"]
+                choice = {
+                    "index": i,
+                    "message": message,
+                    "finish_reason": finished["finish_reason"],
+                }
+                if want_logprobs:
+                    choice["logprobs"] = (
+                        None if finished["tool_calls"] else
+                        _chat_logprobs(
+                            backend, finished["content"] or "",
+                            finished["token_ids"], top_logprobs,
+                            finished["logprobs"],
+                        )
+                    )
+                choices.append(choice)
+            return JSONResponse({
+                "id": rid,
+                "object": "chat.completion",
+                "created": created,
+                "model": model,
+                "choices": choices,
+                "usage": _usage_for_results(backend, prompt, results),
+            })
+
+        response_format = _response_format(body)
+        tools = _request_tools(body)
+        if tools or response_format.get("type", "text") != "text" or n_choices > 1 or want_logprobs:
+            def structured_events():
+                results: list[GenerationResult] = []
+                finished_items = []
+                for i in range(n_choices):
+                    result = backend.generate(
+                        prompt,
+                        max_tokens,
+                        f"{session_id}-{i}",
+                        options=_generation_options_for_choice(
+                            options,
+                            i,
+                            return_logprobs=want_logprobs,
+                            top_logprobs=top_logprobs,
+                        ),
+                    )
+                    result = _apply_stops(result, backend, stop_strings, stop_token_ids)
+                    results.append(result)
+                    finished_items.append(_finish_chat_result(result, backend, body))
+                for i in range(n_choices):
+                    first = {
+                        "id": rid,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{
+                            "index": i,
+                            "delta": {"role": "assistant"},
+                            "finish_reason": None,
+                        }],
+                    }
+                    if include_usage:
+                        first["usage"] = None
+                    yield _json_sse(first)
+                for i, finished in enumerate(finished_items):
+                    if finished["tool_calls"]:
+                        for call_index, call in enumerate(finished["tool_calls"]):
+                            chunk = {
+                                "id": rid,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model,
+                                "choices": [{
+                                    "index": i,
+                                    "delta": {"tool_calls": [{**call, "index": call_index}]},
+                                    "finish_reason": None,
+                                }],
+                            }
+                            if include_usage:
+                                chunk["usage"] = None
+                            yield _json_sse(chunk)
+                    else:
+                        chunk = {
+                            "id": rid,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [{
+                                "index": i,
+                                "delta": {"content": finished["content"] or ""},
+                                "finish_reason": None,
+                            }],
+                        }
+                        if want_logprobs:
+                            chunk["choices"][0]["logprobs"] = _chat_logprobs(
+                                backend, finished["content"] or "",
+                                finished["token_ids"], top_logprobs,
+                                finished["logprobs"],
+                            )
+                        if include_usage:
+                            chunk["usage"] = None
+                        yield _json_sse(chunk)
+                for i, finished in enumerate(finished_items):
+                    final = {
+                        "id": rid,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{
+                            "index": i,
+                            "delta": {},
+                            "finish_reason": finished["finish_reason"],
+                        }],
+                    }
+                    if include_usage:
+                        final["usage"] = None
+                    yield _json_sse(final)
+                if include_usage:
+                    yield _json_sse({
+                        "id": rid,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [],
+                        "usage": _usage_for_results(backend, prompt, results),
+                    })
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(
+                structured_events(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+
+        def events():
+            full_text = ""
+            first = {
+                "id": rid,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{"index": 0, "delta": {"role": "assistant"},
+                             "finish_reason": None}],
+            }
+            if include_usage:
+                first["usage"] = None
+            yield _json_sse(first)
+            try:
+                for piece in backend.stream(prompt, max_tokens, session_id, options=options):
+                    if not piece:
+                        continue
+                    visible, stopped = _split_on_stop(full_text + piece, stop_strings)
+                    piece = visible[len(full_text):]
+                    full_text = visible
+                    if not piece and not stopped:
+                        continue
+                    chunk = {
+                        "id": rid,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {"content": piece},
+                                     "finish_reason": None}],
+                    }
+                    if include_usage:
+                        chunk["usage"] = None
+                    yield _json_sse(chunk)
+                    if stopped:
+                        break
+                final: dict = {
+                    "id": rid,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                }
+                if include_usage:
+                    final["usage"] = None
+                yield _json_sse(final)
+                if include_usage:
+                    yield _json_sse({
+                        "id": rid,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [],
+                        "usage": _usage(
+                            backend, prompt, GenerationResult(text=full_text, token_ids=None)
+                        ),
+                    })
+            except GeneratorExit:
+                raise
+            except Exception as e:
+                yield _json_sse({
+                    "error": {
+                        "message": f"{type(e).__name__}: {e}",
+                        "type": "server_error",
+                        "param": None,
+                        "code": "generation_failed",
+                    }
+                })
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(
+            events(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    async def completions(request: Request):
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            raise OpenAIHTTPError(400, "request body must be valid JSON")
+        if not isinstance(body, dict):
+            raise OpenAIHTTPError(400, "request body must be a JSON object")
+        model = _validate_model(body, backend)
+        _validate_completion_options(body)
+        max_tokens = _validate_max_tokens(body, backend)
+        options = _generation_options(body, backend)
+        stop_strings = _stop_strings(body)
+        stop_token_ids = _stop_token_ids(body)
+        prompts = normalize_completion_prompts(body, backend)
+        for prompt in prompts:
+            _check_context(backend, prompt, max_tokens)
+        stream = bool(body.get("stream", False))
+        include_usage = _include_stream_usage(body)
+        echo = bool(body.get("echo", False))
+        n_choices = _choice_count(body)
+        logprobs_count = _completion_logprobs_count(body)
+        created = _now()
+        rid = _make_id("cmpl")
+
+        if stream:
+            if len(prompts) != 1:
+                raise OpenAIHTTPError(
+                    400,
+                    "streaming completions support only one prompt in this stage",
+                    param="prompt",
+                )
+            prompt = prompts[0]
+            session_id = _make_id("openai")
+
+            if n_choices > 1 or logprobs_count is not None:
+                def structured_completion_events():
+                    results: list[GenerationResult] = []
+                    for i in range(n_choices):
+                        result = backend.generate(
+                            prompt,
+                            max_tokens,
+                            f"{session_id}-{i}",
+                            options=_generation_options_for_choice(
+                                options,
+                                i,
+                                return_logprobs=logprobs_count is not None,
+                                top_logprobs=logprobs_count or 0,
+                            ),
+                        )
+                        result = _apply_stops(result, backend, stop_strings, stop_token_ids)
+                        results.append(result)
+                        text = f"{prompt}{result.text}" if echo else result.text
+                        chunk = {
+                            "id": rid,
+                            "object": "text_completion",
+                            "created": created,
+                            "model": model,
+                            "choices": [{
+                                "text": text,
+                                "index": i,
+                                "logprobs": _completion_logprobs(
+                                    backend,
+                                    text,
+                                    None if echo else result.token_ids,
+                                    logprobs_count,
+                                    None if echo else result.logprobs,
+                                ),
+                                "finish_reason": None,
+                            }],
+                        }
+                        if include_usage:
+                            chunk["usage"] = None
+                        yield _json_sse(chunk)
+                    for i, result in enumerate(results):
+                        final: dict = {
+                            "id": rid,
+                            "object": "text_completion",
+                            "created": created,
+                            "model": model,
+                            "choices": [{
+                                "text": "",
+                                "index": i,
+                                "logprobs": None,
+                                "finish_reason": result.finish_reason,
+                            }],
+                        }
+                        if include_usage:
+                            final["usage"] = None
+                        yield _json_sse(final)
+                    if include_usage:
+                        yield _json_sse({
+                            "id": rid,
+                            "object": "text_completion",
+                            "created": created,
+                            "model": model,
+                            "choices": [],
+                            "usage": _usage_for_results(backend, prompt, results),
+                        })
+                    yield "data: [DONE]\n\n"
+
+                return StreamingResponse(
+                    structured_completion_events(),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+                )
+
+            def events():
+                generated_text = ""
+                if echo and prompt:
+                    chunk = {
+                        "id": rid,
+                        "object": "text_completion",
+                        "created": created,
+                        "model": model,
+                        "choices": [{"text": prompt, "index": 0, "logprobs": None,
+                                     "finish_reason": None}],
+                    }
+                    if include_usage:
+                        chunk["usage"] = None
+                    yield _json_sse(chunk)
+                try:
+                    for piece in backend.stream(prompt, max_tokens, session_id, options=options):
+                        if not piece:
+                            continue
+                        visible, stopped = _split_on_stop(generated_text + piece, stop_strings)
+                        piece = visible[len(generated_text):]
+                        generated_text = visible
+                        if not piece and not stopped:
+                            continue
+                        chunk = {
+                            "id": rid,
+                            "object": "text_completion",
+                            "created": created,
+                            "model": model,
+                            "choices": [{"text": piece, "index": 0, "logprobs": None,
+                                         "finish_reason": None}],
+                        }
+                        if include_usage:
+                            chunk["usage"] = None
+                        yield _json_sse(chunk)
+                        if stopped:
+                            break
+                    final: dict = {
+                        "id": rid,
+                        "object": "text_completion",
+                        "created": created,
+                        "model": model,
+                        "choices": [{"text": "", "index": 0, "logprobs": None,
+                                     "finish_reason": "stop"}],
+                    }
+                    if include_usage:
+                        final["usage"] = None
+                    yield _json_sse(final)
+                    if include_usage:
+                        yield _json_sse({
+                            "id": rid,
+                            "object": "text_completion",
+                            "created": created,
+                            "model": model,
+                            "choices": [],
+                            "usage": _usage(
+                                backend, prompt,
+                                GenerationResult(text=generated_text, token_ids=None),
+                            ),
+                        })
+                except GeneratorExit:
+                    raise
+                except Exception as e:
+                    yield _json_sse({
+                        "error": {
+                            "message": f"{type(e).__name__}: {e}",
+                            "type": "server_error",
+                            "param": None,
+                            "code": "generation_failed",
+                        }
+                    })
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(
+                events(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+
+        choices = []
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
+        choice_index = 0
+        for prompt_index, prompt in enumerate(prompts):
+            total_prompt_tokens += backend.count_tokens(prompt)
+            for j in range(n_choices):
+                offset = prompt_index * n_choices + j
+                result = backend.generate(
+                    prompt,
+                    max_tokens,
+                    f"{_make_id('openai')}-{offset}",
+                    options=_generation_options_for_choice(
+                        options,
+                        offset,
+                        return_logprobs=logprobs_count is not None,
+                        top_logprobs=logprobs_count or 0,
+                    ),
+                )
+                result = _apply_stops(result, backend, stop_strings, stop_token_ids)
+                completion_tokens = (
+                    len(result.token_ids)
+                    if result.token_ids is not None
+                    else backend.count_tokens(result.text)
+                )
+                total_completion_tokens += completion_tokens
+                text = f"{prompt}{result.text}" if echo else result.text
+                choices.append({
+                    "text": text,
+                    "index": choice_index,
+                    "logprobs": _completion_logprobs(
+                        backend,
+                        text,
+                        None if echo else result.token_ids,
+                        logprobs_count,
+                        None if echo else result.logprobs,
+                    ),
+                    "finish_reason": result.finish_reason,
+                })
+                choice_index += 1
+        return JSONResponse({
+            "id": rid,
+            "object": "text_completion",
+            "created": created,
+            "model": model,
+            "choices": choices,
+            "usage": {
+                "prompt_tokens": total_prompt_tokens,
+                "completion_tokens": total_completion_tokens,
+                "total_tokens": total_prompt_tokens + total_completion_tokens,
+            },
+        })
+
+    async def embeddings(request: Request):
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            raise OpenAIHTTPError(400, "request body must be valid JSON")
+        if not isinstance(body, dict):
+            raise OpenAIHTTPError(400, "request body must be a JSON object")
+        model = _validate_model(body, backend)
+        if not getattr(backend, "supports_embeddings", False):
+            raise OpenAIHTTPError(
+                400,
+                "this DRIFT mode cannot produce embeddings because the head does not hold hidden states",
+                code="unsupported_embeddings",
+            )
+        encoding_format = body.get("encoding_format", "float")
+        if body.get("dimensions") is not None:
+            raise OpenAIHTTPError(
+                400, "`dimensions` is not supported by this embedding endpoint yet",
+                param="dimensions", code="unsupported_parameter"
+            )
+        inputs = normalize_embedding_inputs(body, backend)
+        data = []
+        total_tokens = 0
+        for i, prompt in enumerate(inputs):
+            _check_context(backend, prompt, 0)
+            total_tokens += backend.count_tokens(prompt)
+            vector = backend.embed(prompt, f"{_make_id('openai-emb')}-{i}")
+            data.append({
+                "object": "embedding",
+                "index": i,
+                "embedding": _format_embedding(vector, encoding_format),
+            })
+        return JSONResponse({
+            "object": "list",
+            "model": model,
+            "data": data,
+            "usage": {"prompt_tokens": total_tokens, "total_tokens": total_tokens},
+        })
+
+    async def responses(request: Request):
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            raise OpenAIHTTPError(400, "request body must be valid JSON")
+        if not isinstance(body, dict):
+            raise OpenAIHTTPError(400, "request body must be a JSON object")
+        model = _validate_model(body, backend)
+        input_value = body.get("input")
+        if input_value is None:
+            raise OpenAIHTTPError(400, "`input` is required", param="input")
+        if isinstance(input_value, str):
+            prompt: Prompt = input_value
+        elif isinstance(input_value, list):
+            # Responses API clients often send message-like input arrays.
+            prompt = normalize_chat_messages(input_value)
+        else:
+            raise OpenAIHTTPError(400, "`input` must be a string or message array",
+                                  param="input")
+        tools = _request_tools(body)
+        _tool_choice(body)
+        if body.get("parallel_tool_calls") not in (None, True, False):
+            raise OpenAIHTTPError(
+                400, "`parallel_tool_calls` must be a boolean",
+                param="parallel_tool_calls",
+            )
+        response_format = _response_format(body)
+        try:
+            max_tokens = int(body.get("max_output_tokens", body.get("max_tokens",
+                                                                   backend.default_max_tokens)))
+        except (TypeError, ValueError):
+            raise OpenAIHTTPError(400, "`max_output_tokens` must be an integer",
+                                  param="max_output_tokens")
+        if max_tokens < 1:
+            raise OpenAIHTTPError(400, "`max_output_tokens` must be >= 1",
+                                  param="max_output_tokens")
+        _check_context(backend, prompt, max_tokens)
+        options = _generation_options(body, backend)
+        stop_strings = _stop_strings(body)
+        stop_token_ids = _stop_token_ids(body)
+        rid = _make_id("resp")
+        created = _now()
+        stream = bool(body.get("stream", False))
+        message_id = _make_id("msg")
+
+        if stream and not tools and response_format.get("type", "text") == "text":
+            session_id = _make_id("openai-resp")
+
+            def events():
+                sequence = 0
+                full_text = ""
+                created_response = _responses_payload(
+                    rid, model, body, [], "", None,
+                    status="in_progress", created_at=created,
+                )
+                yield _event_sse("response.created", {
+                    "type": "response.created",
+                    "sequence_number": sequence,
+                    "response": created_response,
+                })
+                sequence += 1
+                try:
+                    for piece in backend.stream(prompt, max_tokens, session_id, options=options):
+                        if not piece:
+                            continue
+                        visible, stopped = _split_on_stop(full_text + piece, stop_strings)
+                        piece = visible[len(full_text):]
+                        full_text = visible
+                        if piece:
+                            yield _event_sse("response.output_text.delta", {
+                                "type": "response.output_text.delta",
+                                "sequence_number": sequence,
+                                "item_id": message_id,
+                                "output_index": 0,
+                                "content_index": 0,
+                                "delta": piece,
+                                "logprobs": [],
+                            })
+                            sequence += 1
+                        if stopped:
+                            break
+                    result = GenerationResult(text=full_text, token_ids=None, finish_reason="stop")
+                    usage = _usage(backend, prompt, result)
+                    finished = _finish_chat_result(result, backend, body)
+                    output, output_text, _ = _responses_output_from_finished(
+                        finished, message_id=message_id
+                    )
+                    completed_response = _responses_payload(
+                        rid, model, body, output, output_text, usage,
+                        status="completed", created_at=created,
+                    )
+                    yield _event_sse("response.completed", {
+                        "type": "response.completed",
+                        "sequence_number": sequence,
+                        "response": completed_response,
+                    })
+                except GeneratorExit:
+                    raise
+                except Exception as e:
+                    yield _event_sse("error", {
+                        "type": "error",
+                        "sequence_number": sequence,
+                        "error": {
+                            "message": f"{type(e).__name__}: {e}",
+                            "type": "server_error",
+                            "param": None,
+                            "code": "generation_failed",
+                        },
+                    })
+
+            return StreamingResponse(
+                events(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+
+        result = backend.generate(prompt, max_tokens, _make_id("openai-resp"),
+                                  options=options)
+        result = _apply_stops(result, backend, stop_strings, stop_token_ids)
+        finished = _finish_chat_result(result, backend, body)
+        usage = _usage(backend, prompt, result)
+        output, output_text, _ = _responses_output_from_finished(
+            finished, message_id=message_id
+        )
+        payload = _responses_payload(
+            rid, model, body, output, output_text, usage,
+            status="completed", created_at=created,
+        )
+
+        if stream:
+            def structured_events():
+                sequence = 0
+                created_response = _responses_payload(
+                    rid, model, body, [], "", None,
+                    status="in_progress", created_at=created,
+                )
+                yield _event_sse("response.created", {
+                    "type": "response.created",
+                    "sequence_number": sequence,
+                    "response": created_response,
+                })
+                sequence += 1
+                if output_text:
+                    yield _event_sse("response.output_text.delta", {
+                        "type": "response.output_text.delta",
+                        "sequence_number": sequence,
+                        "item_id": message_id,
+                        "output_index": 0,
+                        "content_index": 0,
+                        "delta": output_text,
+                        "logprobs": [],
+                    })
+                    sequence += 1
+                yield _event_sse("response.completed", {
+                    "type": "response.completed",
+                    "sequence_number": sequence,
+                    "response": payload,
+                })
+
+            return StreamingResponse(
+                structured_events(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+
+        return JSONResponse(payload)
+
+    async def chat_input_tokens(request: Request):
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            raise OpenAIHTTPError(400, "request body must be valid JSON")
+        if not isinstance(body, dict):
+            raise OpenAIHTTPError(400, "request body must be a JSON object")
+        _validate_model(body, backend)
+        prompt = normalize_chat_messages(body.get("messages"))
+        tokens = backend.encode_tokens(prompt)
+        return JSONResponse({"object": "input_tokens", "input_tokens": len(tokens)})
+
+    async def metrics(request: Request):
+        text = "\n".join([
+            "# HELP drift_openai_requests_total HTTP requests seen by drift serve.",
+            "# TYPE drift_openai_requests_total counter",
+            f"drift_openai_requests_total {int(request.app.state.request_count)}",
+            "# HELP drift_openai_model_info Served model metadata.",
+            "# TYPE drift_openai_model_info gauge",
+            f'drift_openai_model_info{{model="{backend.model_id}"}} 1',
+            "",
+        ])
+        return PlainTextResponse(text, media_type="text/plain; version=0.0.4")
+
+    async def tokenize(request: Request):
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            raise OpenAIHTTPError(400, "request body must be valid JSON")
+        if not isinstance(body, dict):
+            raise OpenAIHTTPError(400, "request body must be a JSON object")
+        if "messages" in body:
+            prompt: Prompt = normalize_chat_messages(body["messages"])
+        else:
+            content = body.get("content", body.get("prompt", ""))
+            if not isinstance(content, str):
+                raise OpenAIHTTPError(
+                    400, "`content` must be a string when `messages` is omitted",
+                    param="content",
+                )
+            prompt = content
+        tokens = backend.encode_tokens(prompt)
+        return JSONResponse({"tokens": tokens, "count": len(tokens)})
+
+    async def detokenize(request: Request):
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            raise OpenAIHTTPError(400, "request body must be valid JSON")
+        if not isinstance(body, dict):
+            raise OpenAIHTTPError(400, "request body must be a JSON object")
+        tokens = body.get("tokens")
+        if not isinstance(tokens, list) or not all(isinstance(x, int) for x in tokens):
+            raise OpenAIHTTPError(400, "`tokens` must be an integer array", param="tokens")
+        return JSONResponse({"content": backend.decode_tokens([int(x) for x in tokens])})
+
+    routes = [
+        Route("/health", health, methods=["GET"]),
+        Route("/ready", ready, methods=["GET"]),
+        Route("/v1/models", models, methods=["GET"]),
+        Route("/v1/chat/completions", chat_completions, methods=["POST"]),
+        Route("/v1/chat/completions/input_tokens", chat_input_tokens, methods=["POST"]),
+        Route("/v1/completions", completions, methods=["POST"]),
+        Route("/v1/responses", responses, methods=["POST"]),
+        Route("/v1/embeddings", embeddings, methods=["POST"]),
+        Route("/metrics", metrics, methods=["GET"]),
+        Route("/tokenize", tokenize, methods=["POST"]),
+        Route("/detokenize", detokenize, methods=["POST"]),
+        Route("/v1/tokenize", tokenize, methods=["POST"]),
+        Route("/v1/detokenize", detokenize, methods=["POST"]),
+    ]
+    app = Starlette(routes=routes, exception_handlers={OpenAIHTTPError: openai_error_handler})
+    app.state.request_count = 0
+    if cors_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=cors_origins,
+            allow_methods=["GET", "POST", "OPTIONS"],
+            allow_headers=["authorization", "content-type", "x-api-key", "x-request-id"],
+        )
+    if max_concurrent_requests and max_concurrent_requests > 0:
+        app.add_middleware(ConcurrencyLimitMiddleware, limit=max_concurrent_requests)
+    app.add_middleware(AuthMiddleware)
+    app.add_middleware(RequestIDMiddleware)
+    return app
+
+
+def _parse_serve_nodes(spec: str) -> list[dict]:
+    from .run import _parse_nodes
+
+    return _parse_nodes(spec)
+
+
+def build_backend_from_args(args) -> DriftBackend:
+    from .common import load_config, pick_device
+    from .run import _expand_members, _select_endpoints, build_over_nodes
+
+    cfg = load_config(args.config)
+    model_id = args.model or cfg["model_id"]
+    dtype = cfg.get("dtype", "float16")
+    head_device = pick_device(cfg.get("device"))
+    n_new = args.max_new_tokens or cfg["generation"]["max_new_tokens"]
+
+    endpoints = _select_endpoints(args, cfg)
+    if args.expand:
+        endpoints = _expand_members(endpoints)
+    print(f"[serve] {len(endpoints)} node(s); splitting {model_id} ...", flush=True)
+    orch, plan = build_over_nodes(model_id, dtype, head_device, endpoints,
+                                  chain=args.chain, thin=args.thin, int8=args.int8)
+    for s in plan:
+        print(f"[serve] node {s['host']}:{s['port']} layers "
+              f"[{s['start']}:{s['end']}) device={s['device']}", flush=True)
+    return DriftBackend(orch, args.served_model_name or model_id, default_max_tokens=n_new)
+
+
+def _split_csv(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [x.strip() for x in value.split(",") if x.strip()]
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="drift serve",
+        description="serve DRIFT through an OpenAI-compatible HTTP API")
+    ap.add_argument("--config", default="config.yaml")
+    ap.add_argument("--host", default=os.environ.get("DRIFT_SERVE_HOST", "127.0.0.1"))
+    ap.add_argument("--port", type=int, default=int(os.environ.get("DRIFT_SERVE_PORT", "8000")))
+    ap.add_argument("--nodes", help="comma-separated host:port of running `drift node`s")
+    ap.add_argument("--no-discover", action="store_true", help="skip LAN auto-discovery")
+    ap.add_argument("--discover-timeout", type=float, default=3.0)
+    ap.add_argument("--model", help="override model_id")
+    ap.add_argument("--served-model-name",
+                    help="model id exposed over /v1/models (default: --model/config model_id)")
+    ap.add_argument("--max-new-tokens", type=int)
+    ap.add_argument("--chain", action="store_true",
+                    help="peer-to-peer chain: nodes stream to each other, not through the head")
+    ap.add_argument("--thin", action="store_true",
+                    help="zero-weight head: embed+lm_head move to the edge nodes (implies --chain)")
+    ap.add_argument("--int8", action="store_true",
+                    help="send the hidden state as int8 (half the wire bytes; lossy, relaxed gate)")
+    ap.add_argument("--expand", action="store_true",
+                    help="treat --nodes as seeds and split across the discovered membership")
+    ap.add_argument("--api-key", action="append", default=_split_csv(os.environ.get("DRIFT_API_KEY")),
+                    help="require this HTTP API key (repeatable; also DRIFT_API_KEY=csv)")
+    ap.add_argument("--cors-origin", action="append",
+                    default=_split_csv(os.environ.get("DRIFT_CORS_ORIGINS")),
+                    help="allowed CORS origin (repeatable; also DRIFT_CORS_ORIGINS=csv)")
+    ap.add_argument("--max-concurrent-requests", type=int, default=8,
+                    help="HTTP request concurrency limit; generation is still serialized per backend")
+    ap.add_argument("--no-access-log", action="store_true", help="disable uvicorn access logs")
+    args = ap.parse_args(argv)
+
+    backend = build_backend_from_args(args)
+    app = create_app(
+        backend,
+        api_keys=args.api_key,
+        cors_origins=args.cors_origin,
+        max_concurrent_requests=args.max_concurrent_requests,
+    )
+    try:
+        import uvicorn
+    except ImportError as e:
+        raise RuntimeError("drift serve requires uvicorn") from e
+    print(f"[serve] OpenAI-compatible API listening on http://{args.host}:{args.port}/v1",
+          flush=True)
+    uvicorn.run(app, host=args.host, port=args.port, access_log=not args.no_access_log)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

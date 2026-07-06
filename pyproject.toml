@@ -23,6 +23,8 @@ dependencies = [
   "pyyaml",
   "zeroconf>=0.131",
   "cryptography>=42",
+  "starlette>=0.37",
+  "uvicorn>=0.30",
 ]
 
 [project.scripts]

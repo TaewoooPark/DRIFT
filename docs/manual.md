@@ -273,12 +273,15 @@ Every command takes `--config` (default `config.yaml`).
 | `drift up N` | localhost: spawn N nodes, auto-split, chat (or `--prompt` for one-shot) |
 | `drift node` | run THIS machine as a worker: auto device, `--port`, LAN-announced, waits for the head |
 | `drift run` | the head: discover nodes (or `--nodes host:port,…`), auto-split, configure, stream/chat |
+| `drift serve` | OpenAI-compatible HTTP/SSE API over the DRIFT orchestrator (`/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/embeddings`) |
 | `drift keygen` | create/print the network key + node identity (§14) |
 | `drift ledger` | per-node contribution from a receipt journal — `--verify` · `--csv` (§14) |
 
 `up`, `node`, `run` take `--max-new-tokens`; `run`/`up` also take `--chain`, `--thin`,
 `--int8` (§14); `run` also takes `--model`, `--nodes`, `--no-discover`, `--expand`;
-`node` takes `--tunnel`, `--join`, `--no-advertise`. Omit `--prompt` for a chat.
+`node` takes `--tunnel`, `--join`, `--no-advertise`; `serve` takes `--api-key`,
+`--cors-origin`, `--served-model-name`, and the same node/model routing flags as
+`run`. Omit `--prompt` for a chat.
 
 ### Lower-level modules
 

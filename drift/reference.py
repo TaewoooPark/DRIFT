@@ -11,19 +11,18 @@ import argparse
 import sys
 
 import numpy as np
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from transformers.cache_utils import DynamicCache
 
 from .common import build_input_ids, load_config
 
-_TORCH_DTYPE = {"float16": torch.float16, "float32": torch.float32, "bfloat16": torch.bfloat16}
 
-
-@torch.no_grad()
 def run_reference(cfg: dict, device: str | None = None, out_path: str = "reference_out.npz") -> dict:
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers.cache_utils import DynamicCache
+
     device = device or cfg.get("device", "cpu")
-    dtype = _TORCH_DTYPE[cfg.get("dtype", "float16")]
+    dtype = {"float16": torch.float16, "float32": torch.float32,
+             "bfloat16": torch.bfloat16}[cfg.get("dtype", "float16")]
     model_id = cfg["model_id"]
     n = cfg["generation"]["max_new_tokens"]
     prompt = cfg["generation"]["prompt"]
@@ -37,17 +36,18 @@ def run_reference(cfg: dict, device: str | None = None, out_path: str = "referen
     input_ids = build_input_ids(tok, prompt).to(device)
     cache = DynamicCache(config=model.config)
 
-    out = model(input_ids=input_ids, past_key_values=cache, use_cache=True)
-    logits = out.logits[:, -1, :]
-    first_logits = logits[0].detach().float().cpu().numpy()
-    next_id = int(torch.argmax(logits, dim=-1))
-    generated = [next_id]
-    for _ in range(n - 1):
-        cur = torch.tensor([[next_id]], device=device)
-        out = model(input_ids=cur, past_key_values=cache, use_cache=True)
+    with torch.no_grad():
+        out = model(input_ids=input_ids, past_key_values=cache, use_cache=True)
         logits = out.logits[:, -1, :]
         next_id = int(torch.argmax(logits, dim=-1))
-        generated.append(next_id)
+        first_logits = logits[0].detach().float().cpu().numpy()
+        generated = [next_id]
+        for _ in range(n - 1):
+            cur = torch.tensor([[next_id]], device=device)
+            out = model(input_ids=cur, past_key_values=cache, use_cache=True)
+            logits = out.logits[:, -1, :]
+            next_id = int(torch.argmax(logits, dim=-1))
+            generated.append(next_id)
 
     np.savez(
         out_path,

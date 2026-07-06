@@ -356,6 +356,25 @@ export DRIFT_JOURNAL=~/drift.jsonl && drift run --chain --prompt "…"
 drift ledger ~/drift.jsonl --verify           # per-node contribution, signatures re-checked
 ```
 
+**像 OpenAI 兼容的本地后端一样提供服务**——模型仍然运行在 DRIFT 节点上；
+面向客户端的 API 才是 HTTP/SSE：
+
+```bash
+drift serve --nodes 127.0.0.1:52600,127.0.0.1:52601 --api-key local-dev
+```
+
+受支持的 text-generation 接口包括 `/v1/models`、`/v1/chat/completions`、
+`/v1/completions`、`/v1/responses`、在可暴露 hidden state 的模式下的
+`/v1/embeddings`、tokenizer helpers、health/readiness 和 metrics。接口接受多候选
+(`n`) 与 OpenAI 形状的 logprobs；能暴露 logits 的 DRIFT 运行会返回基于真实 logits
+的 selected-token/top-k logprobs。Tool-call 与 JSON response-format 作为 API 形状
+兼容层提供，Responses streaming 会发出 semantic SSE events。DRIFT 不会在服务端
+执行 tools，也不保证严格的 schema-constrained decoding。Multimodal/audio 以及
+thin-mode sampling/embeddings 会返回明确的 OpenAI 形状 unsupported error。支持矩阵见
+[docs/openai-compatibility.md](docs/openai-compatibility.md)，按清单审计的证据、
+Python/JS SDK smoke 以及剩余 full-stack gate 见
+[docs/openai-compatibility-audit.md](docs/openai-compatibility-audit.md)。
+
 **定制与微调**——模型、切分点、设备、故障排查——全都在**操作手册 → [docs/manual.zh.md](docs/manual.zh.md)**（[English](docs/manual.md) · [한국어](docs/manual.ko.md) · [日本語](docs/manual.ja.md)）里。
 
 **现场演示** — [**DRIFT-Demo**](https://github.com/TaewoooPark/DRIFT-Demo)：用两块屏幕可视化一次真实运行——跨越网络的 residual stream、逐层 ‖Δh‖、尾节点自己算出的 top-k、签名回执与贡献账本——每一个像素都来自真实流量，且完全不改动 DRIFT 源码。

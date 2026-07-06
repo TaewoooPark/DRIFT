@@ -19,8 +19,6 @@ import time
 
 from .common import (free_port, lan_ip, load_config, model_num_layers,
                      pick_device, split_layers)
-from .orchestrator import (ChainTransport, HeadModel, Orchestrator,
-                           SocketTransport)
 
 _LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
@@ -72,6 +70,8 @@ def _make_transport(shards: list[dict], dtype: str, head_device: str, chain: boo
                     int8: bool = False):
     """A star or chain transport over `shards` (chain picks a reachable collect host).
     `int8` sends the hidden state as int8 on the wire (half the bytes, lossy)."""
+    from .orchestrator import ChainTransport, SocketTransport
+
     if not chain:
         t = SocketTransport(shards, dtype, head_device)
     else:
@@ -106,6 +106,8 @@ class _Cluster:
         self.n_layers = model_num_layers(model_id)
 
     def _alive(self) -> list[dict]:
+        from .orchestrator import SocketTransport
+
         alive = []
         for e in self.pool:
             t = SocketTransport([e], self.dtype, self.head_device)
@@ -155,6 +157,8 @@ def build_over_nodes(model_id: str, dtype: str, head_device: str,
     """
     if thin:
         chain = True  # thin mode is chain-only (the head exchanges token ids, no tensor)
+    from .orchestrator import HeadModel, Orchestrator
+
     n_layers = model_num_layers(model_id)
     ranges = split_layers(n_layers, len(endpoints))
     shards = [dict(e) for e in endpoints]
