@@ -28,6 +28,9 @@ class FakeBackend:
             text = " ".join(str(m.get("content") or "") for m in text)
         return len([p for p in text.split() if p])
 
+    def decode_tokens(self, token_ids: list[int]) -> str:
+        return " ".join(f"tok{x}" for x in token_ids)
+
 
 def client():
     backend = FakeBackend()
@@ -140,3 +143,65 @@ def test_rejects_json_response_format_until_supported():
 
     assert res.status_code == 400
     assert res.json()["error"]["param"] == "response_format"
+
+
+def test_completion_non_streaming_single_prompt():
+    backend, c = client()
+    res = c.post("/v1/completions", json={
+        "model": "drift-test",
+        "prompt": "Complete this",
+        "max_tokens": 3,
+    })
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["object"] == "text_completion"
+    assert body["choices"][0]["text"] == "hello from drift"
+    assert body["choices"][0]["logprobs"] is None
+    assert body["usage"]["completion_tokens"] == 3
+    assert backend.prompts == ["Complete this"]
+
+
+def test_completion_non_streaming_prompt_array_and_token_ids():
+    backend, c = client()
+    res = c.post("/v1/completions", json={
+        "model": "drift-test",
+        "prompt": ["first", [10, 11]],
+        "echo": True,
+    })
+
+    assert res.status_code == 200
+    body = res.json()
+    assert len(body["choices"]) == 2
+    assert body["choices"][0]["text"] == "firsthello from drift"
+    assert body["choices"][1]["text"] == "tok10 tok11hello from drift"
+    assert backend.prompts == ["first", "tok10 tok11"]
+
+
+def test_completion_streaming_single_prompt():
+    _, c = client()
+    with c.stream("POST", "/v1/completions", json={
+        "model": "drift-test",
+        "prompt": "Stream completion",
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }) as res:
+        text = res.read().decode()
+
+    assert res.status_code == 200
+    assert "text_completion" in text
+    assert '"text":"hello"' in text
+    assert '"usage"' in text
+    assert "data: [DONE]" in text
+
+
+def test_completion_streaming_rejects_prompt_arrays_for_now():
+    _, c = client()
+    res = c.post("/v1/completions", json={
+        "model": "drift-test",
+        "prompt": ["a", "b"],
+        "stream": True,
+    })
+
+    assert res.status_code == 400
+    assert res.json()["error"]["param"] == "prompt"

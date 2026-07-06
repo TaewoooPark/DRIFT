@@ -40,6 +40,9 @@ class OpenAIBackend(Protocol):
     def count_tokens(self, prompt: Prompt) -> int:
         ...
 
+    def decode_tokens(self, token_ids: list[int]) -> str:
+        ...
+
 
 class DriftBackend:
     """Long-lived bridge from HTTP requests to one DRIFT orchestrator.
@@ -87,6 +90,9 @@ class DriftBackend:
         if ids and isinstance(ids[0], list):
             return len(ids[0])
         return len(ids or [])
+
+    def decode_tokens(self, token_ids: list[int]) -> str:
+        return self.orchestrator.head.tokenizer.decode(token_ids)
 
 
 class OpenAIHTTPError(Exception):
@@ -313,6 +319,72 @@ def _include_stream_usage(body: dict) -> bool:
     return bool(opts.get("include_usage"))
 
 
+def _validate_completion_options(body: dict) -> None:
+    known = {
+        "model", "prompt", "suffix", "max_tokens", "temperature", "top_p", "n",
+        "stream", "stream_options", "logprobs", "echo", "stop",
+        "presence_penalty", "frequency_penalty", "best_of", "logit_bias",
+        "user", "seed",
+    }
+    unknown = sorted(set(body) - known)
+    if unknown:
+        raise OpenAIHTTPError(
+            400,
+            f"unsupported request field(s): {', '.join(unknown)}",
+            code="unsupported_parameter",
+        )
+    _validate_stage1_options({
+        k: v for k, v in body.items()
+        if k not in {"prompt", "suffix", "echo", "best_of"}
+    })
+    if body.get("suffix") not in (None, ""):
+        raise OpenAIHTTPError(
+            400, "`suffix` is not supported by this endpoint stage yet",
+            param="suffix", code="unsupported_parameter"
+        )
+    if body.get("best_of") not in (None, 1):
+        raise OpenAIHTTPError(
+            400, "`best_of` is not supported by this endpoint stage yet",
+            param="best_of", code="unsupported_parameter"
+        )
+
+
+def _decode_token_prompt(backend: OpenAIBackend, item, param: str) -> str:
+    if not isinstance(item, list) or not all(isinstance(x, int) for x in item):
+        raise OpenAIHTTPError(400, f"{param} must be a string or token id array",
+                              param=param)
+    return backend.decode_tokens([int(x) for x in item])
+
+
+def normalize_completion_prompts(body: dict, backend: OpenAIBackend) -> list[str]:
+    if "prompt" not in body:
+        raise OpenAIHTTPError(400, "`prompt` is required", param="prompt")
+    prompt = body.get("prompt")
+    if isinstance(prompt, str):
+        return [prompt]
+    if isinstance(prompt, list):
+        if not prompt:
+            raise OpenAIHTTPError(400, "`prompt` array must not be empty", param="prompt")
+        if all(isinstance(x, str) for x in prompt):
+            return list(prompt)
+        if all(isinstance(x, int) for x in prompt):
+            return [_decode_token_prompt(backend, prompt, "prompt")]
+        out: list[str] = []
+        for i, item in enumerate(prompt):
+            if isinstance(item, str):
+                out.append(item)
+            elif isinstance(item, list):
+                out.append(_decode_token_prompt(backend, item, f"prompt[{i}]"))
+            else:
+                raise OpenAIHTTPError(
+                    400,
+                    "prompt array entries must be strings or token id arrays",
+                    param=f"prompt[{i}]",
+                )
+        return out
+    raise OpenAIHTTPError(400, "`prompt` must be a string or array", param="prompt")
+
+
 def _usage(backend: OpenAIBackend, prompt: str, result: GenerationResult) -> dict:
     completion_tokens = (
         len(result.token_ids) if result.token_ids is not None else backend.count_tokens(result.text)
@@ -451,10 +523,120 @@ def create_app(backend: OpenAIBackend):
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
+    async def completions(request: Request):
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            raise OpenAIHTTPError(400, "request body must be valid JSON")
+        if not isinstance(body, dict):
+            raise OpenAIHTTPError(400, "request body must be a JSON object")
+        model = _validate_model(body, backend)
+        _validate_completion_options(body)
+        max_tokens = _validate_max_tokens(body, backend)
+        prompts = normalize_completion_prompts(body, backend)
+        stream = bool(body.get("stream", False))
+        include_usage = _include_stream_usage(body)
+        echo = bool(body.get("echo", False))
+        created = _now()
+        rid = _make_id("cmpl")
+
+        if stream:
+            if len(prompts) != 1:
+                raise OpenAIHTTPError(
+                    400,
+                    "streaming completions support only one prompt in this stage",
+                    param="prompt",
+                )
+            prompt = prompts[0]
+            session_id = _make_id("openai")
+
+            def events():
+                generated_text = ""
+                if echo and prompt:
+                    yield _json_sse({
+                        "id": rid,
+                        "object": "text_completion",
+                        "created": created,
+                        "model": model,
+                        "choices": [{"text": prompt, "index": 0, "logprobs": None,
+                                     "finish_reason": None}],
+                    })
+                try:
+                    for piece in backend.stream(prompt, max_tokens, session_id):
+                        if not piece:
+                            continue
+                        generated_text += piece
+                        yield _json_sse({
+                            "id": rid,
+                            "object": "text_completion",
+                            "created": created,
+                            "model": model,
+                            "choices": [{"text": piece, "index": 0, "logprobs": None,
+                                         "finish_reason": None}],
+                        })
+                    final: dict = {
+                        "id": rid,
+                        "object": "text_completion",
+                        "created": created,
+                        "model": model,
+                        "choices": [{"text": "", "index": 0, "logprobs": None,
+                                     "finish_reason": "stop"}],
+                    }
+                    if include_usage:
+                        final["usage"] = _usage(
+                            backend, prompt, GenerationResult(text=generated_text, token_ids=None)
+                        )
+                    yield _json_sse(final)
+                except Exception as e:
+                    yield _json_sse({
+                        "error": {
+                            "message": f"{type(e).__name__}: {e}",
+                            "type": "server_error",
+                            "param": None,
+                            "code": "generation_failed",
+                        }
+                    })
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(
+                events(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+
+        choices = []
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
+        for i, prompt in enumerate(prompts):
+            result = backend.generate(prompt, max_tokens, f"{_make_id('openai')}-{i}")
+            usage = _usage(backend, prompt, result)
+            total_prompt_tokens += usage["prompt_tokens"]
+            total_completion_tokens += usage["completion_tokens"]
+            text = f"{prompt}{result.text}" if echo else result.text
+            choices.append({
+                "text": text,
+                "index": i,
+                "logprobs": None,
+                "finish_reason": result.finish_reason,
+            })
+        return JSONResponse({
+            "id": rid,
+            "object": "text_completion",
+            "created": created,
+            "model": model,
+            "choices": choices,
+            "usage": {
+                "prompt_tokens": total_prompt_tokens,
+                "completion_tokens": total_completion_tokens,
+                "total_tokens": total_prompt_tokens + total_completion_tokens,
+            },
+        })
+
     routes = [
         Route("/health", health, methods=["GET"]),
         Route("/v1/models", models, methods=["GET"]),
         Route("/v1/chat/completions", chat_completions, methods=["POST"]),
+        Route("/v1/completions", completions, methods=["POST"]),
     ]
     app = Starlette(routes=routes, exception_handlers={OpenAIHTTPError: openai_error_handler})
     app.add_middleware(RequestIDMiddleware)
