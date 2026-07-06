@@ -30,6 +30,7 @@ class GenerationResult:
 class OpenAIBackend(Protocol):
     model_id: str
     default_max_tokens: int
+    context_length: int | None
 
     def generate(self, prompt: Prompt, max_tokens: int, session_id: str,
                  options: dict | None = None) -> GenerationResult:
@@ -43,6 +44,9 @@ class OpenAIBackend(Protocol):
         ...
 
     def decode_tokens(self, token_ids: list[int]) -> str:
+        ...
+
+    def encode_tokens(self, prompt: Prompt) -> list[int]:
         ...
 
 
@@ -60,7 +64,19 @@ class DriftBackend:
         self.model_id = model_id
         self.default_max_tokens = default_max_tokens
         self.supports_sampling = not getattr(orchestrator, "thin", False)
+        self.context_length = self._context_length()
         self._lock = threading.Lock()
+
+    def _context_length(self) -> int | None:
+        cfg = getattr(getattr(self.orchestrator.head, "lm", None), "config", None)
+        for name in ("max_position_embeddings", "seq_length", "n_positions"):
+            value = getattr(cfg, name, None)
+            if isinstance(value, int) and value > 0:
+                return value
+        value = getattr(self.orchestrator.head.tokenizer, "model_max_length", None)
+        if isinstance(value, int) and 0 < value < 1_000_000_000:
+            return value
+        return None
 
     def generate(self, prompt: Prompt, max_tokens: int, session_id: str,
                  options: dict | None = None) -> GenerationResult:
@@ -100,6 +116,15 @@ class DriftBackend:
 
     def decode_tokens(self, token_ids: list[int]) -> str:
         return self.orchestrator.head.tokenizer.decode(token_ids)
+
+    def encode_tokens(self, prompt: Prompt) -> list[int]:
+        from .common import build_input_ids
+
+        ids = build_input_ids(self.orchestrator.head.tokenizer, prompt)
+        try:
+            return [int(x) for x in ids[0].tolist()]
+        except Exception:
+            return [int(x) for x in ids]
 
 
 class OpenAIHTTPError(Exception):
@@ -238,6 +263,7 @@ def _validate_stage1_options(body: dict) -> None:
     known = {
         "model", "messages", "max_tokens", "max_completion_tokens", "stream",
         "stream_options", "temperature", "top_p", "top_k", "min_p", "n", "stop",
+        "stop_token_ids",
         "presence_penalty", "frequency_penalty", "repetition_penalty", "seed", "user", "tools",
         "tool_choice", "functions", "function_call", "logprobs", "top_logprobs",
         "response_format", "logit_bias",
@@ -255,11 +281,6 @@ def _validate_stage1_options(body: dict) -> None:
         raise OpenAIHTTPError(400, "`n` must be an integer", param="n")
     if n != 1:
         raise OpenAIHTTPError(400, "only n=1 is supported in this stage", param="n")
-    if body.get("stop") not in (None, [], ""):
-        raise OpenAIHTTPError(
-            400, "`stop` is not supported until stop-string handling lands",
-            param="stop", code="unsupported_parameter"
-        )
     if body.get("logit_bias") not in (None, {}):
         raise OpenAIHTTPError(
             400, "`logit_bias` is not supported by this endpoint stage yet",
@@ -360,11 +381,81 @@ def _generation_options(body: dict, backend: OpenAIBackend) -> dict:
     return opts
 
 
+def _stop_strings(body: dict) -> list[str]:
+    stop = body.get("stop")
+    if stop in (None, ""):
+        return []
+    if isinstance(stop, str):
+        return [stop]
+    if isinstance(stop, list) and all(isinstance(x, str) for x in stop):
+        return [x for x in stop if x]
+    raise OpenAIHTTPError(400, "`stop` must be a string or string array", param="stop")
+
+
+def _stop_token_ids(body: dict) -> list[int]:
+    raw = body.get("stop_token_ids")
+    if raw in (None, []):
+        return []
+    if not isinstance(raw, list) or not all(isinstance(x, int) for x in raw):
+        raise OpenAIHTTPError(
+            400, "`stop_token_ids` must be an integer array", param="stop_token_ids"
+        )
+    return [int(x) for x in raw]
+
+
+def _check_context(backend: OpenAIBackend, prompt: Prompt, max_tokens: int) -> None:
+    limit = getattr(backend, "context_length", None)
+    if not limit:
+        return
+    prompt_tokens = backend.count_tokens(prompt)
+    if prompt_tokens + max_tokens > int(limit):
+        raise OpenAIHTTPError(
+            400,
+            f"requested tokens exceed model context window ({prompt_tokens}+{max_tokens}>{limit})",
+            code="context_length_exceeded",
+        )
+
+
+def _apply_stops(result: GenerationResult, backend: OpenAIBackend,
+                 stop_strings: list[str], stop_token_ids: list[int]) -> GenerationResult:
+    text = result.text
+    token_ids = list(result.token_ids) if result.token_ids is not None else None
+    finish = result.finish_reason
+
+    if token_ids is not None and stop_token_ids:
+        stop_set = set(stop_token_ids)
+        for i, tid in enumerate(token_ids):
+            if tid in stop_set:
+                token_ids = token_ids[:i]
+                text = backend.decode_tokens(token_ids)
+                finish = "stop"
+                break
+
+    if stop_strings:
+        found = [(text.find(s), s) for s in stop_strings if s and text.find(s) >= 0]
+        if found:
+            idx, _ = min(found, key=lambda x: x[0])
+            text = text[:idx]
+            finish = "stop"
+
+    return GenerationResult(text=text, token_ids=token_ids, finish_reason=finish)
+
+
+def _split_on_stop(text: str, stop_strings: list[str]) -> tuple[str, bool]:
+    if not stop_strings:
+        return text, False
+    found = [(text.find(s), s) for s in stop_strings if s and text.find(s) >= 0]
+    if not found:
+        return text, False
+    idx, _ = min(found, key=lambda x: x[0])
+    return text[:idx], True
+
+
 def _validate_completion_options(body: dict) -> None:
     known = {
         "model", "prompt", "suffix", "max_tokens", "temperature", "top_p",
         "top_k", "min_p", "n", "stream", "stream_options", "logprobs", "echo",
-        "stop", "presence_penalty", "frequency_penalty", "repetition_penalty",
+        "stop", "stop_token_ids", "presence_penalty", "frequency_penalty", "repetition_penalty",
         "best_of", "logit_bias", "user", "seed",
     }
     unknown = sorted(set(body) - known)
@@ -491,7 +582,10 @@ def create_app(backend: OpenAIBackend):
         _validate_stage1_options(body)
         max_tokens = _validate_max_tokens(body, backend)
         options = _generation_options(body, backend)
+        stop_strings = _stop_strings(body)
+        stop_token_ids = _stop_token_ids(body)
         prompt = normalize_chat_messages(body.get("messages"))
+        _check_context(backend, prompt, max_tokens)
         stream = bool(body.get("stream", False))
         include_usage = _include_stream_usage(body)
         created = _now()
@@ -500,6 +594,7 @@ def create_app(backend: OpenAIBackend):
 
         if not stream:
             result = backend.generate(prompt, max_tokens, session_id, options=options)
+            result = _apply_stops(result, backend, stop_strings, stop_token_ids)
             return JSONResponse({
                 "id": rid,
                 "object": "chat.completion",
@@ -530,7 +625,11 @@ def create_app(backend: OpenAIBackend):
                 for piece in backend.stream(prompt, max_tokens, session_id, options=options):
                     if not piece:
                         continue
-                    full_text += piece
+                    visible, stopped = _split_on_stop(full_text + piece, stop_strings)
+                    piece = visible[len(full_text):]
+                    full_text = visible
+                    if not piece and not stopped:
+                        continue
                     chunk = {
                         "id": rid,
                         "object": "chat.completion.chunk",
@@ -542,6 +641,8 @@ def create_app(backend: OpenAIBackend):
                     if include_usage:
                         chunk["usage"] = None
                     yield _json_sse(chunk)
+                    if stopped:
+                        break
                 final: dict = {
                     "id": rid,
                     "object": "chat.completion.chunk",
@@ -593,7 +694,11 @@ def create_app(backend: OpenAIBackend):
         _validate_completion_options(body)
         max_tokens = _validate_max_tokens(body, backend)
         options = _generation_options(body, backend)
+        stop_strings = _stop_strings(body)
+        stop_token_ids = _stop_token_ids(body)
         prompts = normalize_completion_prompts(body, backend)
+        for prompt in prompts:
+            _check_context(backend, prompt, max_tokens)
         stream = bool(body.get("stream", False))
         include_usage = _include_stream_usage(body)
         echo = bool(body.get("echo", False))
@@ -628,7 +733,11 @@ def create_app(backend: OpenAIBackend):
                     for piece in backend.stream(prompt, max_tokens, session_id, options=options):
                         if not piece:
                             continue
-                        generated_text += piece
+                        visible, stopped = _split_on_stop(generated_text + piece, stop_strings)
+                        piece = visible[len(generated_text):]
+                        generated_text = visible
+                        if not piece and not stopped:
+                            continue
                         chunk = {
                             "id": rid,
                             "object": "text_completion",
@@ -640,6 +749,8 @@ def create_app(backend: OpenAIBackend):
                         if include_usage:
                             chunk["usage"] = None
                         yield _json_sse(chunk)
+                        if stopped:
+                            break
                     final: dict = {
                         "id": rid,
                         "object": "text_completion",
@@ -689,6 +800,7 @@ def create_app(backend: OpenAIBackend):
             result = backend.generate(
                 prompt, max_tokens, f"{_make_id('openai')}-{i}", options=options
             )
+            result = _apply_stops(result, backend, stop_strings, stop_token_ids)
             usage = _usage(backend, prompt, result)
             total_prompt_tokens += usage["prompt_tokens"]
             total_completion_tokens += usage["completion_tokens"]
@@ -712,11 +824,47 @@ def create_app(backend: OpenAIBackend):
             },
         })
 
+    async def tokenize(request: Request):
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            raise OpenAIHTTPError(400, "request body must be valid JSON")
+        if not isinstance(body, dict):
+            raise OpenAIHTTPError(400, "request body must be a JSON object")
+        if "messages" in body:
+            prompt: Prompt = normalize_chat_messages(body["messages"])
+        else:
+            content = body.get("content", body.get("prompt", ""))
+            if not isinstance(content, str):
+                raise OpenAIHTTPError(
+                    400, "`content` must be a string when `messages` is omitted",
+                    param="content",
+                )
+            prompt = content
+        tokens = backend.encode_tokens(prompt)
+        return JSONResponse({"tokens": tokens, "count": len(tokens)})
+
+    async def detokenize(request: Request):
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            raise OpenAIHTTPError(400, "request body must be valid JSON")
+        if not isinstance(body, dict):
+            raise OpenAIHTTPError(400, "request body must be a JSON object")
+        tokens = body.get("tokens")
+        if not isinstance(tokens, list) or not all(isinstance(x, int) for x in tokens):
+            raise OpenAIHTTPError(400, "`tokens` must be an integer array", param="tokens")
+        return JSONResponse({"content": backend.decode_tokens([int(x) for x in tokens])})
+
     routes = [
         Route("/health", health, methods=["GET"]),
         Route("/v1/models", models, methods=["GET"]),
         Route("/v1/chat/completions", chat_completions, methods=["POST"]),
         Route("/v1/completions", completions, methods=["POST"]),
+        Route("/tokenize", tokenize, methods=["POST"]),
+        Route("/detokenize", detokenize, methods=["POST"]),
+        Route("/v1/tokenize", tokenize, methods=["POST"]),
+        Route("/v1/detokenize", detokenize, methods=["POST"]),
     ]
     app = Starlette(routes=routes, exception_handlers={OpenAIHTTPError: openai_error_handler})
     app.add_middleware(RequestIDMiddleware)

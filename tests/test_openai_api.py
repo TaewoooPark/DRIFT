@@ -8,6 +8,7 @@ from drift.openai_api import GenerationResult, create_app
 class FakeBackend:
     model_id = "drift-test"
     default_max_tokens = 8
+    context_length = 64
 
     def __init__(self):
         self.prompts = []
@@ -38,6 +39,13 @@ class FakeBackend:
 
     def decode_tokens(self, token_ids: list[int]) -> str:
         return " ".join(f"tok{x}" for x in token_ids)
+
+    def encode_tokens(self, prompt) -> list[int]:
+        if isinstance(prompt, list):
+            text = " ".join(str(m.get("content") or "") for m in prompt)
+        else:
+            text = str(prompt)
+        return [len(part) for part in text.split()]
 
 
 def client():
@@ -259,3 +267,72 @@ def test_completion_streaming_rejects_prompt_arrays_for_now():
 
     assert res.status_code == 400
     assert res.json()["error"]["param"] == "prompt"
+
+
+def test_non_streaming_applies_stop_strings():
+    _, c = client()
+    res = c.post("/v1/chat/completions", json={
+        "model": "drift-test",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "stop": " from",
+    })
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["choices"][0]["message"]["content"] == "hello"
+    assert body["choices"][0]["finish_reason"] == "stop"
+
+
+def test_non_streaming_applies_stop_token_ids():
+    _, c = client()
+    res = c.post("/v1/completions", json={
+        "model": "drift-test",
+        "prompt": "Hello",
+        "stop_token_ids": [2],
+    })
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["choices"][0]["text"] == "tok1"
+    assert body["choices"][0]["finish_reason"] == "stop"
+    assert body["usage"]["completion_tokens"] == 1
+
+
+def test_streaming_stops_on_stop_string_boundary():
+    _, c = client()
+    with c.stream("POST", "/v1/chat/completions", json={
+        "model": "drift-test",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "stream": True,
+        "stop": " from",
+    }) as res:
+        text = res.read().decode()
+
+    assert res.status_code == 200
+    assert '"content":"hello"' in text
+    assert '"content":" from"' not in text
+
+
+def test_context_length_error_shape():
+    backend = FakeBackend()
+    backend.context_length = 2
+    c = TestClient(create_app(backend))
+    res = c.post("/v1/completions", json={
+        "model": "drift-test",
+        "prompt": "one two",
+        "max_tokens": 1,
+    })
+
+    assert res.status_code == 400
+    assert res.json()["error"]["code"] == "context_length_exceeded"
+
+
+def test_tokenize_and_detokenize_helpers():
+    _, c = client()
+    tok = c.post("/tokenize", json={"content": "one three"})
+    detok = c.post("/v1/detokenize", json={"tokens": [3, 5]})
+
+    assert tok.status_code == 200
+    assert tok.json() == {"tokens": [3, 5], "count": 2}
+    assert detok.status_code == 200
+    assert detok.json() == {"content": "tok3 tok5"}
