@@ -356,6 +356,19 @@ export DRIFT_JOURNAL=~/drift.jsonl && drift run --chain --prompt "…"
 drift ledger ~/drift.jsonl --verify           # per-node contribution, signatures re-checked
 ```
 
+**Serve it like an OpenAI-compatible local backend** — the model still runs across
+DRIFT nodes; only the client-facing API is HTTP/SSE:
+
+```bash
+drift serve --nodes 127.0.0.1:52600,127.0.0.1:52601 --api-key local-dev
+```
+
+Supported text-generation surfaces include `/v1/models`, `/v1/chat/completions`,
+`/v1/completions`, `/v1/responses`, `/v1/embeddings` where the mode can expose
+hidden states, tokenizer helpers, health/readiness, and metrics. Tools, JSON
+schema mode, multimodal/audio, and thin-mode sampling/embeddings return explicit
+OpenAI-shaped unsupported errors. See [docs/openai-compatibility.md](docs/openai-compatibility.md).
+
 **Customize & fine-tune** — models, split points, devices, troubleshooting — is all in the **operations manual → [docs/manual.md](docs/manual.md)** ([한국어](docs/manual.ko.md) · [中文](docs/manual.zh.md) · [日本語](docs/manual.ja.md)).
 
 **See it live** — [**DRIFT-Demo**](https://github.com/TaewoooPark/DRIFT-Demo): a two-screen visual demo of a real run — the residual stream crossing the wire, per-layer ‖Δh‖, the tail's own top-k, signed receipts, and the contribution tally — every pixel drawn from live traffic, the DRIFT sources untouched.
@@ -373,6 +386,7 @@ drift/
   shard_server.py   # concurrent TCP server: ping / configure / prefill / decode / relay / gossip
   orchestrator.py   # head + injectable transport (in-process / star / chain) + decode loop + verifier
   run.py, node.py   # `drift run` head + `drift node` worker (auto-split, discovery, tunnel, --join)
+  openai_api.py     # `drift serve`: OpenAI-compatible HTTP/SSE adapter over the orchestrator
   receipts.py       # signed per-hop receipts + live verifier + journal (the ledger source)
   membership.py     # gossip peer table — signed entries, anti-entropy, --expand
   ledger.py         # `drift ledger` — per-node contribution from the receipt journal
