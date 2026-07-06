@@ -136,6 +136,42 @@ def test_openai_python_sdk_smoke(openai_server):
         n=2,
         logprobs=1,
     )
+    response = client.responses.create(model="drift-test", input="hello")
+    response_events = list(client.responses.create(
+        model="drift-test",
+        input="hello",
+        stream=True,
+    ))
+    structured_response = client.responses.create(
+        model="drift-test",
+        input="json please",
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "answer",
+                "schema": {
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+    )
+    tool_response = client.responses.create(
+        model="drift-test",
+        input="use a tool",
+        tools=[{
+            "type": "function",
+            "name": "lookup",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        }],
+        tool_choice="required",
+    )
 
     assert models.data[0].id == "drift-test"
     assert chat.choices[0].message.content == "sdk answer"
@@ -151,3 +187,11 @@ def test_openai_python_sdk_smoke(openai_server):
     assert len(logprob_completion.choices) == 2
     assert logprob_completion.choices[0].logprobs.tokens == ["1", "2"]
     assert logprob_completion.choices[0].logprobs.token_logprobs == pytest.approx([-0.1, -0.2])
+    assert response.output_text == "sdk answer"
+    assert response.output[0].content[0].annotations == []
+    assert any(event.type == "response.output_text.delta" for event in response_events)
+    assert response_events[-1].type == "response.completed"
+    assert response_events[-1].response.output_text == "sdk answer"
+    assert json.loads(structured_response.output_text) == {"answer": "sdk answer"}
+    assert tool_response.output[0].type == "function_call"
+    assert tool_response.output[0].name == "lookup"

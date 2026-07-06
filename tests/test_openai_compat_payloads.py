@@ -48,6 +48,22 @@ def client(api_key: str | None = None):
     return backend, TestClient(create_app(backend, api_keys=keys))
 
 
+def sse_events(text: str) -> list[tuple[str | None, dict]]:
+    events = []
+    for raw in text.strip().split("\n\n"):
+        event_name = None
+        data_lines = []
+        for line in raw.splitlines():
+            if line.startswith("event: "):
+                event_name = line.removeprefix("event: ")
+            elif line.startswith("data: "):
+                data_lines.append(line.removeprefix("data: "))
+        if data_lines:
+            import json
+            events.append((event_name, json.loads("\n".join(data_lines))))
+    return events
+
+
 def test_openai_sdk_style_chat_payload_snapshot():
     _, c = client()
     res = c.post("/v1/chat/completions", json={
@@ -140,8 +156,58 @@ def test_responses_api_minimal_text_payload():
     assert body["object"] == "response"
     assert body["status"] == "completed"
     assert body["output"][0]["content"][0]["type"] == "output_text"
+    assert body["output"][0]["content"][0]["annotations"] == []
+    assert body["parallel_tool_calls"] is True
+    assert body["tool_choice"] == "none"
     assert body["output_text"] == "compat answer END"
     assert body["usage"]["total_tokens"] > 0
+    assert body["usage"]["input_tokens_details"] == {"cached_tokens": 0}
+    assert body["usage"]["output_tokens_details"] == {"reasoning_tokens": 0}
+
+
+def test_responses_api_streaming_text_events():
+    _, c = client()
+    with c.stream("POST", "/v1/responses", json={
+        "model": "drift-test",
+        "input": "Hello",
+        "stream": True,
+    }) as res:
+        assert res.status_code == 200
+        assert "text/event-stream" in res.headers["content-type"]
+        events = sse_events(res.read().decode("utf-8"))
+
+    assert [name for name, _ in events] == [
+        "response.created",
+        "response.output_text.delta",
+        "response.output_text.delta",
+        "response.output_text.delta",
+        "response.completed",
+    ]
+    assert events[0][1]["type"] == "response.created"
+    assert events[0][1]["response"]["status"] == "in_progress"
+    assert "".join(data["delta"] for name, data in events
+                   if name == "response.output_text.delta") == "compat answer END"
+    completed = events[-1][1]["response"]
+    assert completed["status"] == "completed"
+    assert completed["output_text"] == "compat answer END"
+    assert completed["usage"]["output_tokens"] > 0
+
+
+def test_responses_api_streaming_stop_truncates_text():
+    _, c = client()
+    with c.stream("POST", "/v1/responses", json={
+        "model": "drift-test",
+        "input": "Hello",
+        "stream": True,
+        "stop": [" END"],
+    }) as res:
+        assert res.status_code == 200
+        events = sse_events(res.read().decode("utf-8"))
+
+    text = "".join(data["delta"] for name, data in events
+                   if name == "response.output_text.delta")
+    assert text == "compat answer"
+    assert events[-1][1]["response"]["output_text"] == "compat answer"
 
 
 def test_chat_input_tokens_endpoint():
@@ -231,8 +297,24 @@ def test_responses_api_json_schema_and_tool_choice():
     tool_res = c.post("/v1/responses", json={
         "model": "drift-test",
         "input": "Hello",
-        "tools": [{"type": "function", "function": {"name": "lookup"}}],
+        "tools": [{"type": "function", "name": "lookup"}],
         "tool_choice": "required",
+    })
+    text_format_res = c.post("/v1/responses", json={
+        "model": "drift-test",
+        "input": "Hello",
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "answer",
+                "schema": {
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"],
+                    "additionalProperties": False,
+                },
+            },
+        },
     })
 
     assert json_res.status_code == 200
@@ -240,3 +322,26 @@ def test_responses_api_json_schema_and_tool_choice():
     assert tool_res.status_code == 200
     assert tool_res.json()["output"][0]["type"] == "function_call"
     assert tool_res.json()["output"][0]["name"] == "lookup"
+    assert text_format_res.status_code == 200
+    assert text_format_res.json()["output_text"] == '{"answer":"compat answer END"}'
+    assert text_format_res.json()["text"]["format"]["schema"]["required"] == ["answer"]
+
+
+def test_responses_api_streaming_structured_events():
+    _, c = client()
+    with c.stream("POST", "/v1/responses", json={
+        "model": "drift-test",
+        "input": "Hello",
+        "stream": True,
+        "response_format": {"type": "json_object"},
+    }) as res:
+        assert res.status_code == 200
+        events = sse_events(res.read().decode("utf-8"))
+
+    assert [name for name, _ in events] == [
+        "response.created",
+        "response.output_text.delta",
+        "response.completed",
+    ]
+    assert events[1][1]["delta"] == '{"response":"compat answer END"}'
+    assert events[-1][1]["response"]["output_text"] == '{"response":"compat answer END"}'

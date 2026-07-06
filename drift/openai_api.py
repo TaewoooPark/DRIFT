@@ -213,6 +213,11 @@ def _json_sse(obj: dict) -> str:
     return f"data: {json.dumps(obj, separators=(',', ':'), ensure_ascii=False)}\n\n"
 
 
+def _event_sse(event: str, obj: dict) -> str:
+    data = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+    return f"event: {event}\ndata: {data}\n\n"
+
+
 def _content_to_text(content, param: str) -> str:
     if content is None:
         return ""
@@ -386,10 +391,15 @@ def _completion_logprobs_count(body: dict) -> int | None:
 
 
 def _response_format(body: dict) -> dict:
-    fmt = body.get("response_format") or {"type": "text"}
+    fmt = body.get("response_format")
+    text_config = body.get("text")
+    if fmt is None and isinstance(text_config, dict) and isinstance(text_config.get("format"), dict):
+        fmt = text_config["format"]
+    fmt = fmt or {"type": "text"}
     if not isinstance(fmt, dict):
         raise OpenAIHTTPError(400, "`response_format` must be an object",
                               param="response_format")
+    fmt = dict(fmt)
     ftype = fmt.get("type", "text")
     if ftype not in {"text", "json_object", "json_schema"}:
         raise OpenAIHTTPError(
@@ -400,6 +410,15 @@ def _response_format(body: dict) -> dict:
         )
     if ftype == "json_schema":
         js = fmt.get("json_schema")
+        if js is None and isinstance(fmt.get("schema"), dict):
+            js = {
+                "name": fmt.get("name", "response"),
+                "schema": fmt["schema"],
+            }
+            for key in ("description", "strict"):
+                if key in fmt:
+                    js[key] = fmt[key]
+            fmt["json_schema"] = js
         if not isinstance(js, dict) or not isinstance(js.get("schema"), dict):
             raise OpenAIHTTPError(
                 400,
@@ -431,6 +450,13 @@ def _request_tools(body: dict) -> list[dict]:
             raise OpenAIHTTPError(400, "only function tools are supported",
                                   param=f"tools[{i}]")
         fn = tool.get("function")
+        if fn is None and isinstance(tool.get("name"), str):
+            fn = {
+                "name": tool["name"],
+            }
+            for key in ("description", "parameters", "strict"):
+                if key in tool:
+                    fn[key] = tool[key]
         if not isinstance(fn, dict) or not isinstance(fn.get("name"), str) or not fn["name"]:
             raise OpenAIHTTPError(400, "function tools require `function.name`",
                                   param=f"tools[{i}].function.name")
@@ -889,6 +915,130 @@ def _usage_for_results(
         "completion_tokens": completion_tokens,
         "total_tokens": prompt_tokens + completion_tokens,
     }
+
+
+def _responses_usage(usage: dict | None) -> dict | None:
+    if usage is None:
+        return None
+    return {
+        "input_tokens": usage["prompt_tokens"],
+        "input_tokens_details": {"cached_tokens": 0},
+        "output_tokens": usage["completion_tokens"],
+        "output_tokens_details": {"reasoning_tokens": 0},
+        "total_tokens": usage["total_tokens"],
+    }
+
+
+def _responses_tools(tools: list[dict]) -> list[dict]:
+    out = []
+    for tool in tools:
+        fn = tool["function"]
+        item = {"type": "function", "name": fn["name"]}
+        if "description" in fn:
+            item["description"] = fn["description"]
+        if "parameters" in fn:
+            item["parameters"] = fn["parameters"]
+        if "strict" in fn:
+            item["strict"] = fn["strict"]
+        out.append(item)
+    return out
+
+
+def _responses_tool_choice(choice):
+    if isinstance(choice, str):
+        return choice
+    if isinstance(choice, dict):
+        name = None
+        if isinstance(choice.get("function"), dict):
+            name = choice["function"].get("name")
+        else:
+            name = choice.get("name")
+        if isinstance(name, str) and name:
+            return {"type": "function", "name": name}
+    return "auto"
+
+
+def _responses_text_format(response_format: dict) -> dict:
+    ftype = response_format.get("type", "text")
+    if ftype == "json_schema":
+        js = response_format.get("json_schema", {})
+        out = {
+            "type": "json_schema",
+            "name": js.get("name", "response"),
+            "schema": js.get("schema", {}),
+        }
+        for key in ("description", "strict"):
+            if key in js:
+                out[key] = js[key]
+        return out
+    return {"type": ftype}
+
+
+def _responses_output_from_finished(finished: dict, message_id: str | None = None):
+    if finished["tool_calls"]:
+        return [
+            {
+                "type": "function_call",
+                "id": call["id"],
+                "call_id": call["id"],
+                "name": call["function"]["name"],
+                "arguments": call["function"]["arguments"],
+                "status": "completed",
+            }
+            for call in finished["tool_calls"]
+        ], "", None
+
+    output_text = finished["content"] or ""
+    msg_id = message_id or _make_id("msg")
+    return [{
+        "id": msg_id,
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{
+            "type": "output_text",
+            "text": output_text,
+            "annotations": [],
+        }],
+    }], output_text, msg_id
+
+
+def _responses_payload(
+    rid: str,
+    model: str,
+    body: dict,
+    output: list[dict],
+    output_text: str,
+    usage: dict | None,
+    *,
+    status: str = "completed",
+    created_at: int | None = None,
+) -> dict:
+    tools = _request_tools(body)
+    response_format = _response_format(body)
+    payload = {
+        "id": rid,
+        "object": "response",
+        "created_at": float(created_at if created_at is not None else _now()),
+        "model": model,
+        "status": status,
+        "output": output,
+        "output_text": output_text,
+        "parallel_tool_calls": bool(body.get("parallel_tool_calls", True)),
+        "tool_choice": _responses_tool_choice(_tool_choice(body)),
+        "tools": _responses_tools(tools),
+        "usage": _responses_usage(usage),
+    }
+    if body.get("max_output_tokens") is not None:
+        payload["max_output_tokens"] = body["max_output_tokens"]
+    elif body.get("max_tokens") is not None:
+        payload["max_output_tokens"] = body["max_tokens"]
+    for key in ("temperature", "top_p", "user"):
+        if body.get(key) is not None:
+            payload[key] = body[key]
+    if response_format.get("type", "text") != "text":
+        payload["text"] = {"format": _responses_text_format(response_format)}
+    return payload
 
 
 def _generation_options_for_choice(
@@ -1711,46 +1861,131 @@ def create_app(
         stop_strings = _stop_strings(body)
         stop_token_ids = _stop_token_ids(body)
         rid = _make_id("resp")
+        created = _now()
+        stream = bool(body.get("stream", False))
+        message_id = _make_id("msg")
+
+        if stream and not tools and response_format.get("type", "text") == "text":
+            session_id = _make_id("openai-resp")
+
+            def events():
+                sequence = 0
+                full_text = ""
+                created_response = _responses_payload(
+                    rid, model, body, [], "", None,
+                    status="in_progress", created_at=created,
+                )
+                yield _event_sse("response.created", {
+                    "type": "response.created",
+                    "sequence_number": sequence,
+                    "response": created_response,
+                })
+                sequence += 1
+                try:
+                    for piece in backend.stream(prompt, max_tokens, session_id, options=options):
+                        if not piece:
+                            continue
+                        visible, stopped = _split_on_stop(full_text + piece, stop_strings)
+                        piece = visible[len(full_text):]
+                        full_text = visible
+                        if piece:
+                            yield _event_sse("response.output_text.delta", {
+                                "type": "response.output_text.delta",
+                                "sequence_number": sequence,
+                                "item_id": message_id,
+                                "output_index": 0,
+                                "content_index": 0,
+                                "delta": piece,
+                                "logprobs": [],
+                            })
+                            sequence += 1
+                        if stopped:
+                            break
+                    result = GenerationResult(text=full_text, token_ids=None, finish_reason="stop")
+                    usage = _usage(backend, prompt, result)
+                    finished = _finish_chat_result(result, backend, body)
+                    output, output_text, _ = _responses_output_from_finished(
+                        finished, message_id=message_id
+                    )
+                    completed_response = _responses_payload(
+                        rid, model, body, output, output_text, usage,
+                        status="completed", created_at=created,
+                    )
+                    yield _event_sse("response.completed", {
+                        "type": "response.completed",
+                        "sequence_number": sequence,
+                        "response": completed_response,
+                    })
+                except GeneratorExit:
+                    raise
+                except Exception as e:
+                    yield _event_sse("error", {
+                        "type": "error",
+                        "sequence_number": sequence,
+                        "error": {
+                            "message": f"{type(e).__name__}: {e}",
+                            "type": "server_error",
+                            "param": None,
+                            "code": "generation_failed",
+                        },
+                    })
+
+            return StreamingResponse(
+                events(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+
         result = backend.generate(prompt, max_tokens, _make_id("openai-resp"),
                                   options=options)
         result = _apply_stops(result, backend, stop_strings, stop_token_ids)
         finished = _finish_chat_result(result, backend, body)
         usage = _usage(backend, prompt, result)
-        if finished["tool_calls"]:
-            output = [
-                {
-                    "type": "function_call",
-                    "id": call["id"],
-                    "call_id": call["id"],
-                    "name": call["function"]["name"],
-                    "arguments": call["function"]["arguments"],
-                    "status": "completed",
-                }
-                for call in finished["tool_calls"]
-            ]
-            output_text = ""
-        else:
-            output_text = finished["content"] or ""
-            output = [{
-                "id": _make_id("msg"),
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": output_text}],
-            }]
-        return JSONResponse({
-            "id": rid,
-            "object": "response",
-            "created_at": _now(),
-            "model": model,
-            "status": "completed",
-            "output": output,
-            "output_text": output_text,
-            "usage": {
-                "input_tokens": usage["prompt_tokens"],
-                "output_tokens": usage["completion_tokens"],
-                "total_tokens": usage["total_tokens"],
-            },
-        })
+        output, output_text, _ = _responses_output_from_finished(
+            finished, message_id=message_id
+        )
+        payload = _responses_payload(
+            rid, model, body, output, output_text, usage,
+            status="completed", created_at=created,
+        )
+
+        if stream:
+            def structured_events():
+                sequence = 0
+                created_response = _responses_payload(
+                    rid, model, body, [], "", None,
+                    status="in_progress", created_at=created,
+                )
+                yield _event_sse("response.created", {
+                    "type": "response.created",
+                    "sequence_number": sequence,
+                    "response": created_response,
+                })
+                sequence += 1
+                if output_text:
+                    yield _event_sse("response.output_text.delta", {
+                        "type": "response.output_text.delta",
+                        "sequence_number": sequence,
+                        "item_id": message_id,
+                        "output_index": 0,
+                        "content_index": 0,
+                        "delta": output_text,
+                        "logprobs": [],
+                    })
+                    sequence += 1
+                yield _event_sse("response.completed", {
+                    "type": "response.completed",
+                    "sequence_number": sequence,
+                    "response": payload,
+                })
+
+            return StreamingResponse(
+                structured_events(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+
+        return JSONResponse(payload)
 
     async def chat_input_tokens(request: Request):
         try:

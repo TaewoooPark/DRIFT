@@ -11,7 +11,7 @@ wire protocol.
 | `GET /v1/models` | Supported | Includes DRIFT capability metadata. |
 | `POST /v1/chat/completions` | Supported | Non-streaming and SSE streaming. |
 | `POST /v1/completions` | Supported | Legacy prompt API, non-streaming and SSE streaming. |
-| `POST /v1/responses` | Supported | Text responses plus minimal function-call and JSON response shapes. |
+| `POST /v1/responses` | Supported | Text responses with semantic SSE streaming, plus minimal function-call and JSON response shapes. |
 | `POST /v1/embeddings` | Supported where possible | Non-thin mode pools final hidden state; thin mode returns capability error. |
 | `POST /v1/chat/completions/input_tokens` | Supported | Token count helper for chat messages. |
 | `POST /tokenize`, `/detokenize` | Supported | llama.cpp-style helpers, with `/v1/` aliases. |
@@ -22,7 +22,7 @@ wire protocol.
 | Area | Status |
 |---|---|
 | `model`, `messages`, `prompt`, `input` | Supported. |
-| `stream`, `stream_options.include_usage` | Supported, including `[DONE]` and usage-only final chunks. |
+| `stream`, `stream_options.include_usage` | Supported. Chat/Completions use data-only SSE with `[DONE]`; Responses uses typed semantic events such as `response.created`, `response.output_text.delta`, and `response.completed`. |
 | `max_tokens`, `max_completion_tokens`, `max_output_tokens` | Supported. |
 | `n` | Supported up to 16 choices per request. |
 | `temperature`, `top_p`, `top_k`, `min_p`, `seed` | Supported in non-thin mode. |
@@ -33,8 +33,8 @@ wire protocol.
 | `stop_token_ids` | Supported for non-streaming generation. |
 | `encoding_format=float/base64` for embeddings | Supported. |
 | `tools`, `tool_choice`, legacy `functions`/`function_call` | Compatibility layer supported. Forced tool choice returns OpenAI tool-call shape; auto mode promotes model-emitted tool-call JSON when present. |
-| `response_format={"type":"json_object"}` | Supported by extracting or wrapping valid JSON. |
-| `response_format={"type":"json_schema", ...}` | Supported by extracting JSON and filling simple required object fields without an external validator. |
+| `response_format={"type":"json_object"}` and Responses `text.format` JSON object | Supported by extracting or wrapping valid JSON. |
+| `response_format={"type":"json_schema", ...}` and Responses `text.format` JSON schema | Supported by extracting JSON and filling simple required object fields without an external validator. |
 | `parallel_tool_calls` | Accepted as a boolean; multiple parsed tool calls can be returned, but DRIFT does not execute tools. |
 
 ## Explicitly Unsupported
