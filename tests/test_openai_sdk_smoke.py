@@ -21,7 +21,16 @@ class SDKBackend:
 
     def generate(self, prompt, max_tokens: int, session_id: str,
                  options: dict | None = None) -> GenerationResult:
-        return GenerationResult(text="sdk answer", token_ids=[1, 2])
+        return GenerationResult(
+            text="sdk answer",
+            token_ids=[1, 2],
+            logprobs=[
+                {"token_id": 1, "logprob": -0.1, "top_logprobs": [
+                    {"token_id": 1, "logprob": -0.1}
+                ]},
+                {"token_id": 2, "logprob": -0.2, "top_logprobs": []},
+            ],
+        )
 
     def stream(self, prompt, max_tokens: int, session_id: str,
                options: dict | None = None):
@@ -138,5 +147,7 @@ def test_openai_python_sdk_smoke(openai_server):
     assert tool_chat.choices[0].message.tool_calls[0].function.name == "lookup"
     assert len(logprob_chat.choices) == 2
     assert logprob_chat.choices[0].logprobs.content[0].token == "1"
+    assert logprob_chat.choices[0].logprobs.content[0].logprob == pytest.approx(-0.1)
     assert len(logprob_completion.choices) == 2
     assert logprob_completion.choices[0].logprobs.tokens == ["1", "2"]
+    assert logprob_completion.choices[0].logprobs.token_logprobs == pytest.approx([-0.1, -0.2])

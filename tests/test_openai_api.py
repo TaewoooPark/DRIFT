@@ -24,7 +24,22 @@ class FakeBackend:
         self.prompts.append(prompt)
         self.sessions.append(session_id)
         self.options.append(options or {})
-        return GenerationResult(text="hello from drift", token_ids=[1, 2, 3])
+        return GenerationResult(
+            text="hello from drift",
+            token_ids=[1, 2, 3],
+            logprobs=[
+                {
+                    "token_id": 1,
+                    "logprob": -0.1,
+                    "top_logprobs": [
+                        {"token_id": 1, "logprob": -0.1},
+                        {"token_id": 9, "logprob": -2.0},
+                    ],
+                },
+                {"token_id": 2, "logprob": -0.2, "top_logprobs": []},
+                {"token_id": 3, "logprob": -0.3, "top_logprobs": []},
+            ],
+        )
 
     def stream(self, prompt, max_tokens: int, session_id: str,
                options: dict | None = None):
@@ -300,12 +315,15 @@ def test_chat_completion_n_and_logprobs():
     assert [ch["index"] for ch in body["choices"]] == [0, 1]
     assert len(body["choices"]) == 2
     assert body["choices"][0]["logprobs"]["content"][0]["token"] == "tok1"
+    assert body["choices"][0]["logprobs"]["content"][0]["logprob"] == -0.1
     assert body["choices"][0]["logprobs"]["content"][0]["top_logprobs"][0] == {
         "token": "tok1",
-        "logprob": 0.0,
+        "logprob": -0.1,
         "bytes": [116, 111, 107, 49],
     }
+    assert body["choices"][0]["logprobs"]["content"][0]["top_logprobs"][1]["token"] == "tok9"
     assert [opt["seed"] for opt in backend.options] == [10, 11]
+    assert all(opt["_return_logprobs"] for opt in backend.options)
 
 
 def test_chat_streaming_n_and_logprobs_uses_openai_chunk_shape():
@@ -376,11 +394,15 @@ def test_completion_n_and_logprobs():
     body = res.json()
     assert [ch["index"] for ch in body["choices"]] == [0, 1]
     assert body["choices"][0]["logprobs"]["tokens"] == ["tok1", "tok2", "tok3"]
-    assert body["choices"][0]["logprobs"]["token_logprobs"] == [0.0, 0.0, 0.0]
-    assert body["choices"][0]["logprobs"]["top_logprobs"][0] == {"tok1": 0.0}
+    assert body["choices"][0]["logprobs"]["token_logprobs"] == [-0.1, -0.2, -0.3]
+    assert body["choices"][0]["logprobs"]["top_logprobs"][0] == {
+        "tok1": -0.1,
+        "tok9": -2.0,
+    }
     assert body["usage"]["completion_tokens"] == 6
     assert backend.prompts == ["Complete this", "Complete this"]
     assert [opt["seed"] for opt in backend.options] == [5, 6]
+    assert all(opt["_return_logprobs"] for opt in backend.options)
 
 
 def test_completion_non_streaming_prompt_array_and_token_ids():

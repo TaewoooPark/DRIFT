@@ -29,6 +29,7 @@ class GenerationResult:
     text: str
     token_ids: list[int] | None = None
     finish_reason: str = "stop"
+    logprobs: list[dict] | None = None
 
 
 class OpenAIBackend(Protocol):
@@ -97,7 +98,7 @@ class DriftBackend:
         token_ids = list(out.get("token_ids") or [])
         finish = "length" if len(token_ids) >= max_tokens else "stop"
         return GenerationResult(text=out.get("text", ""), token_ids=token_ids,
-                                finish_reason=finish)
+                                finish_reason=finish, logprobs=out.get("logprobs"))
 
     def stream(self, prompt: Prompt, max_tokens: int, session_id: str,
                options: dict | None = None) -> Iterable[str]:
@@ -603,12 +604,14 @@ def _finish_chat_result(result: GenerationResult, backend: OpenAIBackend, body: 
             "tool_calls": tool_calls,
             "finish_reason": "tool_calls",
             "token_ids": result.token_ids,
+            "logprobs": None,
         }
     return {
         "content": _coerce_json_text(result.text, response_format),
         "tool_calls": None,
         "finish_reason": result.finish_reason,
         "token_ids": result.token_ids,
+        "logprobs": result.logprobs,
     }
 
 
@@ -714,6 +717,7 @@ def _apply_stops(result: GenerationResult, backend: OpenAIBackend,
                  stop_strings: list[str], stop_token_ids: list[int]) -> GenerationResult:
     text = result.text
     token_ids = list(result.token_ids) if result.token_ids is not None else None
+    logprobs = list(result.logprobs) if result.logprobs is not None else None
     finish = result.finish_reason
 
     if token_ids is not None and stop_token_ids:
@@ -721,6 +725,8 @@ def _apply_stops(result: GenerationResult, backend: OpenAIBackend,
         for i, tid in enumerate(token_ids):
             if tid in stop_set:
                 token_ids = token_ids[:i]
+                if logprobs is not None:
+                    logprobs = logprobs[:i]
                 text = backend.decode_tokens(token_ids)
                 finish = "stop"
                 break
@@ -730,9 +736,12 @@ def _apply_stops(result: GenerationResult, backend: OpenAIBackend,
         if found:
             idx, _ = min(found, key=lambda x: x[0])
             text = text[:idx]
+            logprobs = None
             finish = "stop"
 
-    return GenerationResult(text=text, token_ids=token_ids, finish_reason=finish)
+    return GenerationResult(
+        text=text, token_ids=token_ids, finish_reason=finish, logprobs=logprobs
+    )
 
 
 def _split_on_stop(text: str, stop_strings: list[str]) -> tuple[str, bool]:
@@ -882,10 +891,20 @@ def _usage_for_results(
     }
 
 
-def _generation_options_for_choice(options: dict, choice_index: int) -> dict:
+def _generation_options_for_choice(
+    options: dict,
+    choice_index: int,
+    *,
+    return_logprobs: bool = False,
+    top_logprobs: int = 0,
+) -> dict:
     if not options:
-        return {}
-    out = dict(options)
+        out = {}
+    else:
+        out = dict(options)
+    if return_logprobs:
+        out["_return_logprobs"] = True
+        out["_top_logprobs"] = int(top_logprobs)
     if choice_index and out.get("seed") is not None:
         out["seed"] = int(out["seed"]) + choice_index
     return out
@@ -914,11 +933,59 @@ def _token_bytes(token: str) -> list[int]:
     return list(token.encode("utf-8"))
 
 
+def _exact_logprob_item(
+    backend: OpenAIBackend, item: dict | None, fallback_token: str, fallback_logprob: float = 0.0
+) -> tuple[str, float]:
+    if not isinstance(item, dict):
+        return fallback_token, fallback_logprob
+    token_id = item.get("token_id")
+    token = fallback_token
+    if token_id is not None:
+        try:
+            token = backend.decode_tokens([int(token_id)])
+        except Exception:
+            token = str(token_id)
+    try:
+        logprob = float(item.get("logprob", fallback_logprob))
+    except (TypeError, ValueError):
+        logprob = fallback_logprob
+    return token, logprob
+
+
+def _exact_top_logprobs(
+    backend: OpenAIBackend,
+    item: dict | None,
+    fallback_token: str,
+    fallback_logprob: float,
+    top_count: int,
+    *,
+    chat: bool,
+):
+    if top_count <= 0:
+        return [] if chat else None
+    raw = item.get("top_logprobs") if isinstance(item, dict) else None
+    if not isinstance(raw, list) or not raw:
+        raw = [{"token_id": item.get("token_id"), "logprob": fallback_logprob}] \
+            if isinstance(item, dict) else [{"logprob": fallback_logprob}]
+    out = [] if chat else {}
+    for top_item in raw[:top_count]:
+        token, logprob = _exact_logprob_item(
+            backend, top_item if isinstance(top_item, dict) else None,
+            fallback_token, fallback_logprob,
+        )
+        if chat:
+            out.append({"token": token, "logprob": logprob, "bytes": _token_bytes(token)})
+        else:
+            out[token] = logprob
+    return out
+
+
 def _completion_logprobs(
     backend: OpenAIBackend,
     text: str,
     token_ids: list[int] | None,
     top_count: int | None,
+    exact: list[dict] | None = None,
 ) -> dict | None:
     if top_count is None:
         return None
@@ -928,12 +995,21 @@ def _completion_logprobs(
     for token in tokens:
         offsets.append(pos)
         pos += len(token)
+    token_logprobs = []
     top_logprobs = []
-    for token in tokens:
-        top_logprobs.append({token: 0.0} if top_count else None)
+    for i, token in enumerate(tokens):
+        item = exact[i] if exact is not None and i < len(exact) else None
+        token, logprob = _exact_logprob_item(backend, item, token, 0.0)
+        tokens[i] = token
+        token_logprobs.append(logprob)
+        top_logprobs.append(
+            _exact_top_logprobs(
+                backend, item, token, logprob, top_count, chat=False
+            )
+        )
     return {
         "tokens": tokens,
-        "token_logprobs": [0.0 for _ in tokens],
+        "token_logprobs": token_logprobs,
         "top_logprobs": top_logprobs,
         "text_offset": offsets,
     }
@@ -944,19 +1020,18 @@ def _chat_logprobs(
     text: str,
     token_ids: list[int] | None,
     top_count: int,
+    exact: list[dict] | None = None,
 ) -> dict:
     content = []
-    for token in _token_strings(backend, text, token_ids):
-        top = []
-        if top_count:
-            top.append({
-                "token": token,
-                "logprob": 0.0,
-                "bytes": _token_bytes(token),
-            })
+    for i, token in enumerate(_token_strings(backend, text, token_ids)):
+        item = exact[i] if exact is not None and i < len(exact) else None
+        token, logprob = _exact_logprob_item(backend, item, token, 0.0)
+        top = _exact_top_logprobs(
+            backend, item, token, logprob, top_count, chat=True
+        )
         content.append({
             "token": token,
-            "logprob": 0.0,
+            "logprob": logprob,
             "bytes": _token_bytes(token),
             "top_logprobs": top,
         })
@@ -1101,7 +1176,12 @@ def create_app(
                     prompt,
                     max_tokens,
                     f"{session_id}-{i}",
-                    options=_generation_options_for_choice(options, i),
+                    options=_generation_options_for_choice(
+                        options,
+                        i,
+                        return_logprobs=want_logprobs,
+                        top_logprobs=top_logprobs,
+                    ),
                 )
                 result = _apply_stops(result, backend, stop_strings, stop_token_ids)
                 results.append(result)
@@ -1120,6 +1200,7 @@ def create_app(
                         _chat_logprobs(
                             backend, finished["content"] or "",
                             finished["token_ids"], top_logprobs,
+                            finished["logprobs"],
                         )
                     )
                 choices.append(choice)
@@ -1143,7 +1224,12 @@ def create_app(
                         prompt,
                         max_tokens,
                         f"{session_id}-{i}",
-                        options=_generation_options_for_choice(options, i),
+                        options=_generation_options_for_choice(
+                            options,
+                            i,
+                            return_logprobs=want_logprobs,
+                            top_logprobs=top_logprobs,
+                        ),
                     )
                     result = _apply_stops(result, backend, stop_strings, stop_token_ids)
                     results.append(result)
@@ -1196,6 +1282,7 @@ def create_app(
                             chunk["choices"][0]["logprobs"] = _chat_logprobs(
                                 backend, finished["content"] or "",
                                 finished["token_ids"], top_logprobs,
+                                finished["logprobs"],
                             )
                         if include_usage:
                             chunk["usage"] = None
@@ -1349,7 +1436,12 @@ def create_app(
                             prompt,
                             max_tokens,
                             f"{session_id}-{i}",
-                            options=_generation_options_for_choice(options, i),
+                            options=_generation_options_for_choice(
+                                options,
+                                i,
+                                return_logprobs=logprobs_count is not None,
+                                top_logprobs=logprobs_count or 0,
+                            ),
                         )
                         result = _apply_stops(result, backend, stop_strings, stop_token_ids)
                         results.append(result)
@@ -1367,6 +1459,7 @@ def create_app(
                                     text,
                                     None if echo else result.token_ids,
                                     logprobs_count,
+                                    None if echo else result.logprobs,
                                 ),
                                 "finish_reason": None,
                             }],
@@ -1497,7 +1590,12 @@ def create_app(
                     prompt,
                     max_tokens,
                     f"{_make_id('openai')}-{offset}",
-                    options=_generation_options_for_choice(options, offset),
+                    options=_generation_options_for_choice(
+                        options,
+                        offset,
+                        return_logprobs=logprobs_count is not None,
+                        top_logprobs=logprobs_count or 0,
+                    ),
                 )
                 result = _apply_stops(result, backend, stop_strings, stop_token_ids)
                 completion_tokens = (
@@ -1515,6 +1613,7 @@ def create_app(
                         text,
                         None if echo else result.token_ids,
                         logprobs_count,
+                        None if echo else result.logprobs,
                     ),
                     "finish_reason": result.finish_reason,
                 })

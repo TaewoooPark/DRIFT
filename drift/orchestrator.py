@@ -563,6 +563,32 @@ class Orchestrator:
             generator.manual_seed(int(opts["seed"]) + int(step))
         return int(torch.multinomial(probs, 1, generator=generator))
 
+    def _logprob_record(self, logits, token_id: int, top_count: int) -> dict:
+        """OpenAI adapter helper: exact logprob for the selected token plus top-k.
+
+        This is opt-in through private generation_options and does not affect the
+        greedy default path unless the HTTP layer asks for logprobs.
+        """
+        torch = _torch()
+        scores = logits.detach().float().cpu()
+        if scores.ndim != 1:
+            scores = scores.reshape(-1)
+        log_probs = torch.log_softmax(scores, dim=-1)
+        token_id = int(token_id)
+        record = {
+            "token_id": token_id,
+            "logprob": float(log_probs[token_id]) if 0 <= token_id < log_probs.numel() else 0.0,
+            "top_logprobs": [],
+        }
+        if top_count > 0 and log_probs.numel() > 0:
+            k = min(int(top_count), int(log_probs.numel()))
+            vals, idxs = torch.topk(log_probs, k)
+            record["top_logprobs"] = [
+                {"token_id": int(idx), "logprob": float(val)}
+                for idx, val in zip(idxs.tolist(), vals.tolist())
+            ]
+        return record
+
     def _recover(self, session_id: str) -> None:
         """A node dropped mid-run: re-split over the survivors (+ spares), so the
         caller can re-prefill the sequence-so-far and continue. Raises if no
@@ -593,8 +619,12 @@ class Orchestrator:
         sampling = self._sampling_enabled(generation_options)
         if sampling and self.thin:
             raise ValueError("sampling is not available in thin-head mode")
+        collect_logprobs = bool((generation_options or {}).get("_return_logprobs")) \
+            and not self.thin
+        top_logprobs = int((generation_options or {}).get("_top_logprobs") or 0)
 
         generated: list[int] = []
+        logprobs: list[dict] = []
         first_logits = None
         while True:  # (re)start on a mid-run node drop (M9)
             try:
@@ -607,20 +637,29 @@ class Orchestrator:
                 next_id, logits0 = self._prefill(session_id, seq)
                 if first_logits is None:
                     first_logits = logits0
+                current_logits = torch.tensor(logits0) if (collect_logprobs and logits0 is not None) \
+                    else None
                 if sampling and logits0 is not None:
                     next_id = self._pick_token(torch.tensor(logits0), seq,
                                                generation_options, len(generated))
                 p = len(seq)
                 while len(generated) < max_new_tokens:
+                    if collect_logprobs and current_logits is not None:
+                        logprobs.append(self._logprob_record(current_logits, next_id, top_logprobs))
                     generated.append(next_id)
                     self.progress = len(generated)
                     if (stop_on_eos and next_id in eos) or len(generated) >= max_new_tokens:
                         break
-                    if sampling:
+                    if sampling or collect_logprobs:
                         _, logits = self._decode(session_id, next_id, p, return_logits=True)
-                        next_id = self._pick_token(
-                            logits, prompt_ids + generated, generation_options, len(generated)
-                        )
+                        current_logits = logits
+                        if sampling:
+                            next_id = self._pick_token(
+                                logits, prompt_ids + generated,
+                                generation_options, len(generated)
+                            )
+                        else:
+                            next_id = int(torch.argmax(logits, dim=-1))
                     else:
                         next_id = self._decode(session_id, next_id, p)
                     p += 1
@@ -630,7 +669,10 @@ class Orchestrator:
 
         for name in self.order:
             self.transport.reset(name, session_id)
-        return {"token_ids": generated, "first_logits": first_logits, "text": tok.decode(generated)}
+        out = {"token_ids": generated, "first_logits": first_logits, "text": tok.decode(generated)}
+        if collect_logprobs:
+            out["logprobs"] = logprobs
+        return out
 
     @_no_grad
     def generate_stream(self, prompt: str | list[dict], max_new_tokens: int,
