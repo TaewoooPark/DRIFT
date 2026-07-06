@@ -188,7 +188,7 @@ def _require_starlette():
         from starlette.middleware.base import BaseHTTPMiddleware
         from starlette.middleware.cors import CORSMiddleware
         from starlette.requests import Request
-        from starlette.responses import JSONResponse, StreamingResponse
+        from starlette.responses import JSONResponse, PlainTextResponse, StreamingResponse
         from starlette.routing import Route
     except ImportError as e:
         raise RuntimeError(
@@ -196,7 +196,7 @@ def _require_starlette():
         ) from e
     return (
         Starlette, BaseHTTPMiddleware, CORSMiddleware, Request,
-        JSONResponse, StreamingResponse, Route,
+        JSONResponse, PlainTextResponse, StreamingResponse, Route,
     )
 
 
@@ -618,20 +618,24 @@ def create_app(
     cors_origins: list[str] | None = None,
     max_concurrent_requests: int | None = None,
 ):
-    Starlette, BaseHTTPMiddleware, CORSMiddleware, Request, JSONResponse, StreamingResponse, Route = (
+    (
+        Starlette, BaseHTTPMiddleware, CORSMiddleware, Request,
+        JSONResponse, PlainTextResponse, StreamingResponse, Route,
+    ) = (
         _require_starlette()
     )
     api_key_set = {k for k in (api_keys or []) if k}
     protected_paths = (
         "/v1/models", "/v1/chat/completions", "/v1/completions",
         "/v1/embeddings", "/tokenize", "/detokenize", "/v1/tokenize",
-        "/v1/detokenize",
+        "/v1/detokenize", "/v1/responses", "/v1/chat/completions/input_tokens",
     )
 
     class RequestIDMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request: Request, call_next):
             request_id = request.headers.get("x-request-id") or _make_id("req")
             request.state.request_id = request_id
+            request.app.state.request_count += 1
             response = await call_next(request)
             response.headers["x-request-id"] = request_id
             return response
@@ -1006,6 +1010,106 @@ def create_app(
             "usage": {"prompt_tokens": total_tokens, "total_tokens": total_tokens},
         })
 
+    async def responses(request: Request):
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            raise OpenAIHTTPError(400, "request body must be valid JSON")
+        if not isinstance(body, dict):
+            raise OpenAIHTTPError(400, "request body must be a JSON object")
+        model = _validate_model(body, backend)
+        input_value = body.get("input")
+        if input_value is None:
+            raise OpenAIHTTPError(400, "`input` is required", param="input")
+        if isinstance(input_value, str):
+            prompt: Prompt = input_value
+        elif isinstance(input_value, list):
+            # Responses API clients often send message-like input arrays.
+            prompt = normalize_chat_messages(input_value)
+        else:
+            raise OpenAIHTTPError(400, "`input` must be a string or message array",
+                                  param="input")
+        if body.get("tools") not in (None, []):
+            raise OpenAIHTTPError(
+                400, "`tools` is not supported by this endpoint stage yet",
+                param="tools", code="unsupported_parameter"
+            )
+        if body.get("parallel_tool_calls") not in (None, False):
+            raise OpenAIHTTPError(
+                400, "`parallel_tool_calls` is not supported by this endpoint stage yet",
+                param="parallel_tool_calls", code="unsupported_parameter"
+            )
+        response_format = body.get("response_format")
+        if response_format not in (None, {}):
+            if not isinstance(response_format, dict) or response_format.get("type", "text") != "text":
+                raise OpenAIHTTPError(
+                    400,
+                    "only text response_format is supported by this endpoint stage",
+                    param="response_format",
+                    code="unsupported_parameter",
+                )
+        try:
+            max_tokens = int(body.get("max_output_tokens", body.get("max_tokens",
+                                                                   backend.default_max_tokens)))
+        except (TypeError, ValueError):
+            raise OpenAIHTTPError(400, "`max_output_tokens` must be an integer",
+                                  param="max_output_tokens")
+        if max_tokens < 1:
+            raise OpenAIHTTPError(400, "`max_output_tokens` must be >= 1",
+                                  param="max_output_tokens")
+        _check_context(backend, prompt, max_tokens)
+        options = _generation_options(body, backend)
+        stop_strings = _stop_strings(body)
+        stop_token_ids = _stop_token_ids(body)
+        rid = _make_id("resp")
+        result = backend.generate(prompt, max_tokens, _make_id("openai-resp"),
+                                  options=options)
+        result = _apply_stops(result, backend, stop_strings, stop_token_ids)
+        usage = _usage(backend, prompt, result)
+        return JSONResponse({
+            "id": rid,
+            "object": "response",
+            "created_at": _now(),
+            "model": model,
+            "status": "completed",
+            "output": [{
+                "id": _make_id("msg"),
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": result.text}],
+            }],
+            "output_text": result.text,
+            "usage": {
+                "input_tokens": usage["prompt_tokens"],
+                "output_tokens": usage["completion_tokens"],
+                "total_tokens": usage["total_tokens"],
+            },
+        })
+
+    async def chat_input_tokens(request: Request):
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            raise OpenAIHTTPError(400, "request body must be valid JSON")
+        if not isinstance(body, dict):
+            raise OpenAIHTTPError(400, "request body must be a JSON object")
+        _validate_model(body, backend)
+        prompt = normalize_chat_messages(body.get("messages"))
+        tokens = backend.encode_tokens(prompt)
+        return JSONResponse({"object": "input_tokens", "input_tokens": len(tokens)})
+
+    async def metrics(request: Request):
+        text = "\n".join([
+            "# HELP drift_openai_requests_total HTTP requests seen by drift serve.",
+            "# TYPE drift_openai_requests_total counter",
+            f"drift_openai_requests_total {int(request.app.state.request_count)}",
+            "# HELP drift_openai_model_info Served model metadata.",
+            "# TYPE drift_openai_model_info gauge",
+            f'drift_openai_model_info{{model="{backend.model_id}"}} 1',
+            "",
+        ])
+        return PlainTextResponse(text, media_type="text/plain; version=0.0.4")
+
     async def tokenize(request: Request):
         try:
             body = await request.json()
@@ -1043,14 +1147,18 @@ def create_app(
         Route("/ready", ready, methods=["GET"]),
         Route("/v1/models", models, methods=["GET"]),
         Route("/v1/chat/completions", chat_completions, methods=["POST"]),
+        Route("/v1/chat/completions/input_tokens", chat_input_tokens, methods=["POST"]),
         Route("/v1/completions", completions, methods=["POST"]),
+        Route("/v1/responses", responses, methods=["POST"]),
         Route("/v1/embeddings", embeddings, methods=["POST"]),
+        Route("/metrics", metrics, methods=["GET"]),
         Route("/tokenize", tokenize, methods=["POST"]),
         Route("/detokenize", detokenize, methods=["POST"]),
         Route("/v1/tokenize", tokenize, methods=["POST"]),
         Route("/v1/detokenize", detokenize, methods=["POST"]),
     ]
     app = Starlette(routes=routes, exception_handlers={OpenAIHTTPError: openai_error_handler})
+    app.state.request_count = 0
     if cors_origins:
         app.add_middleware(
             CORSMiddleware,
