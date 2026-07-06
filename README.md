@@ -34,6 +34,10 @@
 
 <p align="center"><sub>A friend in New York leaves a node running while they sleep; you're in Seoul. DRIFT splits <b>one</b> model across both machines — their GPU computes the front layers, yours the back, the hidden state streams <b>node-to-node</b> over an <b>encrypted</b> wire, and every hop <b>signs a receipt</b> — so together you run a model neither could hold alone, provably the same answer as one machine.</sub></p>
 
+<p align="center">
+  <img src="docs/img/drift-demo.gif" alt="DRIFT demo: one model running across multiple nodes" width="900">
+</p>
+
 **DRIFT** runs **one** large language model across **heterogeneous personal machines** — a Mac (Apple GPU, PyTorch **MPS**) and a Windows/Linux PC (NVIDIA GPU, PyTorch **CUDA**) — by splitting the model **layer by layer** (pipeline parallelism) and streaming only the **hidden state** between nodes over a **framework-neutral byte protocol** (TCP + msgpack). No datacenter, no `torch.distributed`, no NCCL, no vendor lock. The data plane is bound to *no* framework, so runtimes that could never talk to each other — an Apple Metal graph and an NVIDIA CUDA graph — now run one model together, and the output is **bit-for-bit identical** to running the whole model on a single machine.
 
 On top of that exact core, DRIFT has grown a real **decentralization layer**: the hidden state now streams **peer-to-peer** (the head is no longer a bandwidth hub), the wire is **encrypted and membership-authenticated**, a dropped node is recovered **bitwise**, the head can be **weightless**, every hop **signs a receipt** the head verifies on live traffic, nodes **gossip-discover** each other, and their contribution is tallied in a **ledger**.

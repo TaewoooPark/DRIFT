@@ -34,6 +34,10 @@
 
 <p align="center"><sub>뉴욕의 친구가 잠든 사이 노드를 켜 두고, 당신은 서울에 있다. DRIFT는 <b>하나의</b> 모델을 두 머신에 쪼갠다. 친구의 GPU가 앞쪽 레이어를, 당신의 GPU가 뒤쪽을 계산하고, hidden state는 <b>암호화된</b> 와이어 위로 <b>노드에서 노드로</b> 흐르며, 매 홉이 <b>영수증에 서명한다.</b> 그리하여 어느 한 대도 홀로 담지 못할 모델을 둘이 함께 돌리되, 그 답이 단일 머신과 같음이 증명된다.</sub></p>
 
+<p align="center">
+  <img src="docs/img/drift-demo.gif" alt="DRIFT 데모: 하나의 모델이 여러 노드에 걸쳐 실행되는 모습" width="900">
+</p>
+
 **DRIFT**는 **하나의** 대규모 언어 모델을 **이종(heterogeneous) 개인 머신들**, 곧 Mac(Apple GPU, PyTorch **MPS**)과 Windows/Linux PC(NVIDIA GPU, PyTorch **CUDA**)에 걸쳐 실행하되, 모델을 **레이어 단위로** 분할(파이프라인 병렬화, pipeline parallelism)하고 노드 사이로는 오직 **hidden state**만을 **프레임워크 중립 바이트 프로토콜**(TCP + msgpack) 위로 흘려보내는 방식을 취한다. 데이터센터도, `torch.distributed`도, NCCL도, 벤더 종속도 개입하지 않는바, 데이터 플레인(data plane)이 *어떤* 프레임워크에도 묶여 있지 않기에 서로 결코 대화할 수 없던 런타임, 곧 Apple Metal 그래프와 NVIDIA CUDA 그래프가 비로소 하나의 모델을 함께 돌릴 수 있으며, 그 출력은 전체 모델을 단일 머신에서 실행한 결과와 **비트 하나까지 동일하다**.
 
 그 정확한 핵심 위에서 DRIFT는 진짜 **탈중앙 계층(decentralization layer)**을 길러 냈다. 이제 hidden state는 **피어투피어(peer-to-peer)**로 흐르고(헤드는 더 이상 대역폭 허브가 아니다), 와이어는 **암호화되고 멤버십이 인증되며**, 떨어져 나간 노드는 **비트 단위로** 복구되고, 헤드는 **무게 없는(weightless)** 것이 될 수 있으며, 매 홉은 헤드가 실시간 트래픽 위에서 검증하는 **영수증에 서명하고**, 노드들은 서로를 **가십(gossip)으로 발견하며**, 그 기여는 **원장(ledger)**에 집계된다.

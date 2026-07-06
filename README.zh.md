@@ -34,6 +34,10 @@
 
 <p align="center"><sub>纽约的朋友在睡觉时留着一个节点，你在首尔。DRIFT 把<b>一个</b>模型拆到两台机器上——他的 GPU 计算前面的层，你的计算后面的，hidden state 通过一条<b>加密</b>线缆<b>节点到节点</b>地串流，而且每一跳都<b>签署一份回执</b>——于是你们一起运行一个任何一台都放不下的模型，并且可证明地给出与单机相同的答案。</sub></p>
 
+<p align="center">
+  <img src="docs/img/drift-demo.gif" alt="DRIFT 演示：一个模型跨多个节点运行" width="900">
+</p>
+
 **DRIFT** 让**一个**大语言模型跨**异构个人设备**运行——一台 Mac（Apple GPU，PyTorch **MPS**）和一台 Windows/Linux PC（NVIDIA GPU，PyTorch **CUDA**）——做法是把模型**逐层切分**（pipeline parallelism），并只在节点之间通过一套**框架中立的字节协议**（TCP + msgpack）流式传输 **hidden state**。没有数据中心，没有 `torch.distributed`，没有 NCCL，没有厂商锁定。数据平面*不绑定任何*框架，于是那些本来永远无法对话的运行时——一张 Apple Metal 计算图和一张 NVIDIA CUDA 计算图——如今得以共同运行一个模型，而其输出与在单机上运行整个模型**逐位（bit-for-bit）完全相同**。
 
 在这个精确内核之上，DRIFT 已经长出了一层真正的**去中心化层**：hidden state 如今**点对点**串流（头节点不再是带宽枢纽），线缆**加密且经过成员认证**，掉线的节点会被**逐位**恢复，头节点可以是**无权重**的，每一跳都**签署一份回执**并由头节点在实时流量上验证，节点之间通过 **gossip 相互发现**，它们的贡献则记入一本**账本**。
