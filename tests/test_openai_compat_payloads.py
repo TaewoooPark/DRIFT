@@ -175,7 +175,18 @@ def test_negative_compat_cases_are_openai_shaped():
     tool_call = c.post("/v1/chat/completions", json={
         "model": "drift-test",
         "messages": [{"role": "user", "content": "Hello"}],
-        "tools": [{"type": "function", "function": {"name": "x"}}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "x",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"q": {"type": "string"}},
+                    "required": ["q"],
+                },
+            },
+        }],
+        "tool_choice": {"type": "function", "function": {"name": "x"}},
     }, headers={"authorization": "Bearer secret"})
     bad_embedding = c.post("/v1/embeddings", json={
         "model": "drift-test",
@@ -190,9 +201,42 @@ def test_negative_compat_cases_are_openai_shaped():
 
     assert bad_auth.status_code == 401
     assert bad_auth.json()["error"]["type"] == "authentication_error"
-    assert tool_call.status_code == 400
-    assert tool_call.json()["error"]["code"] == "unsupported_parameter"
+    assert tool_call.status_code == 200
+    assert tool_call.json()["choices"][0]["finish_reason"] == "tool_calls"
+    assert tool_call.json()["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "x"
     assert bad_embedding.status_code == 400
     assert bad_embedding.json()["error"]["param"] == "dimensions"
     assert bad_response.status_code == 400
     assert bad_response.json()["error"]["param"] == "response_format"
+
+
+def test_responses_api_json_schema_and_tool_choice():
+    _, c = client()
+    json_res = c.post("/v1/responses", json={
+        "model": "drift-test",
+        "input": "Hello",
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "answer",
+                "schema": {
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+    })
+    tool_res = c.post("/v1/responses", json={
+        "model": "drift-test",
+        "input": "Hello",
+        "tools": [{"type": "function", "function": {"name": "lookup"}}],
+        "tool_choice": "required",
+    })
+
+    assert json_res.status_code == 200
+    assert json_res.json()["output_text"] == '{"answer":"compat answer END"}'
+    assert tool_res.status_code == 200
+    assert tool_res.json()["output"][0]["type"] == "function_call"
+    assert tool_res.json()["output"][0]["name"] == "lookup"

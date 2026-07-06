@@ -11,7 +11,7 @@ wire protocol.
 | `GET /v1/models` | Supported | Includes DRIFT capability metadata. |
 | `POST /v1/chat/completions` | Supported | Non-streaming and SSE streaming. |
 | `POST /v1/completions` | Supported | Legacy prompt API, non-streaming and SSE streaming. |
-| `POST /v1/responses` | Minimal | Text response shape only; no tools/audio/multimodal. |
+| `POST /v1/responses` | Supported | Text responses plus minimal function-call and JSON response shapes. |
 | `POST /v1/embeddings` | Supported where possible | Non-thin mode pools final hidden state; thin mode returns capability error. |
 | `POST /v1/chat/completions/input_tokens` | Supported | Token count helper for chat messages. |
 | `POST /tokenize`, `/detokenize` | Supported | llama.cpp-style helpers, with `/v1/` aliases. |
@@ -29,6 +29,10 @@ wire protocol.
 | `stop` strings | Supported for non-streaming and streaming text chunks. |
 | `stop_token_ids` | Supported for non-streaming generation. |
 | `encoding_format=float/base64` for embeddings | Supported. |
+| `tools`, `tool_choice`, legacy `functions`/`function_call` | Compatibility layer supported. Forced tool choice returns OpenAI tool-call shape; auto mode promotes model-emitted tool-call JSON when present. |
+| `response_format={"type":"json_object"}` | Supported by extracting or wrapping valid JSON. |
+| `response_format={"type":"json_schema", ...}` | Supported by extracting JSON and filling simple required object fields without an external validator. |
+| `parallel_tool_calls` | Accepted as a boolean; multiple parsed tool calls can be returned, but DRIFT does not execute tools. |
 
 ## Explicitly Unsupported
 
@@ -36,9 +40,8 @@ These requests return OpenAI-shaped errors rather than being silently ignored.
 
 | Feature | Current behavior |
 |---|---|
-| Tools / function calling / `tool_choice` / `parallel_tool_calls` | Unsupported error. |
-| Assistant `tool_calls` message content | Unsupported error. |
-| JSON mode / JSON schema via `response_format` | Unsupported error except `{"type":"text"}`. |
+| Tool execution | Not performed by DRIFT; the server only emits OpenAI-compatible tool-call requests for the client to execute. |
+| Full JSON-schema constrained decoding | Not guaranteed; JSON output is post-processed/coerced for compatibility. |
 | Multimodal image/audio content | Unsupported error. |
 | Audio transcription/translation APIs | Not exposed. |
 | Embedding `dimensions` truncation/projection | Unsupported error. |

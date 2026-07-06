@@ -213,7 +213,7 @@ def test_rejects_multimodal_content_explicitly():
     assert res.json()["error"]["code"] == "unsupported_multimodal_content"
 
 
-def test_rejects_json_response_format_until_supported():
+def test_json_object_response_format_returns_valid_json_text():
     _, c = client()
     res = c.post("/v1/chat/completions", json={
         "model": "drift-test",
@@ -221,8 +221,67 @@ def test_rejects_json_response_format_until_supported():
         "response_format": {"type": "json_object"},
     })
 
-    assert res.status_code == 400
-    assert res.json()["error"]["param"] == "response_format"
+    assert res.status_code == 200
+    body = res.json()
+    assert json.loads(body["choices"][0]["message"]["content"]) == {
+        "response": "hello from drift"
+    }
+
+
+def test_json_schema_response_format_fills_required_fields():
+    _, c = client()
+    res = c.post("/v1/chat/completions", json={
+        "model": "drift-test",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "answer",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "answer": {"type": "string"},
+                        "ok": {"type": "boolean"},
+                    },
+                    "required": ["answer", "ok"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+    })
+
+    assert res.status_code == 200
+    content = json.loads(res.json()["choices"][0]["message"]["content"])
+    assert content == {"answer": "hello from drift", "ok": False}
+
+
+def test_required_tool_choice_returns_tool_calls():
+    _, c = client()
+    res = c.post("/v1/chat/completions", json={
+        "model": "drift-test",
+        "messages": [{"role": "user", "content": "Use a tool"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+            },
+        }],
+        "tool_choice": "required",
+    })
+
+    assert res.status_code == 200
+    choice = res.json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["content"] is None
+    assert choice["message"]["tool_calls"][0]["function"]["name"] == "lookup"
+    assert json.loads(choice["message"]["tool_calls"][0]["function"]["arguments"]) == {
+        "query": ""
+    }
 
 
 def test_completion_non_streaming_single_prompt():

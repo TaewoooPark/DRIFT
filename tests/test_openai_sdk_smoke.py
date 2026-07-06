@@ -2,6 +2,7 @@ import socket
 import threading
 import time
 import urllib.request
+import json
 
 import pytest
 
@@ -92,9 +93,33 @@ def test_openai_python_sdk_smoke(openai_server):
     ))
     completion = client.completions.create(model="drift-test", prompt="hello")
     embedding = client.embeddings.create(model="drift-test", input="hello")
+    json_chat = client.chat.completions.create(
+        model="drift-test",
+        messages=[{"role": "user", "content": "json please"}],
+        response_format={"type": "json_object"},
+    )
+    tool_chat = client.chat.completions.create(
+        model="drift-test",
+        messages=[{"role": "user", "content": "use a tool"}],
+        tools=[{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+            },
+        }],
+        tool_choice="required",
+    )
 
     assert models.data[0].id == "drift-test"
     assert chat.choices[0].message.content == "sdk answer"
     assert any((chunk.choices and chunk.choices[0].delta.content) for chunk in chunks)
     assert completion.choices[0].text == "sdk answer"
     assert embedding.data[0].embedding == pytest.approx([0.1, 0.2])
+    assert json.loads(json_chat.choices[0].message.content) == {"response": "sdk answer"}
+    assert tool_chat.choices[0].finish_reason == "tool_calls"
+    assert tool_chat.choices[0].message.tool_calls[0].function.name == "lookup"

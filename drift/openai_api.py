@@ -252,14 +252,14 @@ def normalize_chat_messages(messages: list[dict]) -> list[dict]:
         if role not in {"system", "developer", "user", "assistant", "tool"}:
             raise OpenAIHTTPError(400, f"unsupported message role: {role!r}",
                                   param=f"messages[{i}].role")
-        if msg.get("tool_calls"):
-            raise OpenAIHTTPError(
-                400,
-                "assistant tool calls are not supported by this DRIFT endpoint yet",
-                param=f"messages[{i}].tool_calls",
-                code="unsupported_tools",
-            )
         text = _content_to_text(msg.get("content"), f"messages[{i}].content")
+        if msg.get("tool_calls"):
+            text = "\n".join(
+                p for p in [
+                    text,
+                    "Tool calls: " + json.dumps(msg["tool_calls"], ensure_ascii=False),
+                ] if p
+            )
         if role == "developer":
             role = "system"
         normalized.append({"role": role, "content": text})
@@ -304,7 +304,7 @@ def _validate_stage1_options(body: dict) -> None:
     known = {
         "model", "messages", "max_tokens", "max_completion_tokens", "stream",
         "stream_options", "temperature", "top_p", "top_k", "min_p", "n", "stop",
-        "stop_token_ids",
+        "stop_token_ids", "parallel_tool_calls",
         "presence_penalty", "frequency_penalty", "repetition_penalty", "seed", "user", "tools",
         "tool_choice", "functions", "function_call", "logprobs", "top_logprobs",
         "response_format", "logit_bias",
@@ -327,28 +327,21 @@ def _validate_stage1_options(body: dict) -> None:
             400, "`logit_bias` is not supported by this endpoint stage yet",
             param="logit_bias", code="unsupported_parameter"
         )
-    response_format = body.get("response_format")
-    if response_format not in (None, {}):
-        if not isinstance(response_format, dict):
-            raise OpenAIHTTPError(400, "`response_format` must be an object",
-                                  param="response_format")
-        if response_format.get("type", "text") != "text":
-            raise OpenAIHTTPError(
-                400,
-                "only text response_format is supported by this endpoint stage",
-                param="response_format",
-                code="unsupported_parameter",
-            )
-    unsupported = [
-        "tools", "tool_choice", "functions", "function_call", "logprobs",
-        "top_logprobs",
-    ]
+    _response_format(body)
+    _request_tools(body)
+    _tool_choice(body)
+    unsupported = ["logprobs", "top_logprobs"]
     for key in unsupported:
         if key in body and body[key] not in (None, [], {}, "none"):
             raise OpenAIHTTPError(
                 400, f"`{key}` is not supported by this endpoint stage yet",
                 param=key, code="unsupported_parameter"
             )
+    if body.get("parallel_tool_calls") not in (None, True, False):
+        raise OpenAIHTTPError(
+            400, "`parallel_tool_calls` must be a boolean",
+            param="parallel_tool_calls",
+        )
 
 
 def _include_stream_usage(body: dict) -> bool:
@@ -357,6 +350,234 @@ def _include_stream_usage(body: dict) -> bool:
         raise OpenAIHTTPError(400, "`stream_options` must be an object",
                               param="stream_options")
     return bool(opts.get("include_usage"))
+
+
+def _response_format(body: dict) -> dict:
+    fmt = body.get("response_format") or {"type": "text"}
+    if not isinstance(fmt, dict):
+        raise OpenAIHTTPError(400, "`response_format` must be an object",
+                              param="response_format")
+    ftype = fmt.get("type", "text")
+    if ftype not in {"text", "json_object", "json_schema"}:
+        raise OpenAIHTTPError(
+            400,
+            "`response_format.type` must be text, json_object, or json_schema",
+            param="response_format",
+            code="unsupported_parameter",
+        )
+    if ftype == "json_schema":
+        js = fmt.get("json_schema")
+        if not isinstance(js, dict) or not isinstance(js.get("schema"), dict):
+            raise OpenAIHTTPError(
+                400,
+                "`response_format.json_schema.schema` must be an object",
+                param="response_format",
+            )
+    return fmt
+
+
+def _request_tools(body: dict) -> list[dict]:
+    tools = body.get("tools")
+    if tools in (None, []):
+        tools = []
+    if body.get("functions") not in (None, []):
+        if tools:
+            raise OpenAIHTTPError(
+                400, "use either `tools` or legacy `functions`, not both",
+                param="tools",
+            )
+        funcs = body["functions"]
+        if not isinstance(funcs, list):
+            raise OpenAIHTTPError(400, "`functions` must be an array", param="functions")
+        tools = [{"type": "function", "function": f} for f in funcs]
+    if not isinstance(tools, list):
+        raise OpenAIHTTPError(400, "`tools` must be an array", param="tools")
+    normalized = []
+    for i, tool in enumerate(tools):
+        if not isinstance(tool, dict) or tool.get("type", "function") != "function":
+            raise OpenAIHTTPError(400, "only function tools are supported",
+                                  param=f"tools[{i}]")
+        fn = tool.get("function")
+        if not isinstance(fn, dict) or not isinstance(fn.get("name"), str) or not fn["name"]:
+            raise OpenAIHTTPError(400, "function tools require `function.name`",
+                                  param=f"tools[{i}].function.name")
+        normalized.append({"type": "function", "function": dict(fn)})
+    return normalized
+
+
+def _tool_choice(body: dict):
+    tools = _request_tools(body)
+    choice = body.get("tool_choice", body.get("function_call"))
+    if choice is None:
+        return "auto" if tools else "none"
+    if choice in ("none", "auto", "required"):
+        if choice == "required" and not tools:
+            raise OpenAIHTTPError(400, "`tool_choice=required` requires `tools`",
+                                  param="tool_choice")
+        return choice
+    if isinstance(choice, dict):
+        if "function" in choice and isinstance(choice["function"], dict):
+            name = choice["function"].get("name")
+        else:
+            name = choice.get("name")
+        if isinstance(name, str) and name:
+            if not tools:
+                raise OpenAIHTTPError(400, "`tool_choice` requires `tools`",
+                                      param="tool_choice")
+            return {"type": "function", "function": {"name": name}}
+    raise OpenAIHTTPError(400, "unsupported `tool_choice`", param="tool_choice")
+
+
+def _schema_default(schema: dict, fallback_text: str = ""):
+    stype = schema.get("type")
+    if isinstance(stype, list):
+        stype = next((t for t in stype if t != "null"), stype[0] if stype else None)
+    if "enum" in schema and isinstance(schema["enum"], list) and schema["enum"]:
+        return schema["enum"][0]
+    if "const" in schema:
+        return schema["const"]
+    if stype == "object" or "properties" in schema:
+        props = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+        required = schema.get("required") if isinstance(schema.get("required"), list) else []
+        out = {}
+        for key in required:
+            if isinstance(key, str):
+                out[key] = _schema_default(props.get(key, {}), fallback_text)
+        return out
+    if stype == "array":
+        return []
+    if stype in ("number", "integer"):
+        return 0
+    if stype == "boolean":
+        return False
+    return fallback_text
+
+
+def _extract_json_value(text: str):
+    decoder = json.JSONDecoder()
+    for i, ch in enumerate(text):
+        if ch not in "[{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text[i:])
+            return value
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def _coerce_json_text(text: str, response_format: dict) -> str:
+    ftype = response_format.get("type", "text")
+    if ftype == "text":
+        return text
+    value = _extract_json_value(text)
+    if ftype == "json_object":
+        if not isinstance(value, (dict, list)):
+            value = {"response": text}
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+    schema = response_format["json_schema"]["schema"]
+    if not isinstance(value, dict):
+        value = {}
+    props = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    required = schema.get("required") if isinstance(schema.get("required"), list) else []
+    out = dict(value)
+    for key in required:
+        if isinstance(key, str) and key not in out:
+            out[key] = _schema_default(props.get(key, {}), text)
+    if schema.get("additionalProperties") is False and props:
+        out = {k: v for k, v in out.items() if k in props}
+    if not out and props:
+        for key, subschema in props.items():
+            out[key] = _schema_default(subschema, text)
+    return json.dumps(out, ensure_ascii=False, separators=(",", ":"))
+
+
+def _tool_arg_defaults(tool: dict) -> dict:
+    params = tool.get("function", {}).get("parameters")
+    return _schema_default(params, "") if isinstance(params, dict) else {}
+
+
+def _parse_tool_calls(text: str, tools: list[dict]) -> list[dict]:
+    if not tools:
+        return []
+    value = _extract_json_value(text)
+    raw_calls = []
+    if isinstance(value, dict):
+        if isinstance(value.get("tool_calls"), list):
+            raw_calls = value["tool_calls"]
+        elif isinstance(value.get("tool_call"), dict):
+            raw_calls = [value["tool_call"]]
+        elif isinstance(value.get("name"), str) or isinstance(value.get("function"), dict):
+            raw_calls = [value]
+    names = {t["function"]["name"] for t in tools}
+    calls = []
+    for call in raw_calls:
+        if not isinstance(call, dict):
+            continue
+        fn = call.get("function") if isinstance(call.get("function"), dict) else call
+        name = fn.get("name")
+        if name not in names:
+            continue
+        args = fn.get("arguments", call.get("arguments", {}))
+        if isinstance(args, str):
+            arguments = args
+        else:
+            arguments = json.dumps(args if isinstance(args, dict) else {},
+                                   ensure_ascii=False, separators=(",", ":"))
+        calls.append({
+            "id": call.get("id") or _make_id("call"),
+            "type": "function",
+            "function": {"name": name, "arguments": arguments},
+        })
+    return calls
+
+
+def _forced_tool_call(tools: list[dict], choice) -> dict | None:
+    if not tools or choice == "none":
+        return None
+    selected = None
+    if choice == "required":
+        selected = tools[0]
+    elif isinstance(choice, dict):
+        name = choice.get("function", {}).get("name")
+        selected = next((t for t in tools if t["function"]["name"] == name), None)
+        if selected is None:
+            raise OpenAIHTTPError(400, f"tool {name!r} is not defined", param="tool_choice")
+    if selected is None:
+        return None
+    return {
+        "id": _make_id("call"),
+        "type": "function",
+        "function": {
+            "name": selected["function"]["name"],
+            "arguments": json.dumps(_tool_arg_defaults(selected),
+                                    ensure_ascii=False, separators=(",", ":")),
+        },
+    }
+
+
+def _finish_chat_result(result: GenerationResult, backend: OpenAIBackend, body: dict) -> dict:
+    response_format = _response_format(body)
+    tools = _request_tools(body)
+    choice = _tool_choice(body)
+    tool_calls = [] if choice == "none" else _parse_tool_calls(result.text, tools)
+    forced = _forced_tool_call(tools, choice)
+    if forced is not None and not tool_calls:
+        tool_calls = [forced]
+    if tool_calls:
+        return {
+            "content": None,
+            "tool_calls": tool_calls,
+            "finish_reason": "tool_calls",
+            "token_ids": result.token_ids,
+        }
+    return {
+        "content": _coerce_json_text(result.text, response_format),
+        "tool_calls": None,
+        "finish_reason": result.finish_reason,
+        "token_ids": result.token_ids,
+    }
 
 
 def _float_param(body: dict, key: str, default: float) -> float:
@@ -599,7 +820,7 @@ def _format_embedding(vector: list[float], encoding_format: str):
     )
 
 
-def _usage(backend: OpenAIBackend, prompt: str, result: GenerationResult) -> dict:
+def _usage(backend: OpenAIBackend, prompt: Prompt, result: GenerationResult) -> dict:
     completion_tokens = (
         len(result.token_ids) if result.token_ids is not None else backend.count_tokens(result.text)
     )
@@ -742,6 +963,10 @@ def create_app(
         if not stream:
             result = backend.generate(prompt, max_tokens, session_id, options=options)
             result = _apply_stops(result, backend, stop_strings, stop_token_ids)
+            finished = _finish_chat_result(result, backend, body)
+            message = {"role": "assistant", "content": finished["content"]}
+            if finished["tool_calls"]:
+                message["tool_calls"] = finished["tool_calls"]
             return JSONResponse({
                 "id": rid,
                 "object": "chat.completion",
@@ -749,11 +974,91 @@ def create_app(
                 "model": model,
                 "choices": [{
                     "index": 0,
-                    "message": {"role": "assistant", "content": result.text},
-                    "finish_reason": result.finish_reason,
+                    "message": message,
+                    "finish_reason": finished["finish_reason"],
                 }],
                 "usage": _usage(backend, prompt, result),
             })
+
+        response_format = _response_format(body)
+        tools = _request_tools(body)
+        if tools or response_format.get("type", "text") != "text":
+            def structured_events():
+                result = backend.generate(prompt, max_tokens, session_id, options=options)
+                result = _apply_stops(result, backend, stop_strings, stop_token_ids)
+                finished = _finish_chat_result(result, backend, body)
+                first = {
+                    "id": rid,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {"role": "assistant"},
+                                 "finish_reason": None}],
+                }
+                if include_usage:
+                    first["usage"] = None
+                yield _json_sse(first)
+                if finished["tool_calls"]:
+                    for i, call in enumerate(finished["tool_calls"]):
+                        chunk = {
+                            "id": rid,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"tool_calls": [{**call, "index": i}]},
+                                "finish_reason": None,
+                            }],
+                        }
+                        if include_usage:
+                            chunk["usage"] = None
+                        yield _json_sse(chunk)
+                else:
+                    chunk = {
+                        "id": rid,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": finished["content"] or ""},
+                            "finish_reason": None,
+                        }],
+                    }
+                    if include_usage:
+                        chunk["usage"] = None
+                    yield _json_sse(chunk)
+                final = {
+                    "id": rid,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": finished["finish_reason"],
+                    }],
+                }
+                if include_usage:
+                    final["usage"] = None
+                yield _json_sse(final)
+                if include_usage:
+                    yield _json_sse({
+                        "id": rid,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [],
+                        "usage": _usage(backend, prompt, result),
+                    })
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(
+                structured_events(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
 
         def events():
             full_text = ""
@@ -1029,25 +1334,14 @@ def create_app(
         else:
             raise OpenAIHTTPError(400, "`input` must be a string or message array",
                                   param="input")
-        if body.get("tools") not in (None, []):
+        tools = _request_tools(body)
+        _tool_choice(body)
+        if body.get("parallel_tool_calls") not in (None, True, False):
             raise OpenAIHTTPError(
-                400, "`tools` is not supported by this endpoint stage yet",
-                param="tools", code="unsupported_parameter"
+                400, "`parallel_tool_calls` must be a boolean",
+                param="parallel_tool_calls",
             )
-        if body.get("parallel_tool_calls") not in (None, False):
-            raise OpenAIHTTPError(
-                400, "`parallel_tool_calls` is not supported by this endpoint stage yet",
-                param="parallel_tool_calls", code="unsupported_parameter"
-            )
-        response_format = body.get("response_format")
-        if response_format not in (None, {}):
-            if not isinstance(response_format, dict) or response_format.get("type", "text") != "text":
-                raise OpenAIHTTPError(
-                    400,
-                    "only text response_format is supported by this endpoint stage",
-                    param="response_format",
-                    code="unsupported_parameter",
-                )
+        response_format = _response_format(body)
         try:
             max_tokens = int(body.get("max_output_tokens", body.get("max_tokens",
                                                                    backend.default_max_tokens)))
@@ -1065,20 +1359,37 @@ def create_app(
         result = backend.generate(prompt, max_tokens, _make_id("openai-resp"),
                                   options=options)
         result = _apply_stops(result, backend, stop_strings, stop_token_ids)
+        finished = _finish_chat_result(result, backend, body)
         usage = _usage(backend, prompt, result)
+        if finished["tool_calls"]:
+            output = [
+                {
+                    "type": "function_call",
+                    "id": call["id"],
+                    "call_id": call["id"],
+                    "name": call["function"]["name"],
+                    "arguments": call["function"]["arguments"],
+                    "status": "completed",
+                }
+                for call in finished["tool_calls"]
+            ]
+            output_text = ""
+        else:
+            output_text = finished["content"] or ""
+            output = [{
+                "id": _make_id("msg"),
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": output_text}],
+            }]
         return JSONResponse({
             "id": rid,
             "object": "response",
             "created_at": _now(),
             "model": model,
             "status": "completed",
-            "output": [{
-                "id": _make_id("msg"),
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": result.text}],
-            }],
-            "output_text": result.text,
+            "output": output,
+            "output_text": output_text,
             "usage": {
                 "input_tokens": usage["prompt_tokens"],
                 "output_tokens": usage["completion_tokens"],
