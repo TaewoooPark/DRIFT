@@ -1,4 +1,6 @@
 import json
+import base64
+import struct
 
 from starlette.testclient import TestClient
 
@@ -15,6 +17,7 @@ class FakeBackend:
         self.sessions = []
         self.options = []
         self.supports_sampling = True
+        self.supports_embeddings = True
 
     def generate(self, prompt, max_tokens: int, session_id: str,
                  options: dict | None = None) -> GenerationResult:
@@ -47,6 +50,11 @@ class FakeBackend:
             text = str(prompt)
         return [len(part) for part in text.split()]
 
+    def embed(self, prompt, session_id: str) -> list[float]:
+        self.prompts.append(prompt)
+        self.sessions.append(session_id)
+        return [0.25, 0.5, 0.75]
+
 
 def client():
     backend = FakeBackend()
@@ -70,6 +78,11 @@ def test_models_endpoint():
     body = res.json()
     assert body["object"] == "list"
     assert body["data"][0]["id"] == "drift-test"
+    assert body["data"][0]["capabilities"] == {
+        "chat": True,
+        "completion": True,
+        "embedding": True,
+    }
 
 
 def test_chat_completion_non_streaming():
@@ -336,3 +349,49 @@ def test_tokenize_and_detokenize_helpers():
     assert tok.json() == {"tokens": [3, 5], "count": 2}
     assert detok.status_code == 200
     assert detok.json() == {"content": "tok3 tok5"}
+
+
+def test_embeddings_float_response():
+    backend, c = client()
+    res = c.post("/v1/embeddings", json={
+        "model": "drift-test",
+        "input": ["alpha beta", [1, 2]],
+    })
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["object"] == "list"
+    assert body["data"][0] == {
+        "object": "embedding",
+        "index": 0,
+        "embedding": [0.25, 0.5, 0.75],
+    }
+    assert body["data"][1]["embedding"] == [0.25, 0.5, 0.75]
+    assert body["usage"]["prompt_tokens"] > 0
+    assert backend.prompts == ["alpha beta", "tok1 tok2"]
+
+
+def test_embeddings_base64_response():
+    _, c = client()
+    res = c.post("/v1/embeddings", json={
+        "model": "drift-test",
+        "input": "alpha",
+        "encoding_format": "base64",
+    })
+
+    assert res.status_code == 200
+    encoded = res.json()["data"][0]["embedding"]
+    assert base64.b64decode(encoded) == struct.pack("<3f", 0.25, 0.5, 0.75)
+
+
+def test_embeddings_unsupported_mode_error():
+    backend = FakeBackend()
+    backend.supports_embeddings = False
+    c = TestClient(create_app(backend))
+    res = c.post("/v1/embeddings", json={
+        "model": "drift-test",
+        "input": "alpha",
+    })
+
+    assert res.status_code == 400
+    assert res.json()["error"]["code"] == "unsupported_embeddings"

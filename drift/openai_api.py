@@ -9,7 +9,9 @@ TCP+msgpack protocol.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
+import struct
 import threading
 import time
 import uuid
@@ -31,6 +33,7 @@ class OpenAIBackend(Protocol):
     model_id: str
     default_max_tokens: int
     context_length: int | None
+    supports_embeddings: bool
 
     def generate(self, prompt: Prompt, max_tokens: int, session_id: str,
                  options: dict | None = None) -> GenerationResult:
@@ -49,6 +52,9 @@ class OpenAIBackend(Protocol):
     def encode_tokens(self, prompt: Prompt) -> list[int]:
         ...
 
+    def embed(self, prompt: Prompt, session_id: str) -> list[float]:
+        ...
+
 
 class DriftBackend:
     """Long-lived bridge from HTTP requests to one DRIFT orchestrator.
@@ -64,6 +70,7 @@ class DriftBackend:
         self.model_id = model_id
         self.default_max_tokens = default_max_tokens
         self.supports_sampling = not getattr(orchestrator, "thin", False)
+        self.supports_embeddings = not getattr(orchestrator, "thin", False)
         self.context_length = self._context_length()
         self._lock = threading.Lock()
 
@@ -125,6 +132,34 @@ class DriftBackend:
             return [int(x) for x in ids[0].tolist()]
         except Exception:
             return [int(x) for x in ids]
+
+    def embed(self, prompt: Prompt, session_id: str) -> list[float]:
+        if not self.supports_embeddings:
+            raise ValueError("embeddings are not available in thin-head mode")
+        from .common import build_input_ids
+
+        import torch
+
+        with self._lock, torch.no_grad():
+            try:
+                input_ids = build_input_ids(self.orchestrator.head.tokenizer, prompt).to(
+                    self.orchestrator.device
+                )
+                prompt_ids = input_ids[0].tolist()
+                hidden = self.orchestrator.head.embed(input_ids)
+                hidden = self.orchestrator.transport.route(
+                    self.orchestrator.order, session_id, hidden,
+                    list(range(len(prompt_ids))), prompt_ids, "prefill"
+                ).to(self.orchestrator.device)
+                pooled = self.orchestrator.head.norm(hidden)[:, -1, :][0]
+                vector = pooled.detach().float().cpu().tolist()
+            finally:
+                for name in self.orchestrator.order:
+                    try:
+                        self.orchestrator.transport.reset(name, session_id)
+                    except Exception:
+                        pass
+            return [float(x) for x in vector]
 
 
 class OpenAIHTTPError(Exception):
@@ -517,6 +552,47 @@ def normalize_completion_prompts(body: dict, backend: OpenAIBackend) -> list[str
     raise OpenAIHTTPError(400, "`prompt` must be a string or array", param="prompt")
 
 
+def normalize_embedding_inputs(body: dict, backend: OpenAIBackend) -> list[Prompt]:
+    if "input" not in body:
+        raise OpenAIHTTPError(400, "`input` is required", param="input")
+    raw = body.get("input")
+    if isinstance(raw, str):
+        return [raw]
+    if isinstance(raw, list):
+        if not raw:
+            raise OpenAIHTTPError(400, "`input` array must not be empty", param="input")
+        if all(isinstance(x, str) for x in raw):
+            return list(raw)
+        if all(isinstance(x, int) for x in raw):
+            return [backend.decode_tokens([int(x) for x in raw])]
+        out: list[Prompt] = []
+        for i, item in enumerate(raw):
+            if isinstance(item, str):
+                out.append(item)
+            elif isinstance(item, list) and all(isinstance(x, int) for x in item):
+                out.append(backend.decode_tokens([int(x) for x in item]))
+            else:
+                raise OpenAIHTTPError(
+                    400,
+                    "input array entries must be strings or token id arrays",
+                    param=f"input[{i}]",
+                )
+        return out
+    raise OpenAIHTTPError(400, "`input` must be a string or array", param="input")
+
+
+def _format_embedding(vector: list[float], encoding_format: str):
+    if encoding_format == "float":
+        return vector
+    if encoding_format == "base64":
+        packed = struct.pack(f"<{len(vector)}f", *vector)
+        return base64.b64encode(packed).decode("ascii")
+    raise OpenAIHTTPError(
+        400, "`encoding_format` must be `float` or `base64`",
+        param="encoding_format",
+    )
+
+
 def _usage(backend: OpenAIBackend, prompt: str, result: GenerationResult) -> dict:
     completion_tokens = (
         len(result.token_ids) if result.token_ids is not None else backend.count_tokens(result.text)
@@ -568,6 +644,11 @@ def create_app(backend: OpenAIBackend):
                 "object": "model",
                 "created": 0,
                 "owned_by": "drift",
+                "capabilities": {
+                    "chat": True,
+                    "completion": True,
+                    "embedding": bool(getattr(backend, "supports_embeddings", False)),
+                },
             }],
         })
 
@@ -824,6 +905,45 @@ def create_app(backend: OpenAIBackend):
             },
         })
 
+    async def embeddings(request: Request):
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            raise OpenAIHTTPError(400, "request body must be valid JSON")
+        if not isinstance(body, dict):
+            raise OpenAIHTTPError(400, "request body must be a JSON object")
+        model = _validate_model(body, backend)
+        if not getattr(backend, "supports_embeddings", False):
+            raise OpenAIHTTPError(
+                400,
+                "this DRIFT mode cannot produce embeddings because the head does not hold hidden states",
+                code="unsupported_embeddings",
+            )
+        encoding_format = body.get("encoding_format", "float")
+        if body.get("dimensions") is not None:
+            raise OpenAIHTTPError(
+                400, "`dimensions` is not supported by this embedding endpoint yet",
+                param="dimensions", code="unsupported_parameter"
+            )
+        inputs = normalize_embedding_inputs(body, backend)
+        data = []
+        total_tokens = 0
+        for i, prompt in enumerate(inputs):
+            _check_context(backend, prompt, 0)
+            total_tokens += backend.count_tokens(prompt)
+            vector = backend.embed(prompt, f"{_make_id('openai-emb')}-{i}")
+            data.append({
+                "object": "embedding",
+                "index": i,
+                "embedding": _format_embedding(vector, encoding_format),
+            })
+        return JSONResponse({
+            "object": "list",
+            "model": model,
+            "data": data,
+            "usage": {"prompt_tokens": total_tokens, "total_tokens": total_tokens},
+        })
+
     async def tokenize(request: Request):
         try:
             body = await request.json()
@@ -861,6 +981,7 @@ def create_app(backend: OpenAIBackend):
         Route("/v1/models", models, methods=["GET"]),
         Route("/v1/chat/completions", chat_completions, methods=["POST"]),
         Route("/v1/completions", completions, methods=["POST"]),
+        Route("/v1/embeddings", embeddings, methods=["POST"]),
         Route("/tokenize", tokenize, methods=["POST"]),
         Route("/detokenize", detokenize, methods=["POST"]),
         Route("/v1/tokenize", tokenize, methods=["POST"]),
