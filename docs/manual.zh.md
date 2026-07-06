@@ -3,7 +3,8 @@
 **如何真正把 DRIFT 跑起来——从头到尾。** 语言：[English](manual.md) ·
 [한국어](manual.ko.md) · **中文** · [日本語](manual.ja.md)
 
-前半部分就是全部要点：安装、试跑、让一个模型跨你的机器运行。
+前半部分就是全部要点：安装、试跑、让一个模型跨你的机器运行，然后把它暴露为
+OpenAI 兼容的本地 endpoint。
 后半部分——**定制与微调**——只在默认设置不够用时才需要。
 关于基准测试方法论与数字，参见 [`benchmarks.md`](benchmarks.md)。
 
@@ -15,18 +16,19 @@
 1. [安装](#1--安装)
 2. [在一台机器上运行](#2--在一台机器上运行)
 3. [跨你的机器运行——一个实操示例](#3--跨你的机器运行一个实操示例)
+4. [通过 OpenAI 兼容 API 提供服务](#4--通过-openai-兼容-api-提供服务)
 
 **定制与微调**
-4. [`config.yaml` 参考](#4--configyaml-参考)
-5. [选择切分点](#5--选择切分点)
-6. [模型](#6--模型)
-7. [设备与 dtype](#7--设备与-dtype)
-8. [生成机制](#8--生成机制)
-9. [手动驱动各分片](#9--手动驱动各分片)
-10. [CLI 参考](#10--cli-参考)
-11. [线缆与会话](#11--线缆与会话)
-12. [内存](#12--内存)
-13. [故障排查](#13--故障排查)
+5. [`config.yaml` 参考](#5--configyaml-参考)
+6. [选择切分点](#6--选择切分点)
+7. [模型](#7--模型)
+8. [设备与 dtype](#8--设备与-dtype)
+9. [生成机制](#9--生成机制)
+10. [手动驱动各分片](#10--手动驱动各分片)
+11. [CLI 参考](#11--cli-参考)
+12. [线缆与会话](#12--线缆与会话)
+13. [内存](#13--内存)
+14. [故障排查](#14--故障排查)
 
 ---
 
@@ -118,23 +120,123 @@ drift run --nodes 192.168.0.22:52601,127.0.0.1:52600 --prompt "hello world"
 
 ---
 
+## 4 · 通过 OpenAI 兼容 API 提供服务
+
+当你的客户端已经会连接 OpenAI 风格的本地后端时——例如 OpenAI Python/JS SDK、`curl`、
+LangChain、LiteLLM、LlamaIndex、编辑器插件或自写 HTTP 客户端——使用 `drift serve`。
+模型仍然通过 DRIFT 的节点间协议运行；只有面向客户端的一层变成 HTTP/SSE。
+
+**1）先启动 worker 节点。** `drift serve` 不会自己 spawn worker。你可以依赖 LAN 发现，
+也可以固定端口并显式传入：
+
+```bash
+# terminal 1
+drift node --port 52600
+
+# terminal 2
+drift node --port 52601
+```
+
+**2）启动 OpenAI 兼容服务器。** 默认只绑定本机 `127.0.0.1:8000`；只有当其他机器也需要
+通过 HTTP 调用时才使用 `--host 0.0.0.0`。
+
+```bash
+export DRIFT_API_KEY=local-dev
+drift serve \
+  --nodes 127.0.0.1:52600,127.0.0.1:52601 \
+  --port 8000
+```
+
+客户端 base URL 是 `http://127.0.0.1:8000/v1`。如果把 HTTP server 暴露到本机之外，
+请保持 `--api-key` / `DRIFT_API_KEY` 开启。
+
+**3）用 `curl` 调用。**
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Authorization: Bearer local-dev" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen2.5-1.5B-Instruct",
+    "messages": [{"role": "user", "content": "Say hello in five words."}],
+    "max_tokens": 32,
+    "temperature": 0
+  }'
+```
+
+**4）也可以直接使用 OpenAI Python SDK。**
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:8000/v1",
+    api_key="local-dev",
+)
+
+reply = client.chat.completions.create(
+    model="Qwen/Qwen2.5-1.5B-Instruct",
+    messages=[{"role": "user", "content": "Explain DRIFT in one sentence."}],
+)
+print(reply.choices[0].message.content)
+```
+
+**支持的接口。** 主要 route 包括 `GET /v1/models`、`POST /v1/chat/completions`、
+`POST /v1/completions`、`POST /v1/responses`、在可暴露 hidden state 的模式下的
+`POST /v1/embeddings`、`POST /v1/chat/completions/input_tokens`、`/tokenize`、
+`/detokenize`、`/health`、`/ready` 和 `/metrics`。Chat/Completions streaming 使用以
+`[DONE]` 结束的 SSE；Responses streaming 会发送 `response.created`、
+`response.output_text.delta`、`response.completed` 等 semantic events。
+
+**兼容性范围。** Adapter 接受常见 OpenAI/vLLM 风格的文本生成参数，例如 `n`、
+`temperature`、`top_p`、`top_k`、`min_p`、penalties、`seed`、`stop`、logprobs、
+tool-call shape 与 JSON response format。DRIFT 不会替你执行 tools，也不保证严格的
+schema-constrained decoding；multimodal/audio 请求以及 thin-head sampling/embedding 会返回
+明确的 OpenAI 形状错误。完整矩阵见 [`openai-compatibility.md`](openai-compatibility.md)，
+审计记录见 [`openai-compatibility-audit.md`](openai-compatibility-audit.md)。
+
+**常用 `serve` flags。**
+
+| Flag | 含义 |
+|---|---|
+| `--nodes host:port,...` | 使用已经运行中的 `drift node` worker。 |
+| `--no-discover` / `--discover-timeout` | 控制省略 `--nodes` 时的 LAN discovery。 |
+| `--model` | 覆盖 `config.yaml` 中的 `model_id`。 |
+| `--served-model-name` | 改变 `/v1/models` 暴露的模型名；客户端也必须发送这个名字。 |
+| `--max-new-tokens` | 请求没有 token limit 时的默认输出预算。 |
+| `--chain`, `--thin`, `--int8`, `--expand` | 使用与 `drift run` 相同的 DRIFT routing modes。 |
+| `--api-key` / `DRIFT_API_KEY` | 要求 `Authorization: Bearer ...` 或 `x-api-key`。 |
+| `--cors-origin` / `DRIFT_CORS_ORIGINS` | 允许指定 browser origins。 |
+| `--max-concurrent-requests` | HTTP 请求并发上限；单个 backend 的生成仍然是串行的。 |
+
+**Smoke-test 一个运行中的 server。**
+
+```bash
+python scripts/openai_compat_smoke.py \
+  --base-url http://127.0.0.1:8000/v1 \
+  --model Qwen/Qwen2.5-1.5B-Instruct \
+  --api-key local-dev
+```
+
+---
+
 **定制与微调**——下面的一切都是可选的，只在上面那套单命令流程不够用时才需要（换一个
 模型、不均匀的切分、精确的端口、手动驱动各个部件）。
 
 ---
 
-## 4 · `config.yaml` 参考
+## 5 · `config.yaml` 参考
 
 `config.yaml` 是模型、精度以及（对手动流程而言）分片表的唯一事实来源。`drift up` /
-`drift run` 从中读取 `model_id`、`dtype` 和 `generation`；切分则由它们自己计算。
+`drift run` / `drift serve` 从中读取 `model_id`、`dtype` 和 `generation`；切分则由它们自己计算。
 
 ```yaml
 model_id: "Qwen/Qwen2.5-1.5B-Instruct"   # any HF causal-LM id
-dtype: "float16"                          # float16 | float32  (see §7)
+dtype: "float16"                          # float16 | float32  (see §8)
 device: "mps"                             # default device: mps | cuda | cpu
 port: 52600                               # default port for a shard that sets none
 
-shards:                                   # only used by the by-hand flow (§9) / `drift run` fallback
+shards:                                   # only used by the by-hand flow (§10) / `drift run` fallback
   - { name: "mac",     host: "127.0.0.1", port: 52600, start_layer: 0,  end_layer: 14, device: "mps" }
   - { name: "windows", host: "127.0.0.1", port: 52601, start_layer: 14, end_layer: 28, device: "mps" }
 
@@ -146,10 +248,10 @@ generation:
 | 键 | 含义 |
 |---|---|
 | `model_id` | Hugging Face 模型 id。会下载一次到本地 HF 缓存。 |
-| `dtype` | 计算**以及**线缆 dtype。`float16`（默认，CPU 往返无损）或 `float32`。`bfloat16` 在线缆上**无效**——见 §7。 |
+| `dtype` | 计算**以及**线缆 dtype。`float16`（默认，CPU 往返无损）或 `float32`。`bfloat16` 在线缆上**无效**——见 §8。 |
 | `device` | head 以及未指定自身设备的分片所用的默认设备。`mps` / `cuda` / `cpu`。 |
 | `port` | 某个分片既无 `port` 又无 `DRIFT_PORT` 时的兜底端口。 |
-| `shards[]` | 供手动流程（§9）以及发现服务一无所获时 `drift run` 兜底所用的有序分片表。 |
+| `shards[]` | 供手动流程（§10）以及发现服务一无所获时 `drift run` 兜底所用的有序分片表。 |
 | `shards[].host` / `port` | 编排器拨号到该分片的地址。本地用 `127.0.0.1`；远程用局域网 IP。 |
 | `shards[].start_layer` / `end_layer` | 半开的解码器层范围 `[start, end)`。 |
 | `shards[].device` | 该分片的设备。 |
@@ -158,9 +260,9 @@ generation:
 
 ---
 
-## 5 · 选择切分点
+## 6 · 选择切分点
 
-`drift run` 会按节点数量均匀切分；只有在手动流程（§9）或不均匀切分时你才需要考虑这个。
+`drift run` 和 `drift serve` 会按节点数量均匀切分；只有在手动流程（§10）或不均匀切分时你才需要考虑这个。
 各范围必须**平铺（tile）**解码器层：连续、有序、无空隙、无重叠，且覆盖
 `[0, num_hidden_layers)`。head 持有 `embed_tokens`、最终 norm 和 `lm_head`——它们绝不
 属于任何分片范围。
@@ -179,7 +281,7 @@ Qwen2.5-1.5B = 28，Gemma-4-E2B = 35。
 
 ---
 
-## 6 · 模型
+## 7 · 模型
 
 引擎会**自省（introspect）**所加载的模型（解码器层类、`rotary_emb`、缓存类型、逐层
 注意力），而不是硬编码某种架构——因此新的模型家族只需给出 id 即可接入。在
@@ -194,7 +296,7 @@ Qwen2.5-1.5B = 28，Gemma-4-E2B = 35。
 
 ---
 
-## 7 · 设备与 dtype
+## 8 · 设备与 dtype
 
 **设备**——`mps`（Apple GPU）、`cuda`（NVIDIA GPU）、`cpu`（可移植，慢）。每个节点的
 设备相互独立；这种独立性正是全部意义所在。`drift node` 会自动检测它；用 `--device`
@@ -210,10 +312,10 @@ Qwen2.5-1.5B = 28，Gemma-4-E2B = 35。
 
 ---
 
-## 8 · 生成机制
+## 9 · 生成机制
 
 - **贪心。** 参考 oracle 和编排器每一步都取 `argmax`；CLI 里还没有 temperature/top-p
-  采样。一致性测试强制使用贪心以保证确定性。
+  采样。OpenAI 兼容 HTTP API 在 non-thin mode 下支持常见 sampling controls。一致性测试强制使用贪心以保证确定性。
 - **EOS。** `drift run` / `drift up` 会在模型的序列结束（end-of-sequence）id 处停止
   （一个很窄的集合，而非每一个特殊 token）。一致性 / 参考路径运行固定的
   `max_new_tokens` 而不提前停止。
@@ -222,7 +324,7 @@ Qwen2.5-1.5B = 28，Gemma-4-E2B = 35。
 
 ---
 
-## 9 · 手动驱动各分片
+## 10 · 手动驱动各分片
 
 `drift node` / `drift run` 这套流程是省心的路径。更底层的命令给你精确的控制
 （固定的端口/范围、无发现服务），也正是一致性门禁和基准测试所使用的。
@@ -257,7 +359,7 @@ embed/norm/head），所以把它放在哪台机器上方便就放哪台。
 
 ---
 
-## 10 · CLI 参考
+## 11 · CLI 参考
 
 每个命令都接受 `--config`（默认 `config.yaml`）。
 
@@ -269,9 +371,12 @@ embed/norm/head），所以把它放在哪台机器上方便就放哪台。
 | `drift up N` | localhost：启动 N 个节点、自动切分、聊天（或 `--prompt` 做一次性生成） |
 | `drift node` | 把**本**机作为 worker 运行：自动 device、`--port`、局域网宣告、等待 head |
 | `drift run` | head：发现节点（或 `--nodes host:port,…`）、自动切分、配置、流式/聊天 |
+| `drift serve` | 在 DRIFT 编排器之上提供 OpenAI 兼容 HTTP/SSE API（`/v1/chat/completions`、`/v1/completions`、`/v1/responses`、`/v1/embeddings`） |
 
 `up`、`node`、`run` 都接受 `--max-new-tokens`；`run` 还接受 `--model`、`--nodes`、
-`--no-discover`。在 `run`/`up` 上省略 `--prompt` 即可进入交互式聊天。
+`--no-discover`。`serve` 接受 `--api-key`、`--cors-origin`、`--served-model-name`、
+`--host`、`--port`、`--max-concurrent-requests`，以及与 `run` 相同的节点/模型 routing flags。
+在 `run`/`up` 上省略 `--prompt` 即可进入交互式聊天。
 
 ### 更底层的模块
 
@@ -285,7 +390,7 @@ embed/norm/head），所以把它放在哪台机器上方便就放哪台。
 
 ---
 
-## 11 · 线缆与会话
+## 12 · 线缆与会话
 
 - **契约（`drift/protocol.py`，冻结不变）：** 每条消息都是一个 4 字节大端长度
   前缀 + 一个 msgpack dict。任何实现了这套帧格式的运行时都可以成为节点——线缆上
@@ -294,14 +399,14 @@ embed/norm/head），所以把它放在哪台机器上方便就放哪台。
   永远不跨越**——每个节点保留自己的。每 token 的流量是 `hidden_size × 2` 字节外加
   几个整数（几 KB），与参数量无关。
 - **可替换的节点。** 一个 `drift node` 启动时是未分配的；head 发来一个 `configure`
-  （模型 + 层范围），所以你永远无需手写范围。预分配的服务器（§9）会跳过这一步。
+  （模型 + 层范围），所以你永远无需手写范围。预分配的服务器（§10）会跳过这一步。
 - **会话。** 一次生成就是一个 `session_id`；每个节点持有一份按会话的 KV 缓存，一次
   生成结束时 head 会发送 `reset`。一个节点**一次只处理一个连接**——不要把两个 head
   指向同一个节点。
 
 ---
 
-## 12 · 内存
+## 13 · 内存
 
 按今天的实现，请为**每个节点上完整的模型驻留 RAM/VRAM** 做好准备：每个节点都会加载
 整个 checkpoint，然后只使用它自己的那段层切片，而 head 也会加载模型（用于
@@ -312,7 +417,7 @@ embed/norm/head）。每个节点的*活跃*参数量更小（在默认的 2 路
 
 ---
 
-## 13 · 故障排查
+## 14 · 故障排查
 
 | 症状 | 可能原因 → 修复 |
 |---|---|
@@ -320,10 +425,14 @@ embed/norm/head）。每个节点的*活跃*参数量更小（在默认的 2 路
 | `ConnectionRefusedError` | 节点未启动，或 host/port 有误。先启动节点；检查端口；`drift doctor --nodes host:port`。 |
 | 本地能跑，跨机器不行 | 某个节点绑定到了 `127.0.0.1`。`drift node` 默认绑定 `0.0.0.0`；手动服务器请传 `--host 0.0.0.0`。打开防火墙端口。 |
 | Windows：对等方够不着它 | 允许 `python.exe` 通过 Defender 防火墙（Private），启用网络发现（Network Discovery）。 |
-| 输出仅在**靠后**的 token 上漂移（MPS↔CUDA） | 预期之内的厂商 fp16 舍入（§3、§7）。不是 bug。 |
+| 输出仅在**靠后**的 token 上漂移（MPS↔CUDA） | 预期之内的厂商 fp16 舍入（§3、§8）。不是 bug。 |
 | 一致性在 **token 1–2 处 FAIL** | 这是真正的 bug（mask/KV/RoPE），不是浮点噪声。 |
-| 加载时内存溢出 | 每个进程都会加载完整 checkpoint（§12）。用更小的模型、更多节点，或给基准测试加 `--no-socket`。 |
-| `unsupported wire dtype` | `dtype` 必须是 `float16` 或 `float32`（§7）。 |
+| 加载时内存溢出 | 每个进程都会加载完整 checkpoint（§13）。用更小的模型、更多节点，或给基准测试加 `--no-socket`。 |
+| `unsupported wire dtype` | `dtype` 必须是 `float16` 或 `float32`（§8）。 |
+| `drift serve` 找到 0 个节点 | 先启动 `drift node`，传入 `--nodes host:port,...`，或调大 `--discover-timeout`。 |
+| OpenAI client 收到 `401` | server 使用了 `--api-key` / `DRIFT_API_KEY`；发送 `Authorization: Bearer <key>` 或 `x-api-key: <key>`。 |
+| OpenAI client 收到 `model ... is not served` | 使用 `GET /v1/models` 返回的 id，或设置 `--served-model-name` 并发送完全相同的名字。 |
+| `--thin` mode 下 `/v1/embeddings` 或 sampling 失败 | thin mode 不把 logits/hidden states 放在 head 上；embeddings 和 sampling 请使用 non-thin mode。 |
 | Mac 上出现罕见的 MPS op 报错 | 确保在启动进程的那个 shell 中设置了 `export PYTORCH_ENABLE_MPS_FALLBACK=1`。 |
 
 ---

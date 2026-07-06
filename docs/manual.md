@@ -3,7 +3,8 @@
 **How to run DRIFT for real — start to finish.** Language: **English** ·
 [한국어](manual.ko.md) · [中文](manual.zh.md) · [日本語](manual.ja.md)
 
-The first half is the whole job: install, try it, run one model across your machines.
+The first half is the whole job: install, try it, run one model across your machines,
+then expose it through an OpenAI-compatible local endpoint.
 The second half — **Customize & fine-tune** — is only for when the defaults aren't enough.
 For benchmark methodology and numbers, see [`benchmarks.md`](benchmarks.md).
 
@@ -15,19 +16,20 @@ For benchmark methodology and numbers, see [`benchmarks.md`](benchmarks.md).
 1. [Install](#1--install)
 2. [Run it on one machine](#2--run-it-on-one-machine)
 3. [Run it across your machines — a worked example](#3--run-it-across-your-machines--a-worked-example)
+4. [Serve through an OpenAI-compatible API](#4--serve-through-an-openai-compatible-api)
 
 **Customize & fine-tune**
-4. [`config.yaml` reference](#4--configyaml-reference)
-5. [Choosing a split point](#5--choosing-a-split-point)
-6. [Models](#6--models)
-7. [Devices & dtype](#7--devices--dtype)
-8. [How generation works](#8--how-generation-works)
-9. [Driving the shards by hand](#9--driving-the-shards-by-hand)
-10. [CLI reference](#10--cli-reference)
-11. [The wire & sessions](#11--the-wire--sessions)
-12. [Memory](#12--memory)
-13. [Troubleshooting](#13--troubleshooting)
-14. [Decentralization — chain, encryption, failover, gossip, ledger, int8](#14--decentralization-v10)
+5. [`config.yaml` reference](#5--configyaml-reference)
+6. [Choosing a split point](#6--choosing-a-split-point)
+7. [Models](#7--models)
+8. [Devices & dtype](#8--devices--dtype)
+9. [How generation works](#9--how-generation-works)
+10. [Driving the shards by hand](#10--driving-the-shards-by-hand)
+11. [CLI reference](#11--cli-reference)
+12. [The wire & sessions](#12--the-wire--sessions)
+13. [Memory](#13--memory)
+14. [Troubleshooting](#14--troubleshooting)
+15. [Decentralization — chain, encryption, failover, gossip, ledger, int8](#15--decentralization-v10)
 
 ---
 
@@ -122,24 +124,128 @@ mixed Mac + Windows case:
 
 ---
 
+## 4 · Serve through an OpenAI-compatible API
+
+Use `drift serve` when your client already knows how to talk to an OpenAI-style local
+backend: the OpenAI Python/JS SDKs, `curl`, LangChain, LiteLLM, LlamaIndex, editor plugins,
+or your own HTTP client. The model still runs through DRIFT's node-to-node protocol; only
+the client-facing edge becomes HTTP/SSE.
+
+**1) Start worker nodes first.** `drift serve` does not spawn workers by itself. You can use
+LAN discovery, or pin ports and pass them explicitly:
+
+```bash
+# terminal 1
+drift node --port 52600
+
+# terminal 2
+drift node --port 52601
+```
+
+**2) Start the OpenAI-compatible server.** The default bind is local-only
+`127.0.0.1:8000`; use `--host 0.0.0.0` only when another machine needs to call it.
+
+```bash
+export DRIFT_API_KEY=local-dev
+drift serve \
+  --nodes 127.0.0.1:52600,127.0.0.1:52601 \
+  --port 8000
+```
+
+The base URL for clients is `http://127.0.0.1:8000/v1`. If you expose the HTTP server beyond
+your own machine, keep `--api-key`/`DRIFT_API_KEY` enabled; for public or tunneled node
+traffic, also use the DRIFT network key from §15.
+
+**3) Call it with `curl`.**
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Authorization: Bearer local-dev" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen2.5-1.5B-Instruct",
+    "messages": [{"role": "user", "content": "Say hello in five words."}],
+    "max_tokens": 32,
+    "temperature": 0
+  }'
+```
+
+**4) Or use the OpenAI Python SDK.**
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:8000/v1",
+    api_key="local-dev",
+)
+
+reply = client.chat.completions.create(
+    model="Qwen/Qwen2.5-1.5B-Instruct",
+    messages=[{"role": "user", "content": "Explain DRIFT in one sentence."}],
+)
+print(reply.choices[0].message.content)
+```
+
+**Supported surface.** The main routes are `GET /v1/models`, `POST /v1/chat/completions`,
+`POST /v1/completions`, `POST /v1/responses`, `POST /v1/embeddings` when the selected mode
+can expose hidden states, `POST /v1/chat/completions/input_tokens`, `/tokenize`,
+`/detokenize`, `/health`, `/ready`, and `/metrics`. Chat and completions support SSE
+streaming with `[DONE]`; Responses streaming emits semantic events such as
+`response.created`, `response.output_text.delta`, and `response.completed`.
+
+**Compatibility details.** The adapter accepts common OpenAI/vLLM-style text-generation
+parameters such as `n`, `temperature`, `top_p`, `top_k`, `min_p`, penalties, `seed`,
+`stop`, logprobs, tool-call shapes, and JSON response formats. DRIFT does not execute tools
+for you, does not guarantee strict schema-constrained decoding, and returns explicit
+OpenAI-shaped errors for unsupported multimodal/audio requests or thin-head
+sampling/embeddings. The full matrix is in
+[`openai-compatibility.md`](openai-compatibility.md), with audit evidence in
+[`openai-compatibility-audit.md`](openai-compatibility-audit.md).
+
+**Useful serve flags.**
+
+| Flag | Meaning |
+|---|---|
+| `--nodes host:port,...` | Use already-running `drift node` workers. |
+| `--no-discover` / `--discover-timeout` | Control LAN discovery when `--nodes` is omitted. |
+| `--model` | Override `model_id` from `config.yaml`. |
+| `--served-model-name` | Expose a friendlier model id through `/v1/models`; clients must send this name. |
+| `--max-new-tokens` | Default output budget when a request omits token limits. |
+| `--chain`, `--thin`, `--int8`, `--expand` | Use the same DRIFT routing modes as `drift run` (§15). |
+| `--api-key` / `DRIFT_API_KEY` | Require `Authorization: Bearer ...` or `x-api-key`. Repeat or comma-separate for multiple keys. |
+| `--cors-origin` / `DRIFT_CORS_ORIGINS` | Allow browser clients from selected origins. |
+| `--max-concurrent-requests` | HTTP request limit; generation over a backend is still serialized. |
+
+**Smoke-test a running server.**
+
+```bash
+python scripts/openai_compat_smoke.py \
+  --base-url http://127.0.0.1:8000/v1 \
+  --model Qwen/Qwen2.5-1.5B-Instruct \
+  --api-key local-dev
+```
+
+---
+
 **Customize & fine-tune** — everything below is optional, for when the one-command flow above
 isn't enough (a different model, an uneven split, exact ports, driving the pieces by hand).
 
 ---
 
-## 4 · `config.yaml` reference
+## 5 · `config.yaml` reference
 
 `config.yaml` is the single source of truth for the model, precision, and (for the by-hand
-flow) the shard table. `drift up` / `drift run` read `model_id`, `dtype`, and `generation`
-from it; they compute the split themselves.
+flow) the shard table. `drift up` / `drift run` / `drift serve` read `model_id`, `dtype`,
+and `generation` from it; they compute the split themselves.
 
 ```yaml
 model_id: "Qwen/Qwen2.5-1.5B-Instruct"   # any HF causal-LM id
-dtype: "float16"                          # float16 | float32  (see §7)
+dtype: "float16"                          # float16 | float32  (see §8)
 device: "mps"                             # default device: mps | cuda | cpu
 port: 52600                               # default port for a shard that sets none
 
-shards:                                   # only used by the by-hand flow (§9) / `drift run` fallback
+shards:                                   # only used by the by-hand flow (§10) / `drift run` fallback
   - { name: "mac",     host: "127.0.0.1", port: 52600, start_layer: 0,  end_layer: 14, device: "mps" }
   - { name: "windows", host: "127.0.0.1", port: 52601, start_layer: 14, end_layer: 28, device: "mps" }
 
@@ -151,10 +257,10 @@ generation:
 | Key | Meaning |
 |---|---|
 | `model_id` | Hugging Face model id. Downloaded once to the local HF cache. |
-| `dtype` | Compute **and** wire dtype. `float16` (default, lossless CPU round-trip) or `float32`. `bfloat16` is **not** valid on the wire — §7. |
+| `dtype` | Compute **and** wire dtype. `float16` (default, lossless CPU round-trip) or `float32`. `bfloat16` is **not** valid on the wire — §8. |
 | `device` | Default device for the head and for a shard that omits its own. `mps` / `cuda` / `cpu`. |
 | `port` | Fallback port for a shard with no `port` and no `DRIFT_PORT`. |
-| `shards[]` | Ordered shard table for the by-hand flow (§9) and the `drift run` fallback when discovery finds nothing. |
+| `shards[]` | Ordered shard table for the by-hand flow (§10) and the `drift run` fallback when discovery finds nothing. |
 | `shards[].host` / `port` | Where the orchestrator dials this shard. `127.0.0.1` local; a LAN IP for remote. |
 | `shards[].start_layer` / `end_layer` | Half-open decoder-layer range `[start, end)`. |
 | `shards[].device` | Device for this shard. |
@@ -163,9 +269,9 @@ generation:
 
 ---
 
-## 5 · Choosing a split point
+## 6 · Choosing a split point
 
-`drift run` splits evenly by node count; you only think about this for the by-hand flow (§9)
+`drift run` and `drift serve` split evenly by node count; you only think about this for the by-hand flow (§10)
 or an uneven split. The ranges must **tile** the decoder layers: contiguous, in order, no gaps,
 no overlaps, covering `[0, num_hidden_layers)`. The head owns `embed_tokens`, the final norm,
 and `lm_head` — never part of a shard range.
@@ -184,7 +290,7 @@ if they differ. Layer counts: Qwen2.5-1.5B = 28, Gemma-4-E2B = 35.
 
 ---
 
-## 6 · Models
+## 7 · Models
 
 The engine **introspects** the loaded model (decoder-layer class, `rotary_emb`, cache type,
 per-layer attention) instead of hardcoding an architecture — so new families drop in by id.
@@ -199,7 +305,7 @@ A larger model just has more layers to split — keep the ranges contiguous over
 
 ---
 
-## 7 · Devices & dtype
+## 8 · Devices & dtype
 
 **Devices** — `mps` (Apple GPU), `cuda` (NVIDIA GPU), `cpu` (portable, slow). Each node's
 device is independent; that independence is the whole point. `drift node` auto-detects it;
@@ -215,10 +321,11 @@ decoding may diverge in later tokens (expected — §3).
 
 ---
 
-## 8 · How generation works
+## 9 · How generation works
 
 - **Greedy.** Both the reference oracle and the orchestrator take `argmax` each step; there is
-  no temperature/top-p sampling in the CLI yet. Parity tests force greedy for determinism.
+  no temperature/top-p sampling in the CLI yet. The OpenAI-compatible HTTP API supports common
+  sampling controls in non-thin mode. Parity tests force greedy for determinism.
 - **EOS.** `drift run` / `drift up` stop at the model's end-of-sequence id(s) (a narrow set, not
   every special token). The parity/reference paths run a fixed `max_new_tokens` with no stop.
 - **Prefill then decode.** The whole prompt is processed once (positions `0…S-1`), then one
@@ -226,7 +333,7 @@ decoding may diverge in later tokens (expected — §3).
 
 ---
 
-## 9 · Driving the shards by hand
+## 10 · Driving the shards by hand
 
 The `drift node` / `drift run` flow is the easy path. The lower-level commands give exact
 control (fixed ports/ranges, no discovery) and are what the parity gate and benchmark use.
@@ -261,7 +368,7 @@ embed/norm/head), so run it on whichever box is convenient.
 
 ---
 
-## 10 · CLI reference
+## 11 · CLI reference
 
 Every command takes `--config` (default `config.yaml`).
 
@@ -274,14 +381,14 @@ Every command takes `--config` (default `config.yaml`).
 | `drift node` | run THIS machine as a worker: auto device, `--port`, LAN-announced, waits for the head |
 | `drift run` | the head: discover nodes (or `--nodes host:port,…`), auto-split, configure, stream/chat |
 | `drift serve` | OpenAI-compatible HTTP/SSE API over the DRIFT orchestrator (`/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/embeddings`) |
-| `drift keygen` | create/print the network key + node identity (§14) |
-| `drift ledger` | per-node contribution from a receipt journal — `--verify` · `--csv` (§14) |
+| `drift keygen` | create/print the network key + node identity (§15) |
+| `drift ledger` | per-node contribution from a receipt journal — `--verify` · `--csv` (§15) |
 
 `up`, `node`, `run` take `--max-new-tokens`; `run`/`up` also take `--chain`, `--thin`,
-`--int8` (§14); `run` also takes `--model`, `--nodes`, `--no-discover`, `--expand`;
+`--int8` (§15); `run` also takes `--model`, `--nodes`, `--no-discover`, `--expand`;
 `node` takes `--tunnel`, `--join`, `--no-advertise`; `serve` takes `--api-key`,
-`--cors-origin`, `--served-model-name`, and the same node/model routing flags as
-`run`. Omit `--prompt` for a chat.
+`--cors-origin`, `--served-model-name`, `--host`, `--port`, `--max-concurrent-requests`,
+and the same node/model routing flags as `run`. Omit `--prompt` for a CLI chat.
 
 ### Lower-level modules
 
@@ -298,7 +405,7 @@ Every command takes `--config` (default `config.yaml`).
 
 ---
 
-## 11 · The wire & sessions
+## 12 · The wire & sessions
 
 - **Contract (`drift/protocol.py`, frozen):** every message is a 4-byte big-endian length
   prefix + a msgpack dict (one ChaCha20-Poly1305 frame when a key is set). Any runtime that
@@ -309,14 +416,14 @@ Every command takes `--config` (default `config.yaml`).
   each hop attaches a signed `receipt`. The **KV cache never crosses** — each node keeps its own.
   Per-token traffic is `hidden_size × 2` bytes (fp16) or ≈`hidden_size × 1` (int8) plus a few ints.
 - **Fungible nodes.** A `drift node` starts unassigned; the head sends a `configure` (model +
-  layer range) so you never hand-write ranges. Pre-assigned servers (§9) skip it.
+  layer range) so you never hand-write ranges. Pre-assigned servers (§10) skip it.
 - **Sessions.** A generation is a `session_id`; each node holds a per-session KV cache and the
   head sends `reset` when it ends. A node serves **one connection at a time** — don't point two
   heads at one node.
 
 ---
 
-## 12 · Memory
+## 13 · Memory
 
 Plan for the **full model in RAM/VRAM on every node** today: each node loads the whole
 checkpoint and then uses only its layer slice, and the head loads the model too (for
@@ -327,7 +434,7 @@ node, or split across **more** nodes to shrink each node's active share.
 
 ---
 
-## 13 · Troubleshooting
+## 14 · Troubleshooting
 
 | Symptom | Likely cause → fix |
 |---|---|
@@ -335,17 +442,21 @@ node, or split across **more** nodes to shrink each node's active share.
 | `ConnectionRefusedError` | Node not up, or wrong host/port. Start the node first; check the port; `drift doctor --nodes host:port`. |
 | Works locally, not across machines | A node bound to `127.0.0.1`. `drift node` binds `0.0.0.0` by default; for the by-hand server pass `--host 0.0.0.0`. Open the firewall port. |
 | Windows: peers can't reach it | Allow `python.exe` through Defender Firewall (Private), enable Network Discovery. |
-| Output drifts only in **late** tokens (MPS↔CUDA) | Expected vendor fp16 rounding (§3, §7). Not a bug. |
+| Output drifts only in **late** tokens (MPS↔CUDA) | Expected vendor fp16 rounding (§3, §8). Not a bug. |
 | Parity **FAIL at token 1–2** | A real bug (mask/KV/RoPE), not float noise. |
-| Out of memory on load | Each process loads the full checkpoint (§12). Use a smaller model, more nodes, or `--no-socket` for the bench. |
-| `unsupported wire dtype` | compute `dtype` must be `float16` or `float32` (§7); `int8` is a *wire* option (`--int8`, §14), not a compute dtype. |
-| `refusing --tunnel without a network key` | a public endpoint would be open compute — run `drift keygen` and `export DRIFT_NETWORK_KEY` first (§14). |
-| A node flagged SUSPECT | the receipt verifier caught a mismatch (§14) — check that node's version/health; a genuine tamper is real. |
+| Out of memory on load | Each process loads the full checkpoint (§13). Use a smaller model, more nodes, or `--no-socket` for the bench. |
+| `unsupported wire dtype` | compute `dtype` must be `float16` or `float32` (§8); `int8` is a *wire* option (`--int8`, §15), not a compute dtype. |
+| `drift serve` says it found 0 nodes | Start `drift node` first, pass `--nodes host:port,...`, or increase `--discover-timeout`. |
+| OpenAI client gets `401` | The server was started with `--api-key`/`DRIFT_API_KEY`; send `Authorization: Bearer <key>` or `x-api-key: <key>`. |
+| OpenAI client gets `model ... is not served` | Use the id shown by `GET /v1/models`, or set `--served-model-name` and send that exact name. |
+| `/v1/embeddings` or sampling fails in `--thin` mode | Thin mode keeps logits/hidden states off the head; use non-thin mode for embeddings and sampling. |
+| `refusing --tunnel without a network key` | a public endpoint would be open compute — run `drift keygen` and `export DRIFT_NETWORK_KEY` first (§15). |
+| A node flagged SUSPECT | the receipt verifier caught a mismatch (§15) — check that node's version/health; a genuine tamper is real. |
 | Rare MPS op error on Mac | Ensure `export PYTORCH_ENABLE_MPS_FALLBACK=1` in the shell that launched the process. |
 
 ---
 
-## 14 · Decentralization (v1.0)
+## 15 · Decentralization (v1.0)
 
 The split core is unchanged; these are opt-in layers on top. Every one is gated
 bitwise (or, for int8, under the relaxed gate) — see `python -m drift.itest`.
