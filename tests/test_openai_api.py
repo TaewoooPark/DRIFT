@@ -12,15 +12,21 @@ class FakeBackend:
     def __init__(self):
         self.prompts = []
         self.sessions = []
+        self.options = []
+        self.supports_sampling = True
 
-    def generate(self, prompt, max_tokens: int, session_id: str) -> GenerationResult:
+    def generate(self, prompt, max_tokens: int, session_id: str,
+                 options: dict | None = None) -> GenerationResult:
         self.prompts.append(prompt)
         self.sessions.append(session_id)
+        self.options.append(options or {})
         return GenerationResult(text="hello from drift", token_ids=[1, 2, 3])
 
-    def stream(self, prompt, max_tokens: int, session_id: str):
+    def stream(self, prompt, max_tokens: int, session_id: str,
+               options: dict | None = None):
         self.prompts.append(prompt)
         self.sessions.append(session_id)
+        self.options.append(options or {})
         yield "hello"
         yield " from"
         yield " drift"
@@ -121,8 +127,38 @@ def test_rejects_unknown_model_with_openai_error_shape():
     assert body["error"]["code"] == "model_not_found"
 
 
-def test_rejects_sampling_until_generation_controls_land():
-    _, c = client()
+def test_passes_sampling_options_to_backend():
+    backend, c = client()
+    res = c.post("/v1/chat/completions", json={
+        "model": "drift-test",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "top_k": 40,
+        "min_p": 0.05,
+        "presence_penalty": 0.1,
+        "frequency_penalty": 0.2,
+        "repetition_penalty": 1.1,
+        "seed": 123,
+    })
+
+    assert res.status_code == 200
+    assert backend.options[0] == {
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "top_k": 40,
+        "min_p": 0.05,
+        "presence_penalty": 0.1,
+        "frequency_penalty": 0.2,
+        "repetition_penalty": 1.1,
+        "seed": 123,
+    }
+
+
+def test_rejects_sampling_when_backend_cannot_sample():
+    backend = FakeBackend()
+    backend.supports_sampling = False
+    c = TestClient(create_app(backend))
     res = c.post("/v1/chat/completions", json={
         "model": "drift-test",
         "messages": [{"role": "user", "content": "Hello"}],
@@ -130,8 +166,7 @@ def test_rejects_sampling_until_generation_controls_land():
     })
 
     assert res.status_code == 400
-    body = res.json()
-    assert body["error"]["code"] == "unsupported_sampling"
+    assert res.json()["error"]["code"] == "unsupported_sampling"
 
 
 def test_rejects_multimodal_content_explicitly():

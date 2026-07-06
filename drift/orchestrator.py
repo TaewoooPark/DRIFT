@@ -427,18 +427,114 @@ class Orchestrator:
         logits = self.head.head(self.head.norm(hidden[:, -1:, :]))[:, -1, :]
         return int(torch.argmax(logits, dim=-1)), logits[0].detach().float().cpu().numpy()
 
-    def _decode(self, session_id, tok_id, pos):
+    def _decode(self, session_id, tok_id, pos, return_logits: bool = False):
         """Feed one token at absolute position `pos`; return the next token id."""
         if self.thin:
             nid = self.transport.route_token(self.order, session_id, [tok_id], [pos], "decode")
             self._check_receipts()
+            if return_logits:
+                raise ValueError("sampling is not available in thin-head mode")
             return nid
         hidden = self.head.embed(torch.tensor([[tok_id]], device=self.device))
         hidden = self.transport.route(self.order, session_id, hidden, [pos], [tok_id],
                                       "decode").to(self.device)
         self._check_receipts()
         logits = self.head.head(self.head.norm(hidden[:, -1:, :]))[:, -1, :]
+        if return_logits:
+            return int(torch.argmax(logits, dim=-1)), logits[0].detach().float().cpu()
         return int(torch.argmax(logits, dim=-1))
+
+    def _sampling_enabled(self, opts: dict | None) -> bool:
+        if not opts:
+            return False
+        temperature = 0.0 if opts.get("temperature") is None else float(opts["temperature"])
+        top_p = 1.0 if opts.get("top_p") is None else float(opts["top_p"])
+        top_k = 0 if opts.get("top_k") is None else int(opts["top_k"])
+        min_p = 0.0 if opts.get("min_p") is None else float(opts["min_p"])
+        presence = 0.0 if opts.get("presence_penalty") is None \
+            else float(opts["presence_penalty"])
+        frequency = 0.0 if opts.get("frequency_penalty") is None \
+            else float(opts["frequency_penalty"])
+        repetition = 1.0 if opts.get("repetition_penalty") is None \
+            else float(opts["repetition_penalty"])
+        return (
+            temperature > 0.0
+            or top_p < 1.0
+            or top_k > 0
+            or min_p > 0.0
+            or presence != 0.0
+            or frequency != 0.0
+            or repetition != 1.0
+        )
+
+    def _pick_token(self, logits, history_ids: list[int], opts: dict | None,
+                    step: int) -> int:
+        """Greedy by default; optional OpenAI/llama.cpp-style sampling controls.
+
+        The default branch is exactly the old argmax path. Sampling runs on CPU so
+        a seeded torch.Generator gives deterministic draws independent of MPS/CUDA.
+        """
+        if not self._sampling_enabled(opts):
+            return int(torch.argmax(logits, dim=-1))
+
+        opts = opts or {}
+        temperature = 1.0 if opts.get("temperature") is None else float(opts["temperature"])
+
+        scores = logits.detach().float().cpu().clone()
+        if history_ids:
+            counts: dict[int, int] = {}
+            for tid in history_ids:
+                counts[int(tid)] = counts.get(int(tid), 0) + 1
+            presence = 0.0 if opts.get("presence_penalty") is None \
+                else float(opts["presence_penalty"])
+            frequency = 0.0 if opts.get("frequency_penalty") is None \
+                else float(opts["frequency_penalty"])
+            repetition = 1.0 if opts.get("repetition_penalty") is None \
+                else float(opts["repetition_penalty"])
+            for tid, count in counts.items():
+                if 0 <= tid < scores.numel():
+                    scores[tid] -= presence + frequency * count
+                    if repetition != 1.0:
+                        scores[tid] = scores[tid] / repetition if scores[tid] > 0 \
+                            else scores[tid] * repetition
+
+        if temperature <= 0:
+            return int(torch.argmax(scores, dim=-1))
+        scores = scores / temperature
+        top_k = 0 if opts.get("top_k") is None else int(opts["top_k"])
+        if top_k > 0 and top_k < scores.numel():
+            keep = torch.topk(scores, top_k).indices
+            mask = torch.full_like(scores, float("-inf"))
+            mask[keep] = scores[keep]
+            scores = mask
+
+        probs = torch.softmax(scores, dim=-1)
+        min_p = 0.0 if opts.get("min_p") is None else float(opts["min_p"])
+        if min_p > 0:
+            cutoff = torch.max(probs) * min_p
+            probs = torch.where(probs >= cutoff, probs, torch.zeros_like(probs))
+
+        top_p = 1.0 if opts.get("top_p") is None else float(opts["top_p"])
+        if 0 < top_p < 1.0:
+            sorted_probs, sorted_idx = torch.sort(probs, descending=True)
+            cumulative = torch.cumsum(sorted_probs, dim=-1)
+            remove = cumulative > top_p
+            remove[1:] = remove[:-1].clone()
+            remove[0] = False
+            sorted_probs = torch.where(remove, torch.zeros_like(sorted_probs), sorted_probs)
+            filtered = torch.zeros_like(probs)
+            filtered[sorted_idx] = sorted_probs
+            probs = filtered
+
+        total = torch.sum(probs)
+        if not torch.isfinite(total) or float(total) <= 0:
+            return int(torch.argmax(logits, dim=-1))
+        probs = probs / total
+        generator = None
+        if opts.get("seed") is not None:
+            generator = torch.Generator()
+            generator.manual_seed(int(opts["seed"]) + int(step))
+        return int(torch.multinomial(probs, 1, generator=generator))
 
     def _recover(self, session_id: str) -> None:
         """A node dropped mid-run: re-split over the survivors (+ spares), so the
@@ -460,12 +556,15 @@ class Orchestrator:
                 pass
 
     @torch.no_grad()
-    def generate(self, prompt: str, max_new_tokens: int, stop_on_eos: bool = False,
-                 session_id: str = "s0") -> dict:
+    def generate(self, prompt: str | list[dict], max_new_tokens: int, stop_on_eos: bool = False,
+                 session_id: str = "s0", generation_options: dict | None = None) -> dict:
         tok = self.head.tokenizer
         input_ids = build_input_ids(tok, prompt).to(self.device)
         prompt_ids = input_ids[0].tolist()
         eos = self._eos_set(stop_on_eos)
+        sampling = self._sampling_enabled(generation_options)
+        if sampling and self.thin:
+            raise ValueError("sampling is not available in thin-head mode")
 
         generated: list[int] = []
         first_logits = None
@@ -480,13 +579,22 @@ class Orchestrator:
                 next_id, logits0 = self._prefill(session_id, seq)
                 if first_logits is None:
                     first_logits = logits0
+                if sampling and logits0 is not None:
+                    next_id = self._pick_token(torch.tensor(logits0), seq,
+                                               generation_options, len(generated))
                 p = len(seq)
                 while len(generated) < max_new_tokens:
                     generated.append(next_id)
                     self.progress = len(generated)
                     if (stop_on_eos and next_id in eos) or len(generated) >= max_new_tokens:
                         break
-                    next_id = self._decode(session_id, next_id, p)
+                    if sampling:
+                        _, logits = self._decode(session_id, next_id, p, return_logits=True)
+                        next_id = self._pick_token(
+                            logits, prompt_ids + generated, generation_options, len(generated)
+                        )
+                    else:
+                        next_id = self._decode(session_id, next_id, p)
                     p += 1
                 break  # finished with no unrecovered drop
             except NodeUnavailable:
@@ -497,8 +605,9 @@ class Orchestrator:
         return {"token_ids": generated, "first_logits": first_logits, "text": tok.decode(generated)}
 
     @torch.no_grad()
-    def generate_stream(self, prompt: str, max_new_tokens: int, stop_on_eos: bool = True,
-                        session_id: str = "s0"):
+    def generate_stream(self, prompt: str | list[dict], max_new_tokens: int,
+                        stop_on_eos: bool = True,
+                        session_id: str = "s0", generation_options: dict | None = None):
         """Streaming twin of generate(): the SAME _prefill/_decode machinery —
         thin-aware, receipt-verifying (M11), journaling (M13), and failover-
         recovering (M9) — but *yields* decoded text deltas as tokens land.
@@ -518,6 +627,9 @@ class Orchestrator:
         input_ids = build_input_ids(tok, prompt).to(self.device)
         prompt_ids = input_ids[0].tolist()
         eos = self._eos_set(stop_on_eos)
+        sampling = self._sampling_enabled(generation_options)
+        if sampling and self.thin:
+            raise ValueError("sampling is not available in thin-head mode")
 
         generated: list[int] = []
         prev = ""
@@ -529,7 +641,10 @@ class Orchestrator:
                     # every survivor's KV. Greedy is deterministic over a fixed
                     # prefix, so the resumed continuation is bitwise-identical.
                     seq = prompt_ids + generated
-                    next_id, _ = self._prefill(session_id, seq)
+                    next_id, logits0 = self._prefill(session_id, seq)
+                    if sampling and logits0 is not None:
+                        next_id = self._pick_token(torch.tensor(logits0), seq,
+                                                   generation_options, len(generated))
                     p = len(seq)
                     while len(generated) < max_new_tokens:
                         if stop_on_eos and next_id in eos:
@@ -542,7 +657,14 @@ class Orchestrator:
                             prev = text
                         if len(generated) >= max_new_tokens:
                             break
-                        next_id = self._decode(session_id, next_id, p)
+                        if sampling:
+                            _, logits = self._decode(session_id, next_id, p, return_logits=True)
+                            next_id = self._pick_token(
+                                logits, prompt_ids + generated,
+                                generation_options, len(generated)
+                            )
+                        else:
+                            next_id = self._decode(session_id, next_id, p)
                         p += 1
                     break  # finished with no unrecovered drop
                 except NodeUnavailable:

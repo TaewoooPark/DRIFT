@@ -31,10 +31,12 @@ class OpenAIBackend(Protocol):
     model_id: str
     default_max_tokens: int
 
-    def generate(self, prompt: Prompt, max_tokens: int, session_id: str) -> GenerationResult:
+    def generate(self, prompt: Prompt, max_tokens: int, session_id: str,
+                 options: dict | None = None) -> GenerationResult:
         ...
 
-    def stream(self, prompt: Prompt, max_tokens: int, session_id: str) -> Iterable[str]:
+    def stream(self, prompt: Prompt, max_tokens: int, session_id: str,
+               options: dict | None = None) -> Iterable[str]:
         ...
 
     def count_tokens(self, prompt: Prompt) -> int:
@@ -57,22 +59,27 @@ class DriftBackend:
         self.orchestrator = orchestrator
         self.model_id = model_id
         self.default_max_tokens = default_max_tokens
+        self.supports_sampling = not getattr(orchestrator, "thin", False)
         self._lock = threading.Lock()
 
-    def generate(self, prompt: Prompt, max_tokens: int, session_id: str) -> GenerationResult:
+    def generate(self, prompt: Prompt, max_tokens: int, session_id: str,
+                 options: dict | None = None) -> GenerationResult:
         with self._lock:
             out = self.orchestrator.generate(
-                prompt, max_tokens, stop_on_eos=True, session_id=session_id
+                prompt, max_tokens, stop_on_eos=True, session_id=session_id,
+                generation_options=options,
             )
         token_ids = list(out.get("token_ids") or [])
         finish = "length" if len(token_ids) >= max_tokens else "stop"
         return GenerationResult(text=out.get("text", ""), token_ids=token_ids,
                                 finish_reason=finish)
 
-    def stream(self, prompt: Prompt, max_tokens: int, session_id: str) -> Iterable[str]:
+    def stream(self, prompt: Prompt, max_tokens: int, session_id: str,
+               options: dict | None = None) -> Iterable[str]:
         with self._lock:
             yield from self.orchestrator.generate_stream(
-                prompt, max_tokens, stop_on_eos=True, session_id=session_id
+                prompt, max_tokens, stop_on_eos=True, session_id=session_id,
+                generation_options=options,
             )
 
     def count_tokens(self, prompt: Prompt) -> int:
@@ -230,8 +237,8 @@ def _validate_max_tokens(body: dict, backend: OpenAIBackend) -> int:
 def _validate_stage1_options(body: dict) -> None:
     known = {
         "model", "messages", "max_tokens", "max_completion_tokens", "stream",
-        "stream_options", "temperature", "top_p", "n", "stop", "presence_penalty",
-        "frequency_penalty", "repetition_penalty", "seed", "user", "tools",
+        "stream_options", "temperature", "top_p", "top_k", "min_p", "n", "stop",
+        "presence_penalty", "frequency_penalty", "repetition_penalty", "seed", "user", "tools",
         "tool_choice", "functions", "function_call", "logprobs", "top_logprobs",
         "response_format", "logit_bias",
     }
@@ -248,35 +255,6 @@ def _validate_stage1_options(body: dict) -> None:
         raise OpenAIHTTPError(400, "`n` must be an integer", param="n")
     if n != 1:
         raise OpenAIHTTPError(400, "only n=1 is supported in this stage", param="n")
-    temp = body.get("temperature")
-    if temp not in (None, 0, 0.0):
-        raise OpenAIHTTPError(
-            400,
-            "sampling is not implemented yet; omit `temperature` or set it to 0",
-            param="temperature",
-            code="unsupported_sampling",
-        )
-    top_p = body.get("top_p")
-    if top_p not in (None, 1, 1.0):
-        raise OpenAIHTTPError(
-            400,
-            "sampling is not implemented yet; omit `top_p` or set it to 1",
-            param="top_p",
-            code="unsupported_sampling",
-        )
-    for key in ("presence_penalty", "frequency_penalty", "repetition_penalty"):
-        if body.get(key) not in (None, 0, 0.0):
-            raise OpenAIHTTPError(
-                400,
-                f"`{key}` is not supported until generation controls land",
-                param=key,
-                code="unsupported_sampling",
-            )
-    if body.get("seed") is not None:
-        raise OpenAIHTTPError(
-            400, "`seed` is not supported until sampling lands",
-            param="seed", code="unsupported_sampling"
-        )
     if body.get("stop") not in (None, [], ""):
         raise OpenAIHTTPError(
             400, "`stop` is not supported until stop-string handling lands",
@@ -319,12 +297,75 @@ def _include_stream_usage(body: dict) -> bool:
     return bool(opts.get("include_usage"))
 
 
+def _float_param(body: dict, key: str, default: float) -> float:
+    if body.get(key) is None:
+        return default
+    try:
+        return float(body[key])
+    except (TypeError, ValueError):
+        raise OpenAIHTTPError(400, f"`{key}` must be a number", param=key)
+
+
+def _int_param(body: dict, key: str, default: int) -> int:
+    if body.get(key) is None:
+        return default
+    try:
+        return int(body[key])
+    except (TypeError, ValueError):
+        raise OpenAIHTTPError(400, f"`{key}` must be an integer", param=key)
+
+
+def _generation_options(body: dict, backend: OpenAIBackend) -> dict:
+    opts = {
+        "temperature": _float_param(body, "temperature", 0.0),
+        "top_p": _float_param(body, "top_p", 1.0),
+        "top_k": _int_param(body, "top_k", 0),
+        "min_p": _float_param(body, "min_p", 0.0),
+        "presence_penalty": _float_param(body, "presence_penalty", 0.0),
+        "frequency_penalty": _float_param(body, "frequency_penalty", 0.0),
+        "repetition_penalty": _float_param(body, "repetition_penalty", 1.0),
+        "seed": None if body.get("seed") is None else _int_param(body, "seed", 0),
+    }
+    if opts["temperature"] < 0:
+        raise OpenAIHTTPError(400, "`temperature` must be >= 0", param="temperature")
+    if not 0 < opts["top_p"] <= 1:
+        raise OpenAIHTTPError(400, "`top_p` must be > 0 and <= 1", param="top_p")
+    if opts["top_k"] < 0:
+        raise OpenAIHTTPError(400, "`top_k` must be >= 0", param="top_k")
+    if not 0 <= opts["min_p"] <= 1:
+        raise OpenAIHTTPError(400, "`min_p` must be >= 0 and <= 1", param="min_p")
+    for key in ("presence_penalty", "frequency_penalty"):
+        if not -2 <= opts[key] <= 2:
+            raise OpenAIHTTPError(400, f"`{key}` must be between -2 and 2", param=key)
+    if opts["repetition_penalty"] <= 0:
+        raise OpenAIHTTPError(
+            400, "`repetition_penalty` must be > 0", param="repetition_penalty"
+        )
+
+    non_greedy = (
+        opts["temperature"] > 0
+        or opts["top_p"] < 1
+        or opts["top_k"] > 0
+        or opts["min_p"] > 0
+        or opts["presence_penalty"] != 0
+        or opts["frequency_penalty"] != 0
+        or opts["repetition_penalty"] != 1
+    )
+    if non_greedy and not getattr(backend, "supports_sampling", True):
+        raise OpenAIHTTPError(
+            400,
+            "sampling parameters are not available in DRIFT thin-head mode",
+            code="unsupported_sampling",
+        )
+    return opts
+
+
 def _validate_completion_options(body: dict) -> None:
     known = {
-        "model", "prompt", "suffix", "max_tokens", "temperature", "top_p", "n",
-        "stream", "stream_options", "logprobs", "echo", "stop",
-        "presence_penalty", "frequency_penalty", "best_of", "logit_bias",
-        "user", "seed",
+        "model", "prompt", "suffix", "max_tokens", "temperature", "top_p",
+        "top_k", "min_p", "n", "stream", "stream_options", "logprobs", "echo",
+        "stop", "presence_penalty", "frequency_penalty", "repetition_penalty",
+        "best_of", "logit_bias", "user", "seed",
     }
     unknown = sorted(set(body) - known)
     if unknown:
@@ -449,6 +490,7 @@ def create_app(backend: OpenAIBackend):
         model = _validate_model(body, backend)
         _validate_stage1_options(body)
         max_tokens = _validate_max_tokens(body, backend)
+        options = _generation_options(body, backend)
         prompt = normalize_chat_messages(body.get("messages"))
         stream = bool(body.get("stream", False))
         include_usage = _include_stream_usage(body)
@@ -457,7 +499,7 @@ def create_app(backend: OpenAIBackend):
         session_id = _make_id("openai")
 
         if not stream:
-            result = backend.generate(prompt, max_tokens, session_id)
+            result = backend.generate(prompt, max_tokens, session_id, options=options)
             return JSONResponse({
                 "id": rid,
                 "object": "chat.completion",
@@ -485,7 +527,7 @@ def create_app(backend: OpenAIBackend):
                 first["usage"] = None
             yield _json_sse(first)
             try:
-                for piece in backend.stream(prompt, max_tokens, session_id):
+                for piece in backend.stream(prompt, max_tokens, session_id, options=options):
                     if not piece:
                         continue
                     full_text += piece
@@ -550,6 +592,7 @@ def create_app(backend: OpenAIBackend):
         model = _validate_model(body, backend)
         _validate_completion_options(body)
         max_tokens = _validate_max_tokens(body, backend)
+        options = _generation_options(body, backend)
         prompts = normalize_completion_prompts(body, backend)
         stream = bool(body.get("stream", False))
         include_usage = _include_stream_usage(body)
@@ -582,7 +625,7 @@ def create_app(backend: OpenAIBackend):
                         chunk["usage"] = None
                     yield _json_sse(chunk)
                 try:
-                    for piece in backend.stream(prompt, max_tokens, session_id):
+                    for piece in backend.stream(prompt, max_tokens, session_id, options=options):
                         if not piece:
                             continue
                         generated_text += piece
@@ -643,7 +686,9 @@ def create_app(backend: OpenAIBackend):
         total_prompt_tokens = 0
         total_completion_tokens = 0
         for i, prompt in enumerate(prompts):
-            result = backend.generate(prompt, max_tokens, f"{_make_id('openai')}-{i}")
+            result = backend.generate(
+                prompt, max_tokens, f"{_make_id('openai')}-{i}", options=options
+            )
             usage = _usage(backend, prompt, result)
             total_prompt_tokens += usage["prompt_tokens"]
             total_completion_tokens += usage["completion_tokens"]
