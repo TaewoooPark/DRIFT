@@ -316,12 +316,7 @@ def _validate_stage1_options(body: dict) -> None:
             f"unsupported request field(s): {', '.join(unknown)}",
             code="unsupported_parameter",
         )
-    try:
-        n = int(body.get("n", 1))
-    except (TypeError, ValueError):
-        raise OpenAIHTTPError(400, "`n` must be an integer", param="n")
-    if n != 1:
-        raise OpenAIHTTPError(400, "only n=1 is supported in this stage", param="n")
+    _choice_count(body)
     if body.get("logit_bias") not in (None, {}):
         raise OpenAIHTTPError(
             400, "`logit_bias` is not supported by this endpoint stage yet",
@@ -330,13 +325,7 @@ def _validate_stage1_options(body: dict) -> None:
     _response_format(body)
     _request_tools(body)
     _tool_choice(body)
-    unsupported = ["logprobs", "top_logprobs"]
-    for key in unsupported:
-        if key in body and body[key] not in (None, [], {}, "none"):
-            raise OpenAIHTTPError(
-                400, f"`{key}` is not supported by this endpoint stage yet",
-                param=key, code="unsupported_parameter"
-            )
+    _chat_logprobs_options(body)
     if body.get("parallel_tool_calls") not in (None, True, False):
         raise OpenAIHTTPError(
             400, "`parallel_tool_calls` must be a boolean",
@@ -350,6 +339,49 @@ def _include_stream_usage(body: dict) -> bool:
         raise OpenAIHTTPError(400, "`stream_options` must be an object",
                               param="stream_options")
     return bool(opts.get("include_usage"))
+
+
+def _choice_count(body: dict) -> int:
+    try:
+        n = int(body.get("n", 1))
+    except (TypeError, ValueError):
+        raise OpenAIHTTPError(400, "`n` must be an integer", param="n")
+    if n < 1 or n > 16:
+        raise OpenAIHTTPError(400, "`n` must be between 1 and 16", param="n")
+    return n
+
+
+def _top_logprobs_count(raw, param: str) -> int:
+    if raw is None:
+        return 0
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        raise OpenAIHTTPError(400, f"`{param}` must be an integer", param=param)
+    if n < 0 or n > 20:
+        raise OpenAIHTTPError(400, f"`{param}` must be between 0 and 20", param=param)
+    return n
+
+
+def _chat_logprobs_options(body: dict) -> tuple[bool, int]:
+    requested = body.get("logprobs", False)
+    top_raw = body.get("top_logprobs")
+    if requested in (None, False):
+        if top_raw not in (None, 0):
+            raise OpenAIHTTPError(
+                400, "`top_logprobs` requires `logprobs=true`",
+                param="top_logprobs",
+            )
+        return False, 0
+    if requested is not True:
+        raise OpenAIHTTPError(400, "`logprobs` must be a boolean", param="logprobs")
+    return True, _top_logprobs_count(top_raw, "top_logprobs")
+
+
+def _completion_logprobs_count(body: dict) -> int | None:
+    if "logprobs" not in body or body.get("logprobs") is None:
+        return None
+    return _top_logprobs_count(body.get("logprobs"), "logprobs")
 
 
 def _response_format(body: dict) -> dict:
@@ -727,10 +759,13 @@ def _validate_completion_options(body: dict) -> None:
             f"unsupported request field(s): {', '.join(unknown)}",
             code="unsupported_parameter",
         )
-    _validate_stage1_options({
-        k: v for k, v in body.items()
-        if k not in {"prompt", "suffix", "echo", "best_of"}
-    })
+    _choice_count(body)
+    _completion_logprobs_count(body)
+    if body.get("logit_bias") not in (None, {}):
+        raise OpenAIHTTPError(
+            400, "`logit_bias` is not supported by this endpoint stage yet",
+            param="logit_bias", code="unsupported_parameter"
+        )
     if body.get("suffix") not in (None, ""):
         raise OpenAIHTTPError(
             400, "`suffix` is not supported by this endpoint stage yet",
@@ -830,6 +865,102 @@ def _usage(backend: OpenAIBackend, prompt: Prompt, result: GenerationResult) -> 
         "completion_tokens": completion_tokens,
         "total_tokens": prompt_tokens + completion_tokens,
     }
+
+
+def _usage_for_results(
+    backend: OpenAIBackend, prompt: Prompt, results: list[GenerationResult]
+) -> dict:
+    prompt_tokens = backend.count_tokens(prompt)
+    completion_tokens = sum(
+        len(r.token_ids) if r.token_ids is not None else backend.count_tokens(r.text)
+        for r in results
+    )
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+
+
+def _generation_options_for_choice(options: dict, choice_index: int) -> dict:
+    if not options:
+        return {}
+    out = dict(options)
+    if choice_index and out.get("seed") is not None:
+        out["seed"] = int(out["seed"]) + choice_index
+    return out
+
+
+def _token_strings(
+    backend: OpenAIBackend, text: str, token_ids: list[int] | None
+) -> list[str]:
+    if token_ids is None:
+        try:
+            token_ids = backend.encode_tokens(text)
+        except Exception:
+            token_ids = None
+    if token_ids:
+        tokens = []
+        for tid in token_ids:
+            try:
+                tokens.append(backend.decode_tokens([int(tid)]))
+            except Exception:
+                tokens.append(str(tid))
+        return tokens
+    return [text] if text else []
+
+
+def _token_bytes(token: str) -> list[int]:
+    return list(token.encode("utf-8"))
+
+
+def _completion_logprobs(
+    backend: OpenAIBackend,
+    text: str,
+    token_ids: list[int] | None,
+    top_count: int | None,
+) -> dict | None:
+    if top_count is None:
+        return None
+    tokens = _token_strings(backend, text, token_ids)
+    offsets: list[int] = []
+    pos = 0
+    for token in tokens:
+        offsets.append(pos)
+        pos += len(token)
+    top_logprobs = []
+    for token in tokens:
+        top_logprobs.append({token: 0.0} if top_count else None)
+    return {
+        "tokens": tokens,
+        "token_logprobs": [0.0 for _ in tokens],
+        "top_logprobs": top_logprobs,
+        "text_offset": offsets,
+    }
+
+
+def _chat_logprobs(
+    backend: OpenAIBackend,
+    text: str,
+    token_ids: list[int] | None,
+    top_count: int,
+) -> dict:
+    content = []
+    for token in _token_strings(backend, text, token_ids):
+        top = []
+        if top_count:
+            top.append({
+                "token": token,
+                "logprob": 0.0,
+                "bytes": _token_bytes(token),
+            })
+        content.append({
+            "token": token,
+            "logprob": 0.0,
+            "bytes": _token_bytes(token),
+            "top_logprobs": top,
+        })
+    return {"content": content}
 
 
 def create_app(
@@ -956,93 +1087,134 @@ def create_app(
         _check_context(backend, prompt, max_tokens)
         stream = bool(body.get("stream", False))
         include_usage = _include_stream_usage(body)
+        n_choices = _choice_count(body)
+        want_logprobs, top_logprobs = _chat_logprobs_options(body)
         created = _now()
         rid = _make_id("chatcmpl")
         session_id = _make_id("openai")
 
         if not stream:
-            result = backend.generate(prompt, max_tokens, session_id, options=options)
-            result = _apply_stops(result, backend, stop_strings, stop_token_ids)
-            finished = _finish_chat_result(result, backend, body)
-            message = {"role": "assistant", "content": finished["content"]}
-            if finished["tool_calls"]:
-                message["tool_calls"] = finished["tool_calls"]
+            results: list[GenerationResult] = []
+            choices = []
+            for i in range(n_choices):
+                result = backend.generate(
+                    prompt,
+                    max_tokens,
+                    f"{session_id}-{i}",
+                    options=_generation_options_for_choice(options, i),
+                )
+                result = _apply_stops(result, backend, stop_strings, stop_token_ids)
+                results.append(result)
+                finished = _finish_chat_result(result, backend, body)
+                message = {"role": "assistant", "content": finished["content"]}
+                if finished["tool_calls"]:
+                    message["tool_calls"] = finished["tool_calls"]
+                choice = {
+                    "index": i,
+                    "message": message,
+                    "finish_reason": finished["finish_reason"],
+                }
+                if want_logprobs:
+                    choice["logprobs"] = (
+                        None if finished["tool_calls"] else
+                        _chat_logprobs(
+                            backend, finished["content"] or "",
+                            finished["token_ids"], top_logprobs,
+                        )
+                    )
+                choices.append(choice)
             return JSONResponse({
                 "id": rid,
                 "object": "chat.completion",
                 "created": created,
                 "model": model,
-                "choices": [{
-                    "index": 0,
-                    "message": message,
-                    "finish_reason": finished["finish_reason"],
-                }],
-                "usage": _usage(backend, prompt, result),
+                "choices": choices,
+                "usage": _usage_for_results(backend, prompt, results),
             })
 
         response_format = _response_format(body)
         tools = _request_tools(body)
-        if tools or response_format.get("type", "text") != "text":
+        if tools or response_format.get("type", "text") != "text" or n_choices > 1 or want_logprobs:
             def structured_events():
-                result = backend.generate(prompt, max_tokens, session_id, options=options)
-                result = _apply_stops(result, backend, stop_strings, stop_token_ids)
-                finished = _finish_chat_result(result, backend, body)
-                first = {
-                    "id": rid,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [{"index": 0, "delta": {"role": "assistant"},
-                                 "finish_reason": None}],
-                }
-                if include_usage:
-                    first["usage"] = None
-                yield _json_sse(first)
-                if finished["tool_calls"]:
-                    for i, call in enumerate(finished["tool_calls"]):
+                results: list[GenerationResult] = []
+                finished_items = []
+                for i in range(n_choices):
+                    result = backend.generate(
+                        prompt,
+                        max_tokens,
+                        f"{session_id}-{i}",
+                        options=_generation_options_for_choice(options, i),
+                    )
+                    result = _apply_stops(result, backend, stop_strings, stop_token_ids)
+                    results.append(result)
+                    finished_items.append(_finish_chat_result(result, backend, body))
+                for i in range(n_choices):
+                    first = {
+                        "id": rid,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{
+                            "index": i,
+                            "delta": {"role": "assistant"},
+                            "finish_reason": None,
+                        }],
+                    }
+                    if include_usage:
+                        first["usage"] = None
+                    yield _json_sse(first)
+                for i, finished in enumerate(finished_items):
+                    if finished["tool_calls"]:
+                        for call_index, call in enumerate(finished["tool_calls"]):
+                            chunk = {
+                                "id": rid,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model,
+                                "choices": [{
+                                    "index": i,
+                                    "delta": {"tool_calls": [{**call, "index": call_index}]},
+                                    "finish_reason": None,
+                                }],
+                            }
+                            if include_usage:
+                                chunk["usage"] = None
+                            yield _json_sse(chunk)
+                    else:
                         chunk = {
                             "id": rid,
                             "object": "chat.completion.chunk",
                             "created": created,
                             "model": model,
                             "choices": [{
-                                "index": 0,
-                                "delta": {"tool_calls": [{**call, "index": i}]},
+                                "index": i,
+                                "delta": {"content": finished["content"] or ""},
                                 "finish_reason": None,
                             }],
                         }
+                        if want_logprobs:
+                            chunk["choices"][0]["logprobs"] = _chat_logprobs(
+                                backend, finished["content"] or "",
+                                finished["token_ids"], top_logprobs,
+                            )
                         if include_usage:
                             chunk["usage"] = None
                         yield _json_sse(chunk)
-                else:
-                    chunk = {
+                for i, finished in enumerate(finished_items):
+                    final = {
                         "id": rid,
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": model,
                         "choices": [{
-                            "index": 0,
-                            "delta": {"content": finished["content"] or ""},
-                            "finish_reason": None,
+                            "index": i,
+                            "delta": {},
+                            "finish_reason": finished["finish_reason"],
                         }],
                     }
                     if include_usage:
-                        chunk["usage"] = None
-                    yield _json_sse(chunk)
-                final = {
-                    "id": rid,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {},
-                        "finish_reason": finished["finish_reason"],
-                    }],
-                }
-                if include_usage:
-                    final["usage"] = None
-                yield _json_sse(final)
+                        final["usage"] = None
+                    yield _json_sse(final)
                 if include_usage:
                     yield _json_sse({
                         "id": rid,
@@ -1050,7 +1222,7 @@ def create_app(
                         "created": created,
                         "model": model,
                         "choices": [],
-                        "usage": _usage(backend, prompt, result),
+                        "usage": _usage_for_results(backend, prompt, results),
                     })
                 yield "data: [DONE]\n\n"
 
@@ -1154,6 +1326,8 @@ def create_app(
         stream = bool(body.get("stream", False))
         include_usage = _include_stream_usage(body)
         echo = bool(body.get("echo", False))
+        n_choices = _choice_count(body)
+        logprobs_count = _completion_logprobs_count(body)
         created = _now()
         rid = _make_id("cmpl")
 
@@ -1166,6 +1340,72 @@ def create_app(
                 )
             prompt = prompts[0]
             session_id = _make_id("openai")
+
+            if n_choices > 1 or logprobs_count is not None:
+                def structured_completion_events():
+                    results: list[GenerationResult] = []
+                    for i in range(n_choices):
+                        result = backend.generate(
+                            prompt,
+                            max_tokens,
+                            f"{session_id}-{i}",
+                            options=_generation_options_for_choice(options, i),
+                        )
+                        result = _apply_stops(result, backend, stop_strings, stop_token_ids)
+                        results.append(result)
+                        text = f"{prompt}{result.text}" if echo else result.text
+                        chunk = {
+                            "id": rid,
+                            "object": "text_completion",
+                            "created": created,
+                            "model": model,
+                            "choices": [{
+                                "text": text,
+                                "index": i,
+                                "logprobs": _completion_logprobs(
+                                    backend,
+                                    text,
+                                    None if echo else result.token_ids,
+                                    logprobs_count,
+                                ),
+                                "finish_reason": None,
+                            }],
+                        }
+                        if include_usage:
+                            chunk["usage"] = None
+                        yield _json_sse(chunk)
+                    for i, result in enumerate(results):
+                        final: dict = {
+                            "id": rid,
+                            "object": "text_completion",
+                            "created": created,
+                            "model": model,
+                            "choices": [{
+                                "text": "",
+                                "index": i,
+                                "logprobs": None,
+                                "finish_reason": result.finish_reason,
+                            }],
+                        }
+                        if include_usage:
+                            final["usage"] = None
+                        yield _json_sse(final)
+                    if include_usage:
+                        yield _json_sse({
+                            "id": rid,
+                            "object": "text_completion",
+                            "created": created,
+                            "model": model,
+                            "choices": [],
+                            "usage": _usage_for_results(backend, prompt, results),
+                        })
+                    yield "data: [DONE]\n\n"
+
+                return StreamingResponse(
+                    structured_completion_events(),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+                )
 
             def events():
                 generated_text = ""
@@ -1248,21 +1488,37 @@ def create_app(
         choices = []
         total_prompt_tokens = 0
         total_completion_tokens = 0
-        for i, prompt in enumerate(prompts):
-            result = backend.generate(
-                prompt, max_tokens, f"{_make_id('openai')}-{i}", options=options
-            )
-            result = _apply_stops(result, backend, stop_strings, stop_token_ids)
-            usage = _usage(backend, prompt, result)
-            total_prompt_tokens += usage["prompt_tokens"]
-            total_completion_tokens += usage["completion_tokens"]
-            text = f"{prompt}{result.text}" if echo else result.text
-            choices.append({
-                "text": text,
-                "index": i,
-                "logprobs": None,
-                "finish_reason": result.finish_reason,
-            })
+        choice_index = 0
+        for prompt_index, prompt in enumerate(prompts):
+            total_prompt_tokens += backend.count_tokens(prompt)
+            for j in range(n_choices):
+                offset = prompt_index * n_choices + j
+                result = backend.generate(
+                    prompt,
+                    max_tokens,
+                    f"{_make_id('openai')}-{offset}",
+                    options=_generation_options_for_choice(options, offset),
+                )
+                result = _apply_stops(result, backend, stop_strings, stop_token_ids)
+                completion_tokens = (
+                    len(result.token_ids)
+                    if result.token_ids is not None
+                    else backend.count_tokens(result.text)
+                )
+                total_completion_tokens += completion_tokens
+                text = f"{prompt}{result.text}" if echo else result.text
+                choices.append({
+                    "text": text,
+                    "index": choice_index,
+                    "logprobs": _completion_logprobs(
+                        backend,
+                        text,
+                        None if echo else result.token_ids,
+                        logprobs_count,
+                    ),
+                    "finish_reason": result.finish_reason,
+                })
+                choice_index += 1
         return JSONResponse({
             "id": rid,
             "object": "text_completion",

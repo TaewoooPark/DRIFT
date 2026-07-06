@@ -365,11 +365,13 @@ drift serve --nodes 127.0.0.1:52600,127.0.0.1:52601 --api-key local-dev
 
 Supported text-generation surfaces include `/v1/models`, `/v1/chat/completions`,
 `/v1/completions`, `/v1/responses`, `/v1/embeddings` where the mode can expose
-hidden states, tokenizer helpers, health/readiness, and metrics. Tool-call and
-JSON response-format compatibility are exposed as API-shape layers; DRIFT does
-not execute tools or guarantee strict schema-constrained decoding. Multimodal/audio
-and thin-mode sampling/embeddings return explicit OpenAI-shaped unsupported
-errors. See [docs/openai-compatibility.md](docs/openai-compatibility.md).
+hidden states, tokenizer helpers, health/readiness, and metrics. Multiple choices
+(`n`) and OpenAI-shaped logprobs are accepted for client compatibility. Tool-call
+and JSON response-format compatibility are exposed as API-shape layers; DRIFT does
+not execute tools, compute exact HTTP logprobs yet, or guarantee strict
+schema-constrained decoding. Multimodal/audio and thin-mode sampling/embeddings
+return explicit OpenAI-shaped unsupported errors. See
+[docs/openai-compatibility.md](docs/openai-compatibility.md).
 
 **Customize & fine-tune** — models, split points, devices, troubleshooting — is all in the **operations manual → [docs/manual.md](docs/manual.md)** ([한국어](docs/manual.ko.md) · [中文](docs/manual.zh.md) · [日本語](docs/manual.ja.md)).
 

@@ -114,6 +114,19 @@ def test_openai_python_sdk_smoke(openai_server):
         }],
         tool_choice="required",
     )
+    logprob_chat = client.chat.completions.create(
+        model="drift-test",
+        messages=[{"role": "user", "content": "logprobs please"}],
+        n=2,
+        logprobs=True,
+        top_logprobs=1,
+    )
+    logprob_completion = client.completions.create(
+        model="drift-test",
+        prompt="legacy logprobs",
+        n=2,
+        logprobs=1,
+    )
 
     assert models.data[0].id == "drift-test"
     assert chat.choices[0].message.content == "sdk answer"
@@ -123,3 +136,7 @@ def test_openai_python_sdk_smoke(openai_server):
     assert json.loads(json_chat.choices[0].message.content) == {"response": "sdk answer"}
     assert tool_chat.choices[0].finish_reason == "tool_calls"
     assert tool_chat.choices[0].message.tool_calls[0].function.name == "lookup"
+    assert len(logprob_chat.choices) == 2
+    assert logprob_chat.choices[0].logprobs.content[0].token == "1"
+    assert len(logprob_completion.choices) == 2
+    assert logprob_completion.choices[0].logprobs.tokens == ["1", "2"]

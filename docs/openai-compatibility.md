@@ -24,8 +24,11 @@ wire protocol.
 | `model`, `messages`, `prompt`, `input` | Supported. |
 | `stream`, `stream_options.include_usage` | Supported, including `[DONE]` and usage-only final chunks. |
 | `max_tokens`, `max_completion_tokens`, `max_output_tokens` | Supported. |
+| `n` | Supported up to 16 choices per request. |
 | `temperature`, `top_p`, `top_k`, `min_p`, `seed` | Supported in non-thin mode. |
 | `presence_penalty`, `frequency_penalty`, `repetition_penalty` | Supported in non-thin mode. |
+| Chat `logprobs`, `top_logprobs` | OpenAI response shape supported; logprob values are compatibility placeholders until DRIFT exposes per-token logits through the HTTP adapter. |
+| Completion `logprobs` | OpenAI response shape supported; logprob values are compatibility placeholders. |
 | `stop` strings | Supported for non-streaming and streaming text chunks. |
 | `stop_token_ids` | Supported for non-streaming generation. |
 | `encoding_format=float/base64` for embeddings | Supported. |

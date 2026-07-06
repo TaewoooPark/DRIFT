@@ -284,6 +284,67 @@ def test_required_tool_choice_returns_tool_calls():
     }
 
 
+def test_chat_completion_n_and_logprobs():
+    backend, c = client()
+    res = c.post("/v1/chat/completions", json={
+        "model": "drift-test",
+        "messages": [{"role": "user", "content": "Two answers"}],
+        "n": 2,
+        "logprobs": True,
+        "top_logprobs": 2,
+        "seed": 10,
+    })
+
+    assert res.status_code == 200
+    body = res.json()
+    assert [ch["index"] for ch in body["choices"]] == [0, 1]
+    assert len(body["choices"]) == 2
+    assert body["choices"][0]["logprobs"]["content"][0]["token"] == "tok1"
+    assert body["choices"][0]["logprobs"]["content"][0]["top_logprobs"][0] == {
+        "token": "tok1",
+        "logprob": 0.0,
+        "bytes": [116, 111, 107, 49],
+    }
+    assert [opt["seed"] for opt in backend.options] == [10, 11]
+
+
+def test_chat_streaming_n_and_logprobs_uses_openai_chunk_shape():
+    _, c = client()
+    with c.stream("POST", "/v1/chat/completions", json={
+        "model": "drift-test",
+        "messages": [{"role": "user", "content": "Stream two"}],
+        "stream": True,
+        "n": 2,
+        "logprobs": True,
+        "stream_options": {"include_usage": True},
+    }) as res:
+        text = res.read().decode()
+
+    assert res.status_code == 200
+    events = sse_json_events(text)
+    indexes = [event["choices"][0]["index"] for event in events if event["choices"]]
+    assert 0 in indexes and 1 in indexes
+    assert any(
+        event["choices"]
+        and event["choices"][0].get("logprobs", {}).get("content")
+        for event in events
+    )
+    assert events[-1]["choices"] == []
+    assert events[-1]["usage"]["completion_tokens"] == 6
+
+
+def test_chat_top_logprobs_requires_logprobs_true():
+    _, c = client()
+    res = c.post("/v1/chat/completions", json={
+        "model": "drift-test",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "top_logprobs": 1,
+    })
+
+    assert res.status_code == 400
+    assert res.json()["error"]["param"] == "top_logprobs"
+
+
 def test_completion_non_streaming_single_prompt():
     backend, c = client()
     res = c.post("/v1/completions", json={
@@ -299,6 +360,27 @@ def test_completion_non_streaming_single_prompt():
     assert body["choices"][0]["logprobs"] is None
     assert body["usage"]["completion_tokens"] == 3
     assert backend.prompts == ["Complete this"]
+
+
+def test_completion_n_and_logprobs():
+    backend, c = client()
+    res = c.post("/v1/completions", json={
+        "model": "drift-test",
+        "prompt": "Complete this",
+        "n": 2,
+        "logprobs": 2,
+        "seed": 5,
+    })
+
+    assert res.status_code == 200
+    body = res.json()
+    assert [ch["index"] for ch in body["choices"]] == [0, 1]
+    assert body["choices"][0]["logprobs"]["tokens"] == ["tok1", "tok2", "tok3"]
+    assert body["choices"][0]["logprobs"]["token_logprobs"] == [0.0, 0.0, 0.0]
+    assert body["choices"][0]["logprobs"]["top_logprobs"][0] == {"tok1": 0.0}
+    assert body["usage"]["completion_tokens"] == 6
+    assert backend.prompts == ["Complete this", "Complete this"]
+    assert [opt["seed"] for opt in backend.options] == [5, 6]
 
 
 def test_completion_non_streaming_prompt_array_and_token_ids():
