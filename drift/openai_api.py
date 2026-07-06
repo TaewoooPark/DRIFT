@@ -17,6 +17,9 @@ from dataclasses import dataclass
 from typing import Iterable, Protocol
 
 
+Prompt = str | list[dict]
+
+
 @dataclass
 class GenerationResult:
     text: str
@@ -28,13 +31,13 @@ class OpenAIBackend(Protocol):
     model_id: str
     default_max_tokens: int
 
-    def generate(self, prompt: str, max_tokens: int, session_id: str) -> GenerationResult:
+    def generate(self, prompt: Prompt, max_tokens: int, session_id: str) -> GenerationResult:
         ...
 
-    def stream(self, prompt: str, max_tokens: int, session_id: str) -> Iterable[str]:
+    def stream(self, prompt: Prompt, max_tokens: int, session_id: str) -> Iterable[str]:
         ...
 
-    def count_tokens(self, text: str) -> int:
+    def count_tokens(self, prompt: Prompt) -> int:
         ...
 
 
@@ -53,7 +56,7 @@ class DriftBackend:
         self.default_max_tokens = default_max_tokens
         self._lock = threading.Lock()
 
-    def generate(self, prompt: str, max_tokens: int, session_id: str) -> GenerationResult:
+    def generate(self, prompt: Prompt, max_tokens: int, session_id: str) -> GenerationResult:
         with self._lock:
             out = self.orchestrator.generate(
                 prompt, max_tokens, stop_on_eos=True, session_id=session_id
@@ -63,18 +66,24 @@ class DriftBackend:
         return GenerationResult(text=out.get("text", ""), token_ids=token_ids,
                                 finish_reason=finish)
 
-    def stream(self, prompt: str, max_tokens: int, session_id: str) -> Iterable[str]:
+    def stream(self, prompt: Prompt, max_tokens: int, session_id: str) -> Iterable[str]:
         with self._lock:
             yield from self.orchestrator.generate_stream(
                 prompt, max_tokens, stop_on_eos=True, session_id=session_id
             )
 
-    def count_tokens(self, text: str) -> int:
+    def count_tokens(self, prompt: Prompt) -> int:
+        from .common import build_input_ids
+
         tok = self.orchestrator.head.tokenizer
         try:
-            ids = tok(text, return_tensors=None).input_ids
+            ids = build_input_ids(tok, prompt)
         except Exception:
             return 0
+        try:
+            return int(ids.shape[-1])
+        except Exception:
+            pass
         if ids and isinstance(ids[0], list):
             return len(ids[0])
         return len(ids or [])
@@ -101,6 +110,7 @@ class OpenAIHTTPError(Exception):
 def _require_starlette():
     try:
         from starlette.applications import Starlette
+        from starlette.middleware.base import BaseHTTPMiddleware
         from starlette.requests import Request
         from starlette.responses import JSONResponse, StreamingResponse
         from starlette.routing import Route
@@ -108,7 +118,7 @@ def _require_starlette():
         raise RuntimeError(
             "drift serve requires the HTTP extras: install starlette and uvicorn"
         ) from e
-    return Starlette, Request, JSONResponse, StreamingResponse, Route
+    return Starlette, BaseHTTPMiddleware, Request, JSONResponse, StreamingResponse, Route
 
 
 def _now() -> int:
@@ -151,10 +161,10 @@ def _content_to_text(content, param: str) -> str:
     raise OpenAIHTTPError(400, f"{param} must be a string or content-part array", param=param)
 
 
-def render_chat_prompt(messages: list[dict]) -> str:
+def normalize_chat_messages(messages: list[dict]) -> list[dict]:
     if not isinstance(messages, list) or not messages:
         raise OpenAIHTTPError(400, "`messages` must be a non-empty array", param="messages")
-    lines: list[str] = []
+    normalized: list[dict] = []
     for i, msg in enumerate(messages):
         if not isinstance(msg, dict):
             raise OpenAIHTTPError(400, f"messages[{i}] must be an object",
@@ -163,10 +173,26 @@ def render_chat_prompt(messages: list[dict]) -> str:
         if role not in {"system", "developer", "user", "assistant", "tool"}:
             raise OpenAIHTTPError(400, f"unsupported message role: {role!r}",
                                   param=f"messages[{i}].role")
+        if msg.get("tool_calls"):
+            raise OpenAIHTTPError(
+                400,
+                "assistant tool calls are not supported by this DRIFT endpoint yet",
+                param=f"messages[{i}].tool_calls",
+                code="unsupported_tools",
+            )
         text = _content_to_text(msg.get("content"), f"messages[{i}].content")
+        if role == "developer":
+            role = "system"
+        normalized.append({"role": role, "content": text})
+    return normalized
+
+
+def render_chat_prompt(messages: list[dict]) -> str:
+    lines: list[str] = []
+    for msg in normalize_chat_messages(messages):
+        text = msg.get("content") or ""
         if text:
-            label = "system" if role == "developer" else role
-            lines.append(f"{label.capitalize()}: {text}")
+            lines.append(f"{msg['role'].capitalize()}: {text}")
     lines.append("Assistant:")
     return "\n".join(lines)
 
@@ -196,6 +222,20 @@ def _validate_max_tokens(body: dict, backend: OpenAIBackend) -> int:
 
 
 def _validate_stage1_options(body: dict) -> None:
+    known = {
+        "model", "messages", "max_tokens", "max_completion_tokens", "stream",
+        "stream_options", "temperature", "top_p", "n", "stop", "presence_penalty",
+        "frequency_penalty", "repetition_penalty", "seed", "user", "tools",
+        "tool_choice", "functions", "function_call", "logprobs", "top_logprobs",
+        "response_format", "logit_bias",
+    }
+    unknown = sorted(set(body) - known)
+    if unknown:
+        raise OpenAIHTTPError(
+            400,
+            f"unsupported request field(s): {', '.join(unknown)}",
+            code="unsupported_parameter",
+        )
     try:
         n = int(body.get("n", 1))
     except (TypeError, ValueError):
@@ -210,9 +250,52 @@ def _validate_stage1_options(body: dict) -> None:
             param="temperature",
             code="unsupported_sampling",
         )
+    top_p = body.get("top_p")
+    if top_p not in (None, 1, 1.0):
+        raise OpenAIHTTPError(
+            400,
+            "sampling is not implemented yet; omit `top_p` or set it to 1",
+            param="top_p",
+            code="unsupported_sampling",
+        )
+    for key in ("presence_penalty", "frequency_penalty", "repetition_penalty"):
+        if body.get(key) not in (None, 0, 0.0):
+            raise OpenAIHTTPError(
+                400,
+                f"`{key}` is not supported until generation controls land",
+                param=key,
+                code="unsupported_sampling",
+            )
+    if body.get("seed") is not None:
+        raise OpenAIHTTPError(
+            400, "`seed` is not supported until sampling lands",
+            param="seed", code="unsupported_sampling"
+        )
+    if body.get("stop") not in (None, [], ""):
+        raise OpenAIHTTPError(
+            400, "`stop` is not supported until stop-string handling lands",
+            param="stop", code="unsupported_parameter"
+        )
+    if body.get("logit_bias") not in (None, {}):
+        raise OpenAIHTTPError(
+            400, "`logit_bias` is not supported by this endpoint stage yet",
+            param="logit_bias", code="unsupported_parameter"
+        )
+    response_format = body.get("response_format")
+    if response_format not in (None, {}):
+        if not isinstance(response_format, dict):
+            raise OpenAIHTTPError(400, "`response_format` must be an object",
+                                  param="response_format")
+        if response_format.get("type", "text") != "text":
+            raise OpenAIHTTPError(
+                400,
+                "only text response_format is supported by this endpoint stage",
+                param="response_format",
+                code="unsupported_parameter",
+            )
     unsupported = [
         "tools", "tool_choice", "functions", "function_call", "logprobs",
-        "top_logprobs", "response_format",
+        "top_logprobs",
     ]
     for key in unsupported:
         if key in body and body[key] not in (None, [], {}, "none"):
@@ -243,9 +326,20 @@ def _usage(backend: OpenAIBackend, prompt: str, result: GenerationResult) -> dic
 
 
 def create_app(backend: OpenAIBackend):
-    Starlette, Request, JSONResponse, StreamingResponse, Route = _require_starlette()
+    Starlette, BaseHTTPMiddleware, Request, JSONResponse, StreamingResponse, Route = (
+        _require_starlette()
+    )
+
+    class RequestIDMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next):
+            request_id = request.headers.get("x-request-id") or _make_id("req")
+            request.state.request_id = request_id
+            response = await call_next(request)
+            response.headers["x-request-id"] = request_id
+            return response
 
     async def openai_error_handler(request: Request, exc: OpenAIHTTPError):
+        request_id = getattr(request.state, "request_id", _make_id("req"))
         return JSONResponse(
             {
                 "error": {
@@ -256,6 +350,7 @@ def create_app(backend: OpenAIBackend):
                 }
             },
             status_code=exc.status_code,
+            headers={"x-request-id": request_id},
         )
 
     async def health(request: Request):
@@ -282,7 +377,7 @@ def create_app(backend: OpenAIBackend):
         model = _validate_model(body, backend)
         _validate_stage1_options(body)
         max_tokens = _validate_max_tokens(body, backend)
-        prompt = render_chat_prompt(body.get("messages"))
+        prompt = normalize_chat_messages(body.get("messages"))
         stream = bool(body.get("stream", False))
         include_usage = _include_stream_usage(body)
         created = _now()
@@ -362,6 +457,7 @@ def create_app(backend: OpenAIBackend):
         Route("/v1/chat/completions", chat_completions, methods=["POST"]),
     ]
     app = Starlette(routes=routes, exception_handlers={OpenAIHTTPError: openai_error_handler})
+    app.add_middleware(RequestIDMiddleware)
     return app
 
 
