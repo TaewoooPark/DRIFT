@@ -27,8 +27,14 @@ import threading
 import time
 
 from .common import free_port, load_config, pick_device
-from .orchestrator import build_inprocess
 from .run import _expand_members, build_over_nodes
+
+
+def _build_inprocess(cfg: dict):
+    from .orchestrator import build_inprocess
+
+    return build_inprocess(cfg)
+
 
 _CASES = [
     ("Give me a short introduction to large language models.", 32),
@@ -77,7 +83,7 @@ def _int8_test(cfg, model_id, dtype, dev, args) -> int:
     hidden = getattr(AutoConfig.from_pretrained(model_id), "hidden_size", None) or \
         AutoConfig.from_pretrained(model_id).text_config.hidden_size
     print(f"[itest:int8] building in-process reference (fp16) …", flush=True)
-    ref = build_inprocess(cfg)
+    ref = _build_inprocess(cfg)
 
     ports, procs = spawn_nodes(args.nodes)
     try:
@@ -188,7 +194,7 @@ def _expand_test(cfg, model_id, dtype, dev, args) -> int:
 
     N = args.expand
     print(f"[itest:expand] building in-process reference …", flush=True)
-    ref = build_inprocess(cfg)
+    ref = _build_inprocess(cfg)
 
     def _spawn(port, extra):
         env = dict(os.environ)
@@ -289,7 +295,7 @@ def _kill_test(cfg, model_id, dtype, dev, args) -> int:
     prompt, n = "Count from one to forty in words.", 48
 
     print(f"[itest:{tag}] building in-process reference …", flush=True)
-    ref = build_inprocess(cfg)
+    ref = _build_inprocess(cfg)
     ref_ids = ref.generate(prompt, n, stop_on_eos=False, session_id="ref")["token_ids"]
 
     print(f"[itest:{tag}] spawning {args.nodes} active + 1 spare node(s) …", flush=True)
@@ -393,7 +399,7 @@ def main(argv=None) -> int:
            ("+secure" if args.secure else "") + ("+thin" if args.thin else "")
 
     print(f"[itest:{topo}] building in-process reference …", flush=True)
-    ref = build_inprocess(cfg)
+    ref = _build_inprocess(cfg)
 
     print(f"[itest:{topo}] spawning {args.nodes} local node(s) …", flush=True)
     ports, procs = spawn_nodes(args.nodes)

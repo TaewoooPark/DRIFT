@@ -34,9 +34,18 @@ import binascii
 import os
 import struct
 
-import msgpack
 
-from . import protocol
+def _msgpack():
+    import msgpack
+
+    return msgpack
+
+
+def _protocol():
+    from . import protocol
+
+    return protocol
+
 
 # 256 MB: generous for a long-prompt prefill tensor, but bounds a hostile length
 # prefix so a peer can't make us allocate gigabytes (the 4B prefix allows 4 GB).
@@ -142,10 +151,10 @@ class PlainChannel:
         self.sock = sock
 
     def send(self, obj) -> None:
-        protocol.send_msg(self.sock, obj)
+        _protocol().send_msg(self.sock, obj)
 
     def recv(self) -> dict:
-        return protocol.recv_msg(self.sock)
+        return _protocol().recv_msg(self.sock)
 
     def close(self) -> None:
         try:
@@ -171,12 +180,15 @@ class SecureChannel:
         return ctr.to_bytes(12, "big")
 
     def send(self, obj) -> None:
+        msgpack = _msgpack()
         body = msgpack.packb(obj, use_bin_type=True)
         ct = self._enc.encrypt(self._nonce(self._sctr), body, None)
         self._sctr += 1
         self.sock.sendall(struct.pack(">I", len(ct)) + ct)
 
     def recv(self) -> dict:
+        msgpack = _msgpack()
+        protocol = _protocol()
         (n,) = struct.unpack(">I", protocol._recvn(self.sock, 4))
         if n > MAX_FRAME_BYTES:
             raise ValueError(f"secure frame length {n} exceeds cap {MAX_FRAME_BYTES}")
@@ -218,6 +230,7 @@ def _peer_pub(raw: bytes):
 
 
 def client_handshake(sock, psk: bytes) -> SecureChannel:
+    protocol = _protocol()
     priv, pub = _eph()
     nonce_c = os.urandom(16)
     protocol.send_msg(sock, {"drift_hs": 1, "eph": pub, "nonce": nonce_c})
@@ -230,6 +243,7 @@ def client_handshake(sock, psk: bytes) -> SecureChannel:
 
 
 def server_handshake(sock, psk: bytes) -> SecureChannel:
+    protocol = _protocol()
     hello = protocol.recv_msg(sock)
     if hello.get("drift_hs") != 1:
         raise ConnectionError("peer is not speaking the DRIFT secure handshake (key mismatch?)")

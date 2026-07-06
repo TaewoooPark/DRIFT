@@ -8,17 +8,37 @@ the same decode loop runs over an in-process callable (M2) or a socket client
 from __future__ import annotations
 
 import argparse
+from functools import wraps
 import queue
 import socket
 import sys
 import threading
 
-import torch
-
-from . import crypto, protocol, receipts
+from . import crypto, receipts
 from .common import build_input_ids, lan_ip, load_config
-from .engine_torch import TorchShardEngine
 from .receipts import ReceiptVerifier
+
+
+def _torch():
+    import torch
+
+    return torch
+
+
+def _protocol():
+    from . import protocol
+
+    return protocol
+
+
+def _no_grad(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        torch = _torch()
+        with torch.no_grad():
+            return fn(*args, **kwargs)
+
+    return wrapper
 
 
 class NodeUnavailable(RuntimeError):
@@ -65,6 +85,7 @@ class HeadModel:
                                       need_rotary=False, tie=tie)
         else:
             # In-process (M2 baseline): full model, shared with the shard engines.
+            torch = _torch()
             torch_dtype = {"float16": torch.float16, "float32": torch.float32,
                            "bfloat16": torch.bfloat16}[dtype]
             self.lm = transformers.AutoModelForCausalLM.from_pretrained(model_id, dtype=torch_dtype)
@@ -72,15 +93,15 @@ class HeadModel:
         self.inner = self.lm.model
         self.tokenizer = transformers.AutoTokenizer.from_pretrained(model_id)
 
-    @torch.no_grad()
+    @_no_grad
     def embed(self, input_ids):
         return self.inner.embed_tokens(input_ids.to(self.device))
 
-    @torch.no_grad()
+    @_no_grad
     def norm(self, hidden):
         return self.inner.norm(hidden)
 
-    @torch.no_grad()
+    @_no_grad
     def head(self, hidden):
         return self.lm.lm_head(hidden)
 
@@ -158,6 +179,7 @@ class SocketTransport:
 
     def forward(self, name, session_id, hidden, position_ids, input_ids, mode):
         self.seq += 1
+        protocol = _protocol()
         tb, scale = protocol.tensor_to_wire(hidden, self.wire_dtype)
         msg = {
             "type": mode,
@@ -180,6 +202,7 @@ class SocketTransport:
 
     def route(self, names, session_id, hidden, position_ids, input_ids, mode):
         """Star routing: every hop round-trips through the head (2N crossings/token)."""
+        protocol = _protocol()
         self.last_receipts = []
         self.last_anchor_in = receipts.hash_bytes(protocol.tensor_to_bytes(hidden, self.dtype))
         for name in names:
@@ -299,6 +322,7 @@ class ChainTransport(SocketTransport):
 
     def route(self, names, session_id, hidden, position_ids, input_ids, mode):
         self.seq += 1
+        protocol = _protocol()
         first = names[0]
         downstream = [[self.shards[n]["host"], self.shards[n]["port"]] for n in names[1:]]
         tb, scale = protocol.tensor_to_wire(hidden, self.wire_dtype)
@@ -420,6 +444,7 @@ class Orchestrator:
                                              list(range(len(seq_ids))), "prefill")
             self._check_receipts()
             return nid, None
+        torch = _torch()
         hidden = self.head.embed(torch.tensor([seq_ids], device=self.device))
         hidden = self.transport.route(self.order, session_id, hidden,
                                       list(range(len(seq_ids))), seq_ids, "prefill").to(self.device)
@@ -435,6 +460,7 @@ class Orchestrator:
             if return_logits:
                 raise ValueError("sampling is not available in thin-head mode")
             return nid
+        torch = _torch()
         hidden = self.head.embed(torch.tensor([[tok_id]], device=self.device))
         hidden = self.transport.route(self.order, session_id, hidden, [pos], [tok_id],
                                       "decode").to(self.device)
@@ -474,6 +500,7 @@ class Orchestrator:
         The default branch is exactly the old argmax path. Sampling runs on CPU so
         a seeded torch.Generator gives deterministic draws independent of MPS/CUDA.
         """
+        torch = _torch()
         if not self._sampling_enabled(opts):
             return int(torch.argmax(logits, dim=-1))
 
@@ -555,9 +582,10 @@ class Orchestrator:
             except Exception:
                 pass
 
-    @torch.no_grad()
+    @_no_grad
     def generate(self, prompt: str | list[dict], max_new_tokens: int, stop_on_eos: bool = False,
                  session_id: str = "s0", generation_options: dict | None = None) -> dict:
+        torch = _torch()
         tok = self.head.tokenizer
         input_ids = build_input_ids(tok, prompt).to(self.device)
         prompt_ids = input_ids[0].tolist()
@@ -604,7 +632,7 @@ class Orchestrator:
             self.transport.reset(name, session_id)
         return {"token_ids": generated, "first_logits": first_logits, "text": tok.decode(generated)}
 
-    @torch.no_grad()
+    @_no_grad
     def generate_stream(self, prompt: str | list[dict], max_new_tokens: int,
                         stop_on_eos: bool = True,
                         session_id: str = "s0", generation_options: dict | None = None):
@@ -623,6 +651,7 @@ class Orchestrator:
         through _prefill/_decode (which the gates already prove bitwise) fixes all
         four at once.
         """
+        torch = _torch()
         tok = self.head.tokenizer
         input_ids = build_input_ids(tok, prompt).to(self.device)
         prompt_ids = input_ids[0].tolist()
@@ -680,6 +709,8 @@ class Orchestrator:
 # ----------------------------------------------------------- builders / CLI
 def build_inprocess(cfg: dict) -> Orchestrator:
     """M2: one shared model; engines reference its disjoint layer slices."""
+    from .engine_torch import TorchShardEngine
+
     device = cfg.get("device", "cpu")
     head = HeadModel(cfg["model_id"], device, cfg.get("dtype", "float16"))
     engines = {}

@@ -40,7 +40,6 @@ import time
 import numpy as np
 
 from .common import build_input_ids, load_config
-from .orchestrator import build_inprocess, build_socket
 
 
 # Mirrors parity_test._SELFTEST_CASES so the benchmark reports on the exact
@@ -358,6 +357,8 @@ def measure_overhead(cfg: dict, orch_inproc, do_socket: bool) -> dict:
         # separate ping connection would occupy that loop and the orchestrator's
         # own connection would never be accepted -> deadlock. One persistent
         # connection per shard, used for both ping and timing, is the contract.
+        from .orchestrator import build_socket
+
         orch_socket = build_socket(cfg, ports)
         transport = orch_socket.transport
         deadline = time.time() + 180
@@ -428,6 +429,8 @@ def main(argv=None) -> int:
     results["wire"] = measure_wire(cfg)
 
     # 1 + 3 · fidelity and M2 overhead share one in-process orchestrator
+    from .orchestrator import build_inprocess
+
     orch = build_inprocess(cfg)
     results["fidelity"] = measure_fidelity(cfg, orch, cases)
     results["overhead"] = measure_overhead(cfg, orch, do_socket=not args.no_socket)

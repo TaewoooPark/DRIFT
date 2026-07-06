@@ -33,9 +33,14 @@ import binascii
 import hashlib
 import json
 
-import msgpack
-
 from . import crypto
+
+
+def _msgpack():
+    import msgpack
+
+    return msgpack
+
 
 # Fields covered by the signature, in a fixed order → deterministic to sign/verify.
 _SIGNED = ("node", "session", "seq", "mode", "start", "end", "in_hash", "out_hash")
@@ -47,11 +52,11 @@ def hash_bytes(b: bytes) -> bytes:
 
 def hash_ints(ints) -> bytes:
     """Hash a list of ints (token ids / a single token) canonically."""
-    return hashlib.sha256(msgpack.packb([int(x) for x in ints], use_bin_type=True)).digest()
+    return hashlib.sha256(_msgpack().packb([int(x) for x in ints], use_bin_type=True)).digest()
 
 
 def _canon(r: dict) -> bytes:
-    return msgpack.packb([r[k] for k in _SIGNED], use_bin_type=True)
+    return _msgpack().packb([r[k] for k in _SIGNED], use_bin_type=True)
 
 
 def make_receipt(sk, pub_hex: str, session: str, seq: int, mode: str,
