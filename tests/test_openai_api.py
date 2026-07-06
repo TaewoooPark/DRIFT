@@ -85,6 +85,15 @@ def test_models_endpoint():
     }
 
 
+def test_ready_endpoint_reports_capabilities_without_auth():
+    backend = FakeBackend()
+    c = TestClient(create_app(backend, api_keys=["secret"]))
+    res = c.get("/ready")
+
+    assert res.status_code == 200
+    assert res.json()["capabilities"]["sampling"] is True
+
+
 def test_chat_completion_non_streaming():
     backend, c = client()
     res = c.post("/v1/chat/completions", json={
@@ -395,3 +404,30 @@ def test_embeddings_unsupported_mode_error():
 
     assert res.status_code == 400
     assert res.json()["error"]["code"] == "unsupported_embeddings"
+
+
+def test_api_key_auth_protects_openai_routes():
+    backend = FakeBackend()
+    c = TestClient(create_app(backend, api_keys=["secret"]))
+
+    missing = c.get("/v1/models", headers={"x-request-id": "req-auth"})
+    bearer = c.get("/v1/models", headers={"authorization": "Bearer secret"})
+    header = c.get("/v1/models", headers={"x-api-key": "secret"})
+
+    assert missing.status_code == 401
+    assert missing.headers["x-request-id"] == "req-auth"
+    assert missing.json()["error"]["code"] == "invalid_api_key"
+    assert bearer.status_code == 200
+    assert header.status_code == 200
+
+
+def test_cors_preflight_when_enabled():
+    backend = FakeBackend()
+    c = TestClient(create_app(backend, cors_origins=["https://example.com"]))
+    res = c.options("/v1/models", headers={
+        "origin": "https://example.com",
+        "access-control-request-method": "GET",
+    })
+
+    assert res.status_code == 200
+    assert res.headers["access-control-allow-origin"] == "https://example.com"

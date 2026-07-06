@@ -9,8 +9,10 @@ TCP+msgpack protocol.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
 import json
+import os
 import struct
 import threading
 import time
@@ -184,6 +186,7 @@ def _require_starlette():
     try:
         from starlette.applications import Starlette
         from starlette.middleware.base import BaseHTTPMiddleware
+        from starlette.middleware.cors import CORSMiddleware
         from starlette.requests import Request
         from starlette.responses import JSONResponse, StreamingResponse
         from starlette.routing import Route
@@ -191,7 +194,10 @@ def _require_starlette():
         raise RuntimeError(
             "drift serve requires the HTTP extras: install starlette and uvicorn"
         ) from e
-    return Starlette, BaseHTTPMiddleware, Request, JSONResponse, StreamingResponse, Route
+    return (
+        Starlette, BaseHTTPMiddleware, CORSMiddleware, Request,
+        JSONResponse, StreamingResponse, Route,
+    )
 
 
 def _now() -> int:
@@ -605,9 +611,21 @@ def _usage(backend: OpenAIBackend, prompt: str, result: GenerationResult) -> dic
     }
 
 
-def create_app(backend: OpenAIBackend):
-    Starlette, BaseHTTPMiddleware, Request, JSONResponse, StreamingResponse, Route = (
+def create_app(
+    backend: OpenAIBackend,
+    *,
+    api_keys: list[str] | None = None,
+    cors_origins: list[str] | None = None,
+    max_concurrent_requests: int | None = None,
+):
+    Starlette, BaseHTTPMiddleware, CORSMiddleware, Request, JSONResponse, StreamingResponse, Route = (
         _require_starlette()
+    )
+    api_key_set = {k for k in (api_keys or []) if k}
+    protected_paths = (
+        "/v1/models", "/v1/chat/completions", "/v1/completions",
+        "/v1/embeddings", "/tokenize", "/detokenize", "/v1/tokenize",
+        "/v1/detokenize",
     )
 
     class RequestIDMiddleware(BaseHTTPMiddleware):
@@ -617,6 +635,37 @@ def create_app(backend: OpenAIBackend):
             response = await call_next(request)
             response.headers["x-request-id"] = request_id
             return response
+
+    class AuthMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next):
+            if api_key_set and request.url.path in protected_paths:
+                auth = request.headers.get("authorization") or ""
+                token = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
+                token = token or request.headers.get("x-api-key", "")
+                if token not in api_key_set:
+                    request_id = request.headers.get("x-request-id") or _make_id("req")
+                    return JSONResponse(
+                        {
+                            "error": {
+                                "message": "missing or invalid API key",
+                                "type": "authentication_error",
+                                "param": None,
+                                "code": "invalid_api_key",
+                            }
+                        },
+                        status_code=401,
+                        headers={"www-authenticate": "Bearer", "x-request-id": request_id},
+                    )
+            return await call_next(request)
+
+    class ConcurrencyLimitMiddleware(BaseHTTPMiddleware):
+        def __init__(self, app, limit: int):
+            super().__init__(app)
+            self._sem = asyncio.Semaphore(limit)
+
+        async def dispatch(self, request: Request, call_next):
+            async with self._sem:
+                return await call_next(request)
 
     async def openai_error_handler(request: Request, exc: OpenAIHTTPError):
         request_id = getattr(request.state, "request_id", _make_id("req"))
@@ -635,6 +684,19 @@ def create_app(backend: OpenAIBackend):
 
     async def health(request: Request):
         return JSONResponse({"status": "ok", "model": backend.model_id})
+
+    async def ready(request: Request):
+        return JSONResponse({
+            "status": "ready",
+            "model": backend.model_id,
+            "context_length": getattr(backend, "context_length", None),
+            "capabilities": {
+                "chat": True,
+                "completion": True,
+                "embedding": bool(getattr(backend, "supports_embeddings", False)),
+                "sampling": bool(getattr(backend, "supports_sampling", False)),
+            },
+        })
 
     async def models(request: Request):
         return JSONResponse({
@@ -978,6 +1040,7 @@ def create_app(backend: OpenAIBackend):
 
     routes = [
         Route("/health", health, methods=["GET"]),
+        Route("/ready", ready, methods=["GET"]),
         Route("/v1/models", models, methods=["GET"]),
         Route("/v1/chat/completions", chat_completions, methods=["POST"]),
         Route("/v1/completions", completions, methods=["POST"]),
@@ -988,6 +1051,16 @@ def create_app(backend: OpenAIBackend):
         Route("/v1/detokenize", detokenize, methods=["POST"]),
     ]
     app = Starlette(routes=routes, exception_handlers={OpenAIHTTPError: openai_error_handler})
+    if cors_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=cors_origins,
+            allow_methods=["GET", "POST", "OPTIONS"],
+            allow_headers=["authorization", "content-type", "x-api-key", "x-request-id"],
+        )
+    if max_concurrent_requests and max_concurrent_requests > 0:
+        app.add_middleware(ConcurrencyLimitMiddleware, limit=max_concurrent_requests)
+    app.add_middleware(AuthMiddleware)
     app.add_middleware(RequestIDMiddleware)
     return app
 
@@ -1020,13 +1093,19 @@ def build_backend_from_args(args) -> DriftBackend:
     return DriftBackend(orch, args.served_model_name or model_id, default_max_tokens=n_new)
 
 
+def _split_csv(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [x.strip() for x in value.split(",") if x.strip()]
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         prog="drift serve",
         description="serve DRIFT through an OpenAI-compatible HTTP API")
     ap.add_argument("--config", default="config.yaml")
-    ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--host", default=os.environ.get("DRIFT_SERVE_HOST", "127.0.0.1"))
+    ap.add_argument("--port", type=int, default=int(os.environ.get("DRIFT_SERVE_PORT", "8000")))
     ap.add_argument("--nodes", help="comma-separated host:port of running `drift node`s")
     ap.add_argument("--no-discover", action="store_true", help="skip LAN auto-discovery")
     ap.add_argument("--discover-timeout", type=float, default=3.0)
@@ -1042,17 +1121,30 @@ def main(argv=None) -> int:
                     help="send the hidden state as int8 (half the wire bytes; lossy, relaxed gate)")
     ap.add_argument("--expand", action="store_true",
                     help="treat --nodes as seeds and split across the discovered membership")
+    ap.add_argument("--api-key", action="append", default=_split_csv(os.environ.get("DRIFT_API_KEY")),
+                    help="require this HTTP API key (repeatable; also DRIFT_API_KEY=csv)")
+    ap.add_argument("--cors-origin", action="append",
+                    default=_split_csv(os.environ.get("DRIFT_CORS_ORIGINS")),
+                    help="allowed CORS origin (repeatable; also DRIFT_CORS_ORIGINS=csv)")
+    ap.add_argument("--max-concurrent-requests", type=int, default=8,
+                    help="HTTP request concurrency limit; generation is still serialized per backend")
+    ap.add_argument("--no-access-log", action="store_true", help="disable uvicorn access logs")
     args = ap.parse_args(argv)
 
     backend = build_backend_from_args(args)
-    app = create_app(backend)
+    app = create_app(
+        backend,
+        api_keys=args.api_key,
+        cors_origins=args.cors_origin,
+        max_concurrent_requests=args.max_concurrent_requests,
+    )
     try:
         import uvicorn
     except ImportError as e:
         raise RuntimeError("drift serve requires uvicorn") from e
     print(f"[serve] OpenAI-compatible API listening on http://{args.host}:{args.port}/v1",
           flush=True)
-    uvicorn.run(app, host=args.host, port=args.port)
+    uvicorn.run(app, host=args.host, port=args.port, access_log=not args.no_access_log)
     return 0
 
 
