@@ -356,6 +356,27 @@ export DRIFT_JOURNAL=~/drift.jsonl && drift run --chain --prompt "…"
 drift ledger ~/drift.jsonl --verify           # per-node contribution, signatures re-checked
 ```
 
+**OpenAI 互換のローカルバックエンドとして配信** — モデルは引き続き DRIFT
+ノード群に分散して実行され、クライアント向けの表面だけが HTTP/SSE になります:
+
+```bash
+drift serve --nodes 127.0.0.1:52600,127.0.0.1:52601 --api-key local-dev
+```
+
+対応する text-generation の表面には `/v1/models`、`/v1/chat/completions`、
+`/v1/completions`、`/v1/responses`、hidden state を公開できるモードでの
+`/v1/embeddings`、tokenizer helpers、health/readiness、metrics が含まれます。
+複数候補 (`n`) と OpenAI 形状の logprobs を受け付け、logits を公開できる DRIFT
+実行では実際の logits に基づく selected-token/top-k logprobs を返します。
+Tool-call と JSON response-format は API shape 互換レイヤーとして提供され、
+Responses streaming は semantic SSE events を送出します。DRIFT は tools を
+サーバー側で実行せず、厳密な schema-constrained decoding も保証しません。
+Multimodal/audio と thin-mode sampling/embeddings は明示的な OpenAI 形状の
+unsupported error を返します。対応範囲は
+[docs/openai-compatibility.md](docs/openai-compatibility.md)、チェックリスト監査、
+Python/JS SDK smoke、残る full-stack gate は
+[docs/openai-compatibility-audit.md](docs/openai-compatibility-audit.md) にまとめています。
+
 **カスタマイズとチューニング** — モデル、分割点、デバイス、トラブルシューティング — はすべて **運用マニュアル → [docs/manual.ja.md](docs/manual.ja.md)** にあります（[English](docs/manual.md) · [한국어](docs/manual.ko.md) · [中文](docs/manual.zh.md)）。
 
 **ライブで見る** — [**DRIFT-Demo**](https://github.com/TaewoooPark/DRIFT-Demo)：実際の実行を 2 画面で可視化するデモです — ワイヤを渡る residual stream、レイヤーごとの ‖Δh‖、テイルノード自身が計算する top-k、署名レシート、貢献台帳まで、すべてのピクセルがライブトラフィックから描かれ、DRIFT のソースには一切手を加えていません。
