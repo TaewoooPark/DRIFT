@@ -1,6 +1,8 @@
 import json
 import base64
+import asyncio
 import struct
+import threading
 
 from starlette.testclient import TestClient
 
@@ -18,12 +20,14 @@ class FakeBackend:
         self.options = []
         self.supports_sampling = True
         self.supports_embeddings = True
+        self.lock = threading.Lock()
 
     def generate(self, prompt, max_tokens: int, session_id: str,
                  options: dict | None = None) -> GenerationResult:
-        self.prompts.append(prompt)
-        self.sessions.append(session_id)
-        self.options.append(options or {})
+        with self.lock:
+            self.prompts.append(prompt)
+            self.sessions.append(session_id)
+            self.options.append(options or {})
         return GenerationResult(
             text="hello from drift",
             token_ids=[1, 2, 3],
@@ -43,9 +47,10 @@ class FakeBackend:
 
     def stream(self, prompt, max_tokens: int, session_id: str,
                options: dict | None = None):
-        self.prompts.append(prompt)
-        self.sessions.append(session_id)
-        self.options.append(options or {})
+        with self.lock:
+            self.prompts.append(prompt)
+            self.sessions.append(session_id)
+            self.options.append(options or {})
         yield "hello"
         yield " from"
         yield " drift"
@@ -66,8 +71,9 @@ class FakeBackend:
         return [len(part) for part in text.split()]
 
     def embed(self, prompt, session_id: str) -> list[float]:
-        self.prompts.append(prompt)
-        self.sessions.append(session_id)
+        with self.lock:
+            self.prompts.append(prompt)
+            self.sessions.append(session_id)
         return [0.25, 0.5, 0.75]
 
 
@@ -137,6 +143,45 @@ def test_chat_completion_non_streaming():
     ]
 
 
+def test_chat_accepts_all_text_roles_and_tool_followups():
+    backend, c = client()
+    res = c.post("/v1/chat/completions", json={
+        "model": "drift-test",
+        "messages": [
+            {"role": "system", "content": "System rule"},
+            {"role": "developer", "content": "Developer rule"},
+            {"role": "user", "content": [{"type": "text", "text": "Question"}]},
+            {
+                "role": "assistant",
+                "content": "I will call a tool",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{\"q\":\"x\"}"},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "Tool answer"},
+        ],
+    })
+
+    assert res.status_code == 200
+    assert backend.prompts[0] == [
+        {"role": "system", "content": "System rule"},
+        {"role": "system", "content": "Developer rule"},
+        {"role": "user", "content": "Question"},
+        {
+            "role": "assistant",
+            "content": (
+                "I will call a tool\n"
+                "Tool calls: [{\"id\": \"call-1\", \"type\": \"function\", "
+                "\"function\": {\"name\": \"lookup\", \"arguments\": "
+                "\"{\\\"q\\\":\\\"x\\\"}\"}}]"
+            ),
+        },
+        {"role": "tool", "content": "Tool answer"},
+    ]
+
+
 def test_chat_completion_streaming():
     _, c = client()
     with c.stream("POST", "/v1/chat/completions", json={
@@ -170,6 +215,25 @@ def test_rejects_unknown_model_with_openai_error_shape():
     assert res.headers["x-request-id"] == "req-test"
     body = res.json()
     assert body["error"]["code"] == "model_not_found"
+
+
+def test_malformed_json_and_unknown_fields_are_openai_shaped():
+    _, c = client()
+    bad_json = c.post(
+        "/v1/chat/completions",
+        content="{not-json",
+        headers={"content-type": "application/json"},
+    )
+    unknown = c.post("/v1/chat/completions", json={
+        "model": "drift-test",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "unknown_parameter": True,
+    })
+
+    assert bad_json.status_code == 400
+    assert bad_json.json()["error"]["message"] == "request body must be valid JSON"
+    assert unknown.status_code == 400
+    assert unknown.json()["error"]["code"] == "unsupported_parameter"
 
 
 def test_passes_sampling_options_to_backend():
@@ -297,6 +361,94 @@ def test_required_tool_choice_returns_tool_calls():
     assert json.loads(choice["message"]["tool_calls"][0]["function"]["arguments"]) == {
         "query": ""
     }
+
+
+def test_auto_tool_choice_promotes_model_emitted_tool_call_json():
+    class ToolJSONBackend(FakeBackend):
+        def generate(self, prompt, max_tokens: int, session_id: str,
+                     options: dict | None = None) -> GenerationResult:
+            with self.lock:
+                self.prompts.append(prompt)
+                self.sessions.append(session_id)
+                self.options.append(options or {})
+            return GenerationResult(
+                text='{"tool_call":{"name":"lookup","arguments":{"query":"drift"}}}',
+                token_ids=[1],
+            )
+
+    backend = ToolJSONBackend()
+    c = TestClient(create_app(backend))
+    res = c.post("/v1/chat/completions", json={
+        "model": "drift-test",
+        "messages": [{"role": "user", "content": "Use a tool"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+            },
+        }],
+        "tool_choice": "auto",
+    })
+
+    assert res.status_code == 200
+    choice = res.json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["tool_calls"][0]["function"] == {
+        "name": "lookup",
+        "arguments": "{\"query\":\"drift\"}",
+    }
+
+
+def test_legacy_functions_and_function_call_are_accepted():
+    _, c = client()
+    res = c.post("/v1/chat/completions", json={
+        "model": "drift-test",
+        "messages": [{"role": "user", "content": "Use a legacy function"}],
+        "functions": [{
+            "name": "lookup",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        }],
+        "function_call": {"name": "lookup"},
+    })
+
+    assert res.status_code == 200
+    choice = res.json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["tool_calls"][0]["function"]["name"] == "lookup"
+
+
+def test_finish_reason_length_is_propagated():
+    class LengthBackend(FakeBackend):
+        def generate(self, prompt, max_tokens: int, session_id: str,
+                     options: dict | None = None) -> GenerationResult:
+            with self.lock:
+                self.prompts.append(prompt)
+                self.sessions.append(session_id)
+                self.options.append(options or {})
+            return GenerationResult(
+                text="tok tok",
+                token_ids=[1, 2],
+                finish_reason="length",
+            )
+
+    c = TestClient(create_app(LengthBackend()))
+    res = c.post("/v1/chat/completions", json={
+        "model": "drift-test",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "max_tokens": 2,
+    })
+
+    assert res.status_code == 200
+    assert res.json()["choices"][0]["finish_reason"] == "length"
 
 
 def test_chat_completion_n_and_logprobs():
@@ -543,6 +695,55 @@ def test_embeddings_float_response():
     assert backend.prompts == ["alpha beta", "tok1 tok2"]
 
 
+def test_embeddings_string_array_token_ids_and_empty_input_errors():
+    backend, c = client()
+    string_res = c.post("/v1/embeddings", json={
+        "model": "drift-test",
+        "input": "solo",
+    })
+    token_res = c.post("/v1/embeddings", json={
+        "model": "drift-test",
+        "input": [1, 2, 3],
+    })
+    empty_array = c.post("/v1/embeddings", json={
+        "model": "drift-test",
+        "input": [],
+    })
+    empty_string = c.post("/v1/embeddings", json={
+        "model": "drift-test",
+        "input": "",
+    })
+
+    assert string_res.status_code == 200
+    assert string_res.json()["data"][0]["index"] == 0
+    assert token_res.status_code == 200
+    assert backend.prompts[-2:] == ["solo", "tok1 tok2 tok3"]
+    assert empty_array.status_code == 400
+    assert empty_array.json()["error"]["param"] == "input"
+    assert empty_string.status_code == 400
+    assert empty_string.json()["error"]["param"] == "input"
+
+
+def test_embeddings_context_overflow_and_bad_encoding_errors():
+    backend = FakeBackend()
+    backend.context_length = 1
+    c = TestClient(create_app(backend))
+    too_long = c.post("/v1/embeddings", json={
+        "model": "drift-test",
+        "input": "one two",
+    })
+    bad_encoding = c.post("/v1/embeddings", json={
+        "model": "drift-test",
+        "input": "one",
+        "encoding_format": "hex",
+    })
+
+    assert too_long.status_code == 400
+    assert too_long.json()["error"]["code"] == "context_length_exceeded"
+    assert bad_encoding.status_code == 400
+    assert bad_encoding.json()["error"]["param"] == "encoding_format"
+
+
 def test_embeddings_base64_response():
     _, c = client()
     res = c.post("/v1/embeddings", json={
@@ -594,3 +795,29 @@ def test_cors_preflight_when_enabled():
 
     assert res.status_code == 200
     assert res.headers["access-control-allow-origin"] == "https://example.com"
+
+
+def test_concurrent_requests_get_isolated_sessions():
+    backend = FakeBackend()
+    app = create_app(backend, max_concurrent_requests=4)
+
+    async def run():
+        import httpx
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
+            return await asyncio.gather(*[
+                c.post("/v1/chat/completions", json={
+                    "model": "drift-test",
+                    "messages": [{"role": "user", "content": f"hello {i}"}],
+                    "seed": i,
+                })
+                for i in range(10)
+            ])
+
+    results = asyncio.run(run())
+
+    assert all(res.status_code == 200 for res in results)
+    assert len(backend.sessions) == 10
+    assert len(set(backend.sessions)) == 10
+    assert sorted(opt["seed"] for opt in backend.options) == list(range(10))

@@ -2,7 +2,9 @@
 
 DRIFT's HTTP server is a text-generation OpenAI-compatible surface over the
 existing DRIFT orchestrator. It does not replace the node-to-node TCP+msgpack
-wire protocol.
+wire protocol. See [openai-compatibility-audit.md](openai-compatibility-audit.md)
+for the checklist-by-checklist evidence and remaining full-stack validation
+items.
 
 ## Supported HTTP Surface
 
@@ -68,6 +70,12 @@ OpenAI Python SDK smoke with an isolated venv:
 python3 -m venv /tmp/drift-openai-sdk-venv
 /tmp/drift-openai-sdk-venv/bin/python -m pip install openai pytest starlette uvicorn httpx
 PYTHONPATH=$PWD /tmp/drift-openai-sdk-venv/bin/python -m pytest tests/test_openai_sdk_smoke.py -q
+```
+
+OpenAI JS SDK smoke is opt-in because it installs npm packages:
+
+```bash
+DRIFT_RUN_JS_SDK_SMOKE=1 python3 -m pytest tests/test_openai_js_sdk_smoke.py -q
 ```
 
 Smoke a running DRIFT server:

@@ -854,17 +854,25 @@ def normalize_embedding_inputs(body: dict, backend: OpenAIBackend) -> list[Promp
         raise OpenAIHTTPError(400, "`input` is required", param="input")
     raw = body.get("input")
     if isinstance(raw, str):
+        if raw == "":
+            raise OpenAIHTTPError(400, "`input` must not be empty", param="input")
         return [raw]
     if isinstance(raw, list):
         if not raw:
             raise OpenAIHTTPError(400, "`input` array must not be empty", param="input")
         if all(isinstance(x, str) for x in raw):
+            if any(x == "" for x in raw):
+                raise OpenAIHTTPError(400, "`input` entries must not be empty",
+                                      param="input")
             return list(raw)
         if all(isinstance(x, int) for x in raw):
             return [backend.decode_tokens([int(x) for x in raw])]
         out: list[Prompt] = []
         for i, item in enumerate(raw):
             if isinstance(item, str):
+                if item == "":
+                    raise OpenAIHTTPError(400, "`input` entries must not be empty",
+                                          param=f"input[{i}]")
                 out.append(item)
             elif isinstance(item, list) and all(isinstance(x, int) for x in item):
                 out.append(backend.decode_tokens([int(x) for x in item]))
